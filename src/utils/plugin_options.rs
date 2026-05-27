@@ -18,7 +18,7 @@ impl PluginOptions {
     }
 
     pub fn get(&self, key: &str) -> Result<String, PluginError> {
-        let env_key = format!("{}_{}", self.env_prefix, key.to_uppercase());
+        let env_key = format!("{}__{}", self.env_prefix, key.to_uppercase());
         if let Ok(val) = std::env::var(&env_key) {
             return Ok(val);
         }
@@ -31,7 +31,7 @@ impl PluginOptions {
     }
 
     pub fn get_or(&self, key: &str, default: &str) -> String {
-        let env_key = format!("{}_{}", self.env_prefix, key.to_uppercase());
+        let env_key = format!("{}__{}", self.env_prefix, key.to_uppercase());
         std::env::var(&env_key)
             .ok()
             .or_else(|| self.options.get(key).cloned())
@@ -39,7 +39,7 @@ impl PluginOptions {
     }
 
     pub fn get_secret(&self, key: &str) -> Option<String> {
-        let env_key = format!("{}_{}", self.env_prefix, key.to_uppercase());
+        let env_key = format!("{}__{}", self.env_prefix, key.to_uppercase());
         std::env::var(&env_key).ok().or_else(|| {
             if let Some(val) = self.options.get(key) {
                 warn!(
