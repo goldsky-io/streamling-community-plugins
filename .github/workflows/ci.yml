@@ -1,0 +1,262 @@
+name: community-plugins
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      streamling_ref:
+        description: "Git ref for the streamling repo to build against"
+        type: string
+        default: 'main'
+
+jobs:
+  # Resolve the streamling ref to a concrete SHA exactly once so every
+  # downstream job agrees on the same commit.
+  resolve-streamling-sha:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve streamling SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          STREAMLING_REF: ${{ inputs.streamling_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          SHA=$(git ls-remote "https://x-access-token:${GH_TOKEN}@github.com/goldsky-io/streamling.git" "$STREAMLING_REF" | head -n1 | awk '{print $1}')
+          if [ -z "$SHA" ]; then
+            echo "Failed to resolve streamling ref '$STREAMLING_REF'" >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved streamling ref '$STREAMLING_REF' to $SHA"
+
+  validate-and-test:
+    needs: [resolve-streamling-sha]
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "10G"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout streamling
+        uses: actions/checkout@v4
+        with:
+          repository: goldsky-io/streamling
+          ref: ${{ needs.resolve-streamling-sha.outputs.sha }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: streamling
+      - name: Symlink streamling as sibling
+        run: ln -s "$GITHUB_WORKSPACE/streamling" "$GITHUB_WORKSPACE/../streamling"
+      - name: Configure git for private deps
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy, rustfmt
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-plugins-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-plugins-${{ runner.os }}-1.90.0-
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "community-plugins"
+          cache-targets: true
+          cache-on-failure: true
+      - name: Run linters
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run tests
+        run: cargo nextest run --locked --lib
+        env:
+          RUST_LOG: info
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        timeout-minutes: 15
+
+  # ==========================================================================
+  # Build release binaries (streamling + plugin) for e2e tests
+  # ==========================================================================
+  build-release:
+    needs: [resolve-streamling-sha, validate-and-test]
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout streamling
+        uses: actions/checkout@v4
+        with:
+          repository: goldsky-io/streamling
+          ref: ${{ needs.resolve-streamling-sha.outputs.sha }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: streamling
+      - name: Symlink streamling as sibling
+        run: ln -s "$GITHUB_WORKSPACE/streamling" "$GITHUB_WORKSPACE/../streamling"
+      - name: Configure git for private deps
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-release-${{ runner.os }}-${{ runner.arch }}-1.90.0-${{ hashFiles('Cargo.lock', 'streamling/Cargo.lock') }}
+          restore-keys: |
+            sccache-release-${{ runner.os }}-${{ runner.arch }}-1.90.0-
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "community-plugins-release"
+          cache-targets: true
+          cache-on-failure: true
+          workspaces: |
+            .
+            streamling
+      - name: Build streamling binary
+        working-directory: streamling
+        run: cargo build --release --locked
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
+          SCCACHE_CACHE_SIZE: "10G"
+          LIBZ_SYS_STATIC: 1
+          PKG_CONFIG_ALL_STATIC: 1
+      - name: Build community plugins
+        run: cargo build --release --locked --lib
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
+          SCCACHE_CACHE_SIZE: "10G"
+          LIBZ_SYS_STATIC: 1
+          PKG_CONFIG_ALL_STATIC: 1
+      - name: Show sccache stats
+        run: sccache --show-stats || true
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            streamling/target/release/streamling
+            target/release/libcommunity_plugins.so
+            streamling/crates/streamling/config.yaml
+            streamling/crates/streamling-core/wasm/runtime.wasm
+          retention-days: 1
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Plugin-local e2e tests (reuses build-release artifacts, no recompilation)
+  # ==========================================================================
+  plugin-e2e:
+    needs: [resolve-streamling-sha, build-release]
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "10G"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout streamling
+        uses: actions/checkout@v4
+        with:
+          repository: goldsky-io/streamling
+          ref: ${{ needs.resolve-streamling-sha.outputs.sha }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: streamling
+      - name: Symlink streamling as sibling
+        run: ln -s "$GITHUB_WORKSPACE/streamling" "$GITHUB_WORKSPACE/../streamling"
+      - name: Configure git for private deps
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      # Download pre-built binaries from build-release job (no recompilation)
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+      - name: Install release binaries
+        run: |
+          chmod +x artifacts/streamling/target/release/streamling
+          echo "E2E_STREAMLING_BIN=$GITHUB_WORKSPACE/artifacts/streamling/target/release/streamling" >> $GITHUB_ENV
+          echo "E2E_STREAMLING_DIR=$GITHUB_WORKSPACE/streamling/crates/streamling" >> $GITHUB_ENV
+          echo "STREAMLING__PLUGIN__PATH=$GITHUB_WORKSPACE/artifacts/target/release/libcommunity_plugins.so" >> $GITHUB_ENV
+      # Rust + caching (only for compiling the test binary, not streamling)
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache,nextest
+      - name: Set SCCACHE_DIR env
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-plugin-e2e-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-plugin-e2e-${{ runner.os }}-1.90.0-
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "community-plugins-e2e"
+          cache-targets: true
+          cache-on-failure: true
+      # Infrastructure
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+      - name: Setup k3s cluster
+        working-directory: streamling
+        run: ./scripts/k3s-setup.sh
+        timeout-minutes: 5
+      # Run plugin e2e tests
+      - name: Run plugin e2e tests
+        run: |
+          set -euo pipefail
+          eval "$(cd streamling && ./scripts/k3s-setup.sh --env-only)"
+          cargo nextest run --test '*'
+        env:
+          RUST_LOG: info
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        timeout-minutes: 10

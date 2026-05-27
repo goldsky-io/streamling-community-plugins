@@ -1,0 +1,7 @@
+[profile.dev]
+debug = 1            # lighter debug info than the default 2
+panic = "abort"      # unwinding across FFI (cdylib) is UB
+incremental = true   # speeds rebuilds, modest disk cost
+
+[profile.release]
+panic = "abort"      # unwinding across FFI (cdylib) is UB
