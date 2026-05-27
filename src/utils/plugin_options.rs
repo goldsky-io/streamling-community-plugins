@@ -9,11 +9,7 @@ pub struct PluginOptions {
 }
 
 impl PluginOptions {
-    pub fn new(
-        options: HashMap<String, String>,
-        plugin_name: &str,
-        env_prefix: &str,
-    ) -> Self {
+    pub fn new(options: HashMap<String, String>, plugin_name: &str, env_prefix: &str) -> Self {
         PluginOptions {
             options,
             env_prefix: env_prefix.to_string(),
@@ -57,5 +53,4 @@ impl PluginOptions {
             }
         })
     }
-
 }

@@ -217,7 +217,8 @@ impl SinkPlugin for S3Sink {
 
         // Cache the trimmed prefix once (avoids per-batch allocation in build_key)
         let prefix = self
-            .opts.get("prefix")
+            .opts
+            .get("prefix")
             .ok()
             .map(|p| p.trim_end_matches('/').to_string());
         let _ = self.prefix.set(prefix);
@@ -228,12 +229,11 @@ impl SinkPlugin for S3Sink {
             PluginError::Internal(err.to_string())
         })?;
 
-        let secret_access_key =
-            self.opts.get_secret("secret_access_key").ok_or_else(|| {
-                let err = "s3_sink: required option 'secret_access_key' is not specified";
-                error!(error = %err, "S3 sink initialization failed");
-                PluginError::Internal(err.to_string())
-            })?;
+        let secret_access_key = self.opts.get_secret("secret_access_key").ok_or_else(|| {
+            let err = "s3_sink: required option 'secret_access_key' is not specified";
+            error!(error = %err, "S3 sink initialization failed");
+            PluginError::Internal(err.to_string())
+        })?;
 
         let region = self.opts.get("region")?;
         let bucket = self.opts.get("bucket")?;
@@ -269,7 +269,8 @@ impl SinkPlugin for S3Sink {
         // Allow HTTP if detected from endpoint URL, or if explicitly set in config
         if should_allow_http
             || self
-                .opts.get_or("allow_http", "false")
+                .opts
+                .get_or("allow_http", "false")
                 .parse::<bool>()
                 .unwrap_or(false)
         {

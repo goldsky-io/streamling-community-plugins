@@ -50,7 +50,8 @@ impl MySqlSink {
     }
 
     fn primary_key_columns(&self) -> Vec<String> {
-        self.opts.get("primary_key")
+        self.opts
+            .get("primary_key")
             .ok()
             .map(|pk| {
                 pk.split(',')
@@ -275,7 +276,8 @@ impl SinkPlugin for MySqlSink {
 
         let host = self.opts.get("host")?;
         let port: u16 = self
-            .opts.get_or("port", "3306")
+            .opts
+            .get_or("port", "3306")
             .parse()
             .map_err(|_| PluginError::Internal("invalid port value".into()))?;
         let user = self.opts.get("user")?;
@@ -349,7 +351,8 @@ impl SinkPlugin for MySqlSink {
         }
 
         let chunk_size: usize = self
-            .opts.get_or("batch_size", "1000")
+            .opts
+            .get_or("batch_size", "1000")
             .parse()
             .unwrap_or(1000);
 
