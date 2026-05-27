@@ -8,24 +8,26 @@ Community-maintained plugins for [Streamling](https://github.com/goldsky-io/stre
 
 Writes data as Parquet files to S3-compatible storage. Supports optional Hive-style partitioning.
 
-| YAML option | Env var | Required | Description |
-|---|---|---|---|
-| `bucket` | — | yes | S3 bucket name |
-| `region` | `STREAMLING__PLUGIN__S3_SINK__REGION` | yes | AWS region |
-| `access_key_id` | `STREAMLING__PLUGIN__S3_SINK__ACCESS_KEY_ID` | yes | AWS access key (env var preferred) |
-| `secret_access_key` | `STREAMLING__PLUGIN__S3_SINK__SECRET_ACCESS_KEY` | yes | AWS secret key (env var preferred) |
-| `session_token` | `STREAMLING__PLUGIN__S3_SINK__SESSION_TOKEN` | no | STS session token |
-| `prefix` | — | no | Key prefix (trailing `/` is stripped) |
-| `endpoint` | — | no | Custom S3-compatible endpoint URL |
-| `allow_http` | — | no | Allow plain HTTP (auto-detected from `endpoint`) |
-| `partition_columns` | — | no | Comma-separated column names for Hive partitioning |
-| `max_concurrent_partition_uploads` | `STREAMLING__PLUGIN__S3_SINK__MAX_CONCURRENT_PARTITION_UPLOADS` | no | Max parallel partition uploads (default: 16) |
+All YAML options can also be set via `STREAMLING__PLUGIN__S3_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Description |
+|---|---|---|
+| `bucket` | yes | S3 bucket name |
+| `region` | yes | AWS region |
+| `access_key_id` | yes | AWS access key (env var preferred) |
+| `secret_access_key` | yes | AWS secret key (env var preferred) |
+| `session_token` | no | STS session token (env var preferred) |
+| `prefix` | no | Key prefix (trailing `/` is stripped) |
+| `endpoint` | no | Custom S3-compatible endpoint URL |
+| `allow_http` | no | Allow plain HTTP (auto-detected from `endpoint`) |
+| `partition_columns` | no | Comma-separated column names for Hive partitioning |
+| `max_concurrent_partition_uploads` | no | Max parallel partition uploads (default: 16) |
 
 ### MySQL Sink (`mysql_sink`)
 
 Writes to MySQL with upsert/delete (CDC) support. Rows with `_gs_op = "d"` are deleted; all others are upserted.
 
-All YAML options can also be set via `STREAMLING__PLUGIN__MYSQL_SINK__<KEY>` environment variables (uppercase key).
+All YAML options can also be set via `STREAMLING__PLUGIN__MYSQL_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
 
 | YAML option | Required | Default | Description |
 |---|---|---|---|
@@ -44,14 +46,16 @@ All YAML options can also be set via `STREAMLING__PLUGIN__MYSQL_SINK__<KEY>` env
 
 Sends each row as a JSON message to an AWS SQS queue. Handles SQS 10-message batch limits and retries partial failures.
 
-| YAML option | Env var | Required | Description |
-|---|---|---|---|
-| `queue_url` | — | yes | SQS queue URL |
-| `region` | `STREAMLING__PLUGIN__SQS_SINK__REGION` | no | AWS region override |
-| `access_key_id` | `STREAMLING__PLUGIN__SQS_SINK__ACCESS_KEY_ID` | no | AWS access key (env var preferred) |
-| `secret_access_key` | `STREAMLING__PLUGIN__SQS_SINK__SECRET_ACCESS_KEY` | no | AWS secret key (env var preferred) |
-| `session_token` | `STREAMLING__PLUGIN__SQS_SINK__SESSION_TOKEN` | no | STS session token |
-| `endpoint_url` | — | no | Custom SQS endpoint (e.g. LocalStack) |
+All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Description |
+|---|---|---|
+| `queue_url` | yes | SQS queue URL |
+| `region` | no | AWS region override |
+| `endpoint_url` | no | Custom SQS endpoint (e.g. LocalStack) |
+| `access_key_id` | no | AWS access key (env var preferred) |
+| `secret_access_key` | no | AWS secret key (env var preferred) |
+| `session_token` | no | STS session token (env var preferred) |
 
 ### Quick start
 

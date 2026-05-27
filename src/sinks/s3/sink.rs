@@ -20,6 +20,7 @@ use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
 use super::partitioning::{PartitionConfig, partition_batch};
+use crate::utils::plugin_options::PluginOptions;
 
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -35,7 +36,7 @@ fn is_retriable_s3_error(e: &object_store::Error) -> bool {
 }
 
 pub struct S3Sink {
-    options: HashMap<String, String>,
+    opts: PluginOptions,
     schema: SchemaRef,
     store: OnceLock<Arc<AmazonS3>>,
     bucket: OnceLock<String>,
@@ -53,7 +54,7 @@ impl S3Sink {
         options: HashMap<String, String>,
     ) -> Self {
         S3Sink {
-            options,
+            opts: PluginOptions::new(options, "s3_sink", "STREAMLING__PLUGIN__S3_SINK"),
             schema,
             store: OnceLock::new(),
             bucket: OnceLock::new(),
@@ -202,7 +203,10 @@ impl SinkPlugin for S3Sink {
         info!("Initializing S3 sink...");
 
         // Parse and validate partition configuration against schema
-        let pc = PartitionConfig::from_options(&self.options, &self.schema)?;
+        let pc = PartitionConfig::parse(
+            self.opts.get("partition_columns").ok().as_deref(),
+            &self.schema,
+        )?;
         if let Some(ref config) = pc {
             info!(
                 partition_columns = ?config.columns,
@@ -213,69 +217,31 @@ impl SinkPlugin for S3Sink {
 
         // Cache the trimmed prefix once (avoids per-batch allocation in build_key)
         let prefix = self
-            .options
-            .get("prefix")
+            .opts.get("prefix")
+            .ok()
             .map(|p| p.trim_end_matches('/').to_string());
         let _ = self.prefix.set(prefix);
 
-        // Retrieve configuration values from environment variables first, then fall back to options
-        // Environment variables take precedence over YAML configuration
-        let access_key_id = std::env::var("STREAMLING__PLUGIN__S3_SINK__ACCESS_KEY_ID")
-            .ok()
-            .or_else(|| {
-                if let Some(val) = self.options.get("access_key_id") {
-                    warn!(
-                        "access_key_id is set in plaintext YAML configuration. \
-                        Consider using environment variable STREAMLING__PLUGIN__S3_SINK__ACCESS_KEY_ID instead."
-                    );
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                let err = "access_key_id is not specified. Set STREAMLING__PLUGIN__S3_SINK__ACCESS_KEY_ID environment variable or access_key_id in YAML config.".to_string();
-                error!(error = %err, "S3 sink initialization failed");
-                PluginError::Internal(err)
-            })?;
-
-        let secret_access_key = std::env::var("STREAMLING__PLUGIN__S3_SINK__SECRET_ACCESS_KEY")
-            .ok()
-            .or_else(|| {
-                if let Some(val) = self.options.get("secret_access_key") {
-                    warn!(
-                        "secret_access_key is set in plaintext YAML configuration. \
-                        Consider using environment variable STREAMLING__PLUGIN__S3_SINK__SECRET_ACCESS_KEY instead."
-                    );
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                let err = "secret_access_key is not specified. Set STREAMLING__PLUGIN__S3_SINK__SECRET_ACCESS_KEY environment variable or secret_access_key in YAML config.".to_string();
-                error!(error = %err, "S3 sink initialization failed");
-                PluginError::Internal(err)
-            })?;
-
-        let region = std::env::var("STREAMLING__PLUGIN__S3_SINK__REGION")
-            .ok()
-            .or_else(|| self.options.get("region").cloned())
-            .ok_or_else(|| {
-                let err = "region is not specified. Set STREAMLING__PLUGIN__S3_SINK__REGION environment variable or region in YAML config.".to_string();
-                error!(error = %err, "S3 sink initialization failed");
-                PluginError::Internal(err)
-            })?;
-        let bucket = self.options.get("bucket").ok_or_else(|| {
-            let err = "bucket is not specified".to_string();
+        let access_key_id = self.opts.get_secret("access_key_id").ok_or_else(|| {
+            let err = "s3_sink: required option 'access_key_id' is not specified";
             error!(error = %err, "S3 sink initialization failed");
-            PluginError::Internal(err)
+            PluginError::Internal(err.to_string())
         })?;
 
+        let secret_access_key =
+            self.opts.get_secret("secret_access_key").ok_or_else(|| {
+                let err = "s3_sink: required option 'secret_access_key' is not specified";
+                error!(error = %err, "S3 sink initialization failed");
+                PluginError::Internal(err.to_string())
+            })?;
+
+        let region = self.opts.get("region")?;
+        let bucket = self.opts.get("bucket")?;
+
         info!(
-            bucket = bucket,
+            bucket = %bucket,
             region = %region,
-            endpoint = self.options.get("endpoint"),
+            endpoint = self.opts.get("endpoint").ok(),
             "Configuring S3 store"
         );
 
@@ -287,39 +253,25 @@ impl SinkPlugin for S3Sink {
             .with_secret_access_key(secret_access_key);
 
         // Optional session token (required for temporary STS credentials)
-        let session_token = std::env::var("STREAMLING__PLUGIN__S3_SINK__SESSION_TOKEN")
-            .ok()
-            .or_else(|| {
-                if let Some(val) = self.options.get("session_token") {
-                    warn!(
-                        "session_token is set in plaintext YAML configuration. \
-                        Consider using environment variable STREAMLING__PLUGIN__S3_SINK__SESSION_TOKEN instead."
-                    );
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            });
-        if let Some(token) = session_token {
+        if let Some(token) = self.opts.get_secret("session_token") {
             builder = builder.with_token(token);
         }
 
         // Optional endpoint URL (for S3-compatible services)
         let mut should_allow_http = false;
-        if let Some(endpoint) = self.options.get("endpoint") {
-            builder = builder.with_endpoint(endpoint);
-
-            // Automatically detect HTTP endpoints
+        if let Ok(endpoint) = self.opts.get("endpoint") {
             if endpoint.to_lowercase().starts_with("http://") {
                 should_allow_http = true;
             }
+            builder = builder.with_endpoint(endpoint);
         }
 
         // Allow HTTP if detected from endpoint URL, or if explicitly set in config
-        if should_allow_http {
-            builder = builder.with_allow_http(true);
-        } else if let Some(allow_http) = self.options.get("allow_http")
-            && allow_http.parse::<bool>().unwrap_or(false)
+        if should_allow_http
+            || self
+                .opts.get_or("allow_http", "false")
+                .parse::<bool>()
+                .unwrap_or(false)
         {
             builder = builder.with_allow_http(true);
         }
@@ -376,27 +328,13 @@ impl SinkPlugin for S3Sink {
                     .collect::<Result<Vec<_>, PluginError>>()?;
 
                 // Upload partitions concurrently with a bounded parallelism limit.
-                // Env var takes precedence, then YAML option, then default (16).
-                let max_concurrent =
-                    std::env::var("STREAMLING__PLUGIN__S3_SINK__MAX_CONCURRENT_PARTITION_UPLOADS")
-                        .ok()
-                        .or_else(|| {
-                            self.options
-                                .get("max_concurrent_partition_uploads")
-                                .cloned()
-                        })
-                        .and_then(|v| {
-                            v.parse::<usize>()
-                        .map_err(|e| {
-                            warn!(
-                                value = %v,
-                                error = %e,
-                                "Invalid max_concurrent_partition_uploads, using default (16)"
-                            );
-                        })
-                        .ok()
-                        })
-                        .unwrap_or(16);
+                let max_concurrent = self
+                    .opts.get_or("max_concurrent_partition_uploads", "16")
+                    .parse::<usize>()
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "Invalid max_concurrent_partition_uploads, using default (16)");
+                        16
+                    });
                 let results: Vec<Result<(), PluginError>> = stream::iter(uploads)
                     .map(|(key, data)| async move {
                         self.upload_to_s3(&key, data).await.inspect_err(|_| {
@@ -473,7 +411,7 @@ mod tests {
     ) -> S3Sink {
         let schema = make_test_schema();
         let sink = S3Sink {
-            options,
+            opts: PluginOptions::new(options, "s3_sink", "STREAMLING__PLUGIN__S3_SINK"),
             schema,
             store: OnceLock::new(),
             bucket: OnceLock::new(),
@@ -625,55 +563,27 @@ mod tests {
         assert_ne!(key1, key2, "Each key should contain a unique UUID");
     }
 
-    // ── Backwards-compatibility: PartitionConfig::from_options with no partition_columns ──
+    // ── Backwards-compatibility: PartitionConfig::parse with no partition_columns ──
 
     #[test]
     fn test_no_partition_columns_returns_none() {
         let schema = make_test_schema();
-        let opts = HashMap::new();
-        let result = PartitionConfig::from_options(&opts, &schema).unwrap();
+        let result = PartitionConfig::parse(None, &schema).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_empty_partition_columns_returns_none() {
         let schema = make_test_schema();
-        let mut opts = HashMap::new();
-        opts.insert("partition_columns".to_string(), "".to_string());
-        let result = PartitionConfig::from_options(&opts, &schema).unwrap();
+        let result = PartitionConfig::parse(Some(""), &schema).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_whitespace_only_partition_columns_returns_none() {
         let schema = make_test_schema();
-        let mut opts = HashMap::new();
-        opts.insert("partition_columns".to_string(), "   ".to_string());
-        let result = PartitionConfig::from_options(&opts, &schema).unwrap();
+        let result = PartitionConfig::parse(Some("   "), &schema).unwrap();
         assert!(result.is_none());
-    }
-
-    // ── Backwards-compatibility: existing config keys are not affected ──
-
-    #[test]
-    fn test_existing_config_keys_not_consumed_by_partition_config() {
-        let schema = make_test_schema();
-        let mut opts = HashMap::new();
-        opts.insert("bucket".to_string(), "my-bucket".to_string());
-        opts.insert("prefix".to_string(), "data/output/".to_string());
-        opts.insert("region".to_string(), "us-east-1".to_string());
-        opts.insert(
-            "endpoint".to_string(),
-            "https://s3.amazonaws.com".to_string(),
-        );
-        opts.insert("allow_http".to_string(), "false".to_string());
-
-        let result = PartitionConfig::from_options(&opts, &schema).unwrap();
-        assert!(result.is_none());
-
-        assert_eq!(opts.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(opts.get("prefix").unwrap(), "data/output/");
-        assert_eq!(opts.get("region").unwrap(), "us-east-1");
     }
 
     // ── Backwards-compatibility: key path format matches original ──

@@ -13,15 +13,16 @@ use streamling_plugin::api::SupportsGracefulShutdown;
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
+use crate::utils::plugin_options::PluginOptions;
 use crate::utils::record_batch_json;
 
 const SQS_MAX_BATCH_SIZE: usize = 10;
 const SQS_PARTIAL_FAILURE_MAX_RETRIES: u32 = 5;
 
 pub struct SqsSink {
-    options: HashMap<String, String>,
+    opts: PluginOptions,
     _schema: SchemaRef,
     client: OnceLock<SqsClient>,
     queue_url: OnceLock<String>,
@@ -37,7 +38,7 @@ impl SqsSink {
         options: HashMap<String, String>,
     ) -> Self {
         SqsSink {
-            options,
+            opts: PluginOptions::new(options, "sqs_sink", "STREAMLING__PLUGIN__SQS_SINK"),
             _schema: schema,
             client: OnceLock::new(),
             queue_url: OnceLock::new(),
@@ -65,70 +66,21 @@ impl SinkPlugin for SqsSink {
             return Ok(());
         }
 
-        let queue_url = self
-            .options
-            .get("queue_url")
-            .ok_or_else(|| {
-                let err = "queue_url is not specified".to_string();
-                error!(error = %err, "SQS sink initialization failed");
-                PluginError::Internal(err)
-            })?
-            .clone();
+        let queue_url = self.opts.get("queue_url")?;
 
         let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
 
-        let region = std::env::var("STREAMLING__PLUGIN__SQS_SINK__REGION")
-            .ok()
-            .or_else(|| self.options.get("region").cloned());
-        if let Some(region) = region {
+        if let Ok(region) = self.opts.get("region") {
             config_loader = config_loader.region(aws_types::region::Region::new(region));
         }
 
-        if let Some(endpoint_url) = self.options.get("endpoint_url") {
-            config_loader = config_loader.endpoint_url(endpoint_url.clone());
+        if let Ok(endpoint_url) = self.opts.get("endpoint_url") {
+            config_loader = config_loader.endpoint_url(endpoint_url);
         }
 
-        let access_key_id = std::env::var("STREAMLING__PLUGIN__SQS_SINK__ACCESS_KEY_ID")
-            .ok()
-            .or_else(|| {
-                if let Some(val) = self.options.get("access_key_id") {
-                    warn!(
-                        "access_key_id is set in plaintext YAML configuration. \
-                        Consider using environment variable STREAMLING__PLUGIN__SQS_SINK__ACCESS_KEY_ID instead."
-                    );
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            });
-
-        let secret_access_key = std::env::var("STREAMLING__PLUGIN__SQS_SINK__SECRET_ACCESS_KEY")
-            .ok()
-            .or_else(|| {
-                if let Some(val) = self.options.get("secret_access_key") {
-                    warn!(
-                        "secret_access_key is set in plaintext YAML configuration. \
-                        Consider using environment variable STREAMLING__PLUGIN__SQS_SINK__SECRET_ACCESS_KEY instead."
-                    );
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            });
-
-        let session_token = std::env::var("STREAMLING__PLUGIN__SQS_SINK__SESSION_TOKEN")
-            .ok()
-            .or_else(|| {
-                if let Some(val) = self.options.get("session_token") {
-                    warn!(
-                        "session_token is set in plaintext YAML configuration. \
-                        Consider using environment variable STREAMLING__PLUGIN__SQS_SINK__SESSION_TOKEN instead."
-                    );
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            });
+        let access_key_id = self.opts.get_secret("access_key_id");
+        let secret_access_key = self.opts.get_secret("secret_access_key");
+        let session_token = self.opts.get_secret("session_token");
 
         if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
             let creds = Credentials::new(

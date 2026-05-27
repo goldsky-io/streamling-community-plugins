@@ -14,10 +14,12 @@ use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
 use tracing::{debug, info};
 
+use crate::utils::plugin_options::PluginOptions;
+
 static COLUMN_NAME_OP: &str = "_gs_op";
 
 pub struct MySqlSink {
-    options: HashMap<String, String>,
+    opts: PluginOptions,
     schema: SchemaRef,
     pool: OnceLock<MySqlPool>,
     running: Arc<AtomicBool>,
@@ -33,33 +35,12 @@ impl MySqlSink {
         options: HashMap<String, String>,
     ) -> Self {
         MySqlSink {
-            options,
+            opts: PluginOptions::new(options, "mysql_sink", "STREAMLING__PLUGIN__MYSQL_SINK"),
             schema,
             pool: OnceLock::new(),
             running: Arc::new(AtomicBool::new(true)),
             metrics_recorder,
         }
-    }
-
-    fn get_option(&self, key: &str) -> Result<String, PluginError> {
-        let env_key = format!("STREAMLING__PLUGIN__MYSQL_SINK__{}", key.to_uppercase());
-        if let Ok(val) = std::env::var(&env_key) {
-            return Ok(val);
-        }
-        self.options.get(key).cloned().ok_or_else(|| {
-            PluginError::Internal(format!(
-                "mysql_sink: required option '{}' is not specified",
-                key
-            ))
-        })
-    }
-
-    fn get_option_or(&self, key: &str, default: &str) -> String {
-        let env_key = format!("STREAMLING__PLUGIN__MYSQL_SINK__{}", key.to_uppercase());
-        std::env::var(&env_key)
-            .ok()
-            .or_else(|| self.options.get(key).cloned())
-            .unwrap_or_else(|| default.to_string())
     }
 
     fn pool(&self) -> Result<&MySqlPool, PluginError> {
@@ -69,7 +50,7 @@ impl MySqlSink {
     }
 
     fn primary_key_columns(&self) -> Vec<String> {
-        self.get_option("primary_key")
+        self.opts.get("primary_key")
             .ok()
             .map(|pk| {
                 pk.split(',')
@@ -100,8 +81,8 @@ impl MySqlSink {
     }
 
     async fn create_table_if_needed(&self, pool: &MySqlPool) -> Result<(), PluginError> {
-        let table = self.get_option("table")?;
-        let database = self.get_option("database")?;
+        let table = self.opts.get("table")?;
+        let database = self.opts.get("database")?;
         let pk_columns = self.primary_key_columns();
 
         let mut col_defs = Vec::new();
@@ -149,9 +130,9 @@ impl MySqlSink {
         }
 
         let pool = self.pool()?;
-        let table = self.get_option("table")?;
-        let database = self.get_option("database")?;
-        let on_conflict = self.get_option_or("on_conflict", "update");
+        let table = self.opts.get("table")?;
+        let database = self.opts.get("database")?;
+        let on_conflict = self.opts.get_or("on_conflict", "update");
         let column_names = self.sink_column_names();
         let column_indices = self.sink_column_indices();
         let pk_columns = self.primary_key_columns();
@@ -224,8 +205,8 @@ impl MySqlSink {
         }
 
         let pool = self.pool()?;
-        let table = self.get_option("table")?;
-        let database = self.get_option("database")?;
+        let table = self.opts.get("table")?;
+        let database = self.opts.get("database")?;
 
         let pk_indices: Vec<usize> = pk_columns
             .iter()
@@ -292,15 +273,15 @@ impl SinkPlugin for MySqlSink {
             return Ok(());
         }
 
-        let host = self.get_option("host")?;
+        let host = self.opts.get("host")?;
         let port: u16 = self
-            .get_option_or("port", "3306")
+            .opts.get_or("port", "3306")
             .parse()
             .map_err(|_| PluginError::Internal("invalid port value".into()))?;
-        let user = self.get_option("user")?;
-        let password = self.get_option("password")?;
-        let database = self.get_option("database")?;
-        let sslmode = self.get_option_or("sslmode", "disabled");
+        let user = self.opts.get("user")?;
+        let password = self.opts.get("password")?;
+        let database = self.opts.get("database")?;
+        let sslmode = self.opts.get_or("sslmode", "disabled");
 
         info!(
             "Connecting to MySQL: {}@{}:{}/{}",
@@ -368,7 +349,7 @@ impl SinkPlugin for MySqlSink {
         }
 
         let chunk_size: usize = self
-            .get_option_or("batch_size", "1000")
+            .opts.get_or("batch_size", "1000")
             .parse()
             .unwrap_or(1000);
 

@@ -14,13 +14,13 @@ pub struct PartitionConfig {
 }
 
 impl PartitionConfig {
-    /// Parse `partition_columns` from plugin options and validate against the schema.
-    /// Returns `None` if `partition_columns` is not set.
-    pub fn from_options(
-        options: &HashMap<String, String>,
+    /// Parse a comma-separated list of partition column names and validate against the schema.
+    /// Returns `None` if `partition_columns` is `None` or empty.
+    pub fn parse(
+        partition_columns: Option<&str>,
         schema: &SchemaRef,
     ) -> Result<Option<Self>, PluginError> {
-        let raw = match options.get("partition_columns") {
+        let raw = match partition_columns {
             Some(v) if !v.trim().is_empty() => v,
             _ => return Ok(None),
         };
@@ -196,30 +196,19 @@ mod tests {
         ))
     }
 
-    fn make_options(partition_columns: &str) -> HashMap<String, String> {
-        let mut opts = HashMap::new();
-        opts.insert(
-            "partition_columns".to_string(),
-            partition_columns.to_string(),
-        );
-        opts
-    }
-
     // ── PartitionConfig tests ──
 
     #[test]
-    fn test_from_options_none_when_missing() {
+    fn test_parse_none_when_missing() {
         let schema = make_schema(vec![("id", DataType::Int64)]);
-        let opts = HashMap::new();
-        let result = PartitionConfig::from_options(&opts, &schema).unwrap();
+        let result = PartitionConfig::parse(None, &schema).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_from_options_single_column() {
+    fn test_parse_single_column() {
         let schema = make_schema(vec![("id", DataType::Int64), ("dt", DataType::Utf8)]);
-        let opts = make_options("dt");
-        let config = PartitionConfig::from_options(&opts, &schema)
+        let config = PartitionConfig::parse(Some("dt"), &schema)
             .unwrap()
             .unwrap();
         assert_eq!(config.columns, vec!["dt"]);
@@ -227,14 +216,13 @@ mod tests {
     }
 
     #[test]
-    fn test_from_options_multiple_columns() {
+    fn test_parse_multiple_columns() {
         let schema = make_schema(vec![
             ("id", DataType::Int64),
             ("chain_id", DataType::Int32),
             ("dt", DataType::Utf8),
         ]);
-        let opts = make_options("dt, chain_id");
-        let config = PartitionConfig::from_options(&opts, &schema)
+        let config = PartitionConfig::parse(Some("dt, chain_id"), &schema)
             .unwrap()
             .unwrap();
         assert_eq!(config.columns, vec!["dt", "chain_id"]);
@@ -242,10 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn test_from_options_invalid_column() {
+    fn test_parse_invalid_column() {
         let schema = make_schema(vec![("id", DataType::Int64), ("dt", DataType::Utf8)]);
-        let opts = make_options("nonexistent");
-        let err = PartitionConfig::from_options(&opts, &schema).unwrap_err();
+        let err = PartitionConfig::parse(Some("nonexistent"), &schema).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("nonexistent"));
         assert!(msg.contains("not found in schema"));
@@ -454,30 +441,27 @@ mod tests {
     }
 
     #[test]
-    fn test_from_options_duplicate_columns() {
+    fn test_parse_duplicate_columns() {
         let schema = make_schema(vec![("id", DataType::Int64), ("dt", DataType::Utf8)]);
-        let opts = make_options("dt, dt");
-        let err = PartitionConfig::from_options(&opts, &schema).unwrap_err();
+        let err = PartitionConfig::parse(Some("dt, dt"), &schema).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("duplicate partition column"));
         assert!(msg.contains("dt"));
     }
 
     #[test]
-    fn test_from_options_trailing_comma_ignored() {
+    fn test_parse_trailing_comma_ignored() {
         let schema = make_schema(vec![("id", DataType::Int64), ("dt", DataType::Utf8)]);
-        let opts = make_options("dt,");
-        let config = PartitionConfig::from_options(&opts, &schema)
+        let config = PartitionConfig::parse(Some("dt,"), &schema)
             .unwrap()
             .unwrap();
         assert_eq!(config.columns, vec!["dt"]);
     }
 
     #[test]
-    fn test_from_options_rejects_special_char_column_name() {
+    fn test_parse_rejects_special_char_column_name() {
         let schema = make_schema(vec![("id", DataType::Int64), ("my col", DataType::Utf8)]);
-        let opts = make_options("my col");
-        let err = PartitionConfig::from_options(&opts, &schema).unwrap_err();
+        let err = PartitionConfig::parse(Some("my col"), &schema).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("invalid characters"));
     }
