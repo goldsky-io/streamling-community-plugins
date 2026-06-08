@@ -2,6 +2,11 @@
 
 Community-maintained plugins for [Streamling](https://github.com/goldsky-io/streamling).
 
+## How to Use
+
+Build the plugins as a shared library (`cargo build --profile release-optimized --lib`) or download a pre-built release from the GitHub releases page. 
+Then set the `STREAMLING__PLUGIN__PATH` environment variable to the path of the compiled `.so`/`.dylib`/`.dll` file and run `streamling` as usual.
+
 ## Available Plugins
 
 ### S3 Sink (`s3_sink`)

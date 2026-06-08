@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-streamling-plugin = { path = "../streamling/crates/streamling-plugin" }
+streamling-plugin = "0.2.0"
 
 # Generic RecordBatch-to-JSON conversion (see utils::record_batch_json).
 # U256 columns are serialized as decimal strings; arrow_json emits hex by default.
@@ -56,8 +56,7 @@ regex = "1.11.1"
 serde = "1.0"
 serde_json = "1.0"
 sqlx = { version = "0.8.5", features = ["runtime-tokio", "mysql", "tls-rustls"] }
-streamling-common = { path = "../streamling/crates/streamling-common" }
-streamling-e2e = { path = "../streamling/crates/streamling-e2e" }
+streamling-e2e = "0.1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lib]

@@ -5,3 +5,8 @@ incremental = true   # speeds rebuilds, modest disk cost
 
 [profile.release]
 panic = "abort"      # unwinding across FFI (cdylib) is UB
+
+[profile.release-optimized]
+inherits = "release"
+lto = true           # enables Link-Time Optimization
+codegen-units = 1    # forces to compile as a single unit, allowing more optimization
