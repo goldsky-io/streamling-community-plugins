@@ -51,6 +51,15 @@ aws-config = { version = "1", default-features = false, features = [
 aws-credential-types = "1"
 aws-types = "1"
 
+# S2 (s2.dev) sink
+s2-sdk = "0.31.2"
+# rustls is a direct dep so the S2 sink can install the aws-lc-rs CryptoProvider
+# at startup. s2-sdk pulls rustls in via its default feature; we want to be
+# explicit because more than one TLS-using crate is linked (aws-smithy-http-client
+# also uses aws-lc-rs) and rustls 0.23 requires an explicit provider when more
+# than one is present.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
 [dev-dependencies]
 regex = "1.11.1"
 serde = "1.0"
