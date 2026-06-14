@@ -28,13 +28,6 @@
 //! process_batch returns once records have been accepted by the Producer; the
 //! checkpoint marker is the durability barrier.
 //!
-//! Retries are delegated to the SDK via S2Config::with_retry: max_attempts
-//! = u32::MAX with capped exponential backoff (250ms → 15s) so transient
-//! errors retry until the pipeline shuts down. AppendRetryPolicy::NoSideEffects
-//! avoids duplicate appends at the cost of occasionally surfacing a Server
-//! error when the SDK cannot prove the request didn't reach the broker; the
-//! streamling supervisor then restarts from the last checkpoint.
-//!
 //! A checkpoint marker awaits all outstanding Producer record tickets before
 //! returning, so the dispatcher only acknowledges the checkpoint after S2 has
 //! durably appended every record submitted before the marker. Termination drains
@@ -245,7 +238,7 @@ impl SinkPlugin for S2Sink {
                     .with_max_attempts(NonZeroU32::new(u32::MAX).expect("u32::MAX is nonzero"))
                     .with_min_base_delay(Duration::from_millis(250))
                     .with_max_base_delay(Duration::from_secs(15))
-                    .with_append_retry_policy(AppendRetryPolicy::NoSideEffects),
+                    .with_append_retry_policy(AppendRetryPolicy::All),
             );
 
         let s2 = S2::new(cfg)
