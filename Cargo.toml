@@ -15,7 +15,7 @@ uint = "0.10"
 abi_stable = "0.11.3"
 
 # Core dependencies
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
 async-trait = "0.1.83"
 futures = "0.3"
