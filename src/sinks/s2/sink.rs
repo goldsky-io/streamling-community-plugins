@@ -9,9 +9,10 @@
 //! - stream — S2 stream name within the basin.
 //!
 //! Optional:
-//! - create_stream (default true) — call basin.ensure_stream at init so the
+//! - ensure_stream (default true) — call basin.ensure_stream at init so the
 //!   stream is created if missing (idempotent). Disable if the access token
 //!   only has append scope.
+//! - endpoint — optional S2-compatible endpoint, useful for s2-lite.
 //! - request_timeout_ms (default 5000) — per-request HTTP timeout passed to
 //!   S2Config::with_request_timeout.
 //! - linger_ms (default 5) - how long the SDK Producer waits for more records
@@ -41,8 +42,8 @@ use s2_sdk::{
     batching::BatchingConfig,
     producer::{Producer, ProducerConfig, RecordSubmitTicket},
     types::{
-        AppendRecord, AppendRetryPolicy, BasinName, EnsureStreamInput, RetryConfig, S2Config,
-        StreamName,
+        AccountEndpoint, AppendRecord, AppendRetryPolicy, BasinEndpoint, BasinName,
+        EnsureStreamInput, RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
 use std::collections::HashMap;
@@ -201,12 +202,12 @@ impl SinkPlugin for S2Sink {
         let basin = self.opts.get("basin")?;
         let stream = self.opts.get("stream")?;
 
-        let create_stream: bool =
+        let ensure_stream: bool =
             self.opts
-                .get_or("create_stream", "true")
+                .get_or("ensure_stream", "true")
                 .parse()
                 .map_err(|e| {
-                    PluginError::Internal(format!("create_stream is not a valid bool: {}", e))
+                    PluginError::Internal(format!("ensure_stream is not a valid bool: {}", e))
                 })?;
 
         let request_timeout_ms: u64 = self
@@ -216,6 +217,7 @@ impl SinkPlugin for S2Sink {
             .map_err(|e| {
                 PluginError::Internal(format!("request_timeout_ms is not a valid u64: {}", e))
             })?;
+        let endpoint = self.opts.get_or("endpoint", "");
         let linger_ms: u64 =
             self.opts.get_or("linger_ms", "5").parse().map_err(|e| {
                 PluginError::Internal(format!("linger_ms is not a valid u64: {}", e))
@@ -231,7 +233,7 @@ impl SinkPlugin for S2Sink {
             PluginError::Internal(format!("invalid stream name '{}': {}", stream, e))
         })?;
 
-        let cfg = S2Config::new(access_token)
+        let mut cfg = S2Config::new(access_token)
             .with_request_timeout(Duration::from_millis(request_timeout_ms))
             .with_retry(
                 RetryConfig::new()
@@ -240,12 +242,24 @@ impl SinkPlugin for S2Sink {
                     .with_max_base_delay(Duration::from_secs(15))
                     .with_append_retry_policy(AppendRetryPolicy::All),
             );
+        if !endpoint.is_empty() {
+            let endpoints = S2Endpoints::new(
+                AccountEndpoint::new(&endpoint).map_err(|e| {
+                    PluginError::Internal(format!("invalid S2 account endpoint: {}", e))
+                })?,
+                BasinEndpoint::new(&endpoint).map_err(|e| {
+                    PluginError::Internal(format!("invalid S2 basin endpoint: {}", e))
+                })?,
+            )
+            .map_err(|e| PluginError::Internal(format!("invalid S2 endpoints: {}", e)))?;
+            cfg = cfg.with_endpoints(endpoints);
+        }
 
         let s2 = S2::new(cfg)
             .map_err(|e| PluginError::Internal(format!("failed to construct S2 client: {}", e)))?;
         let basin_handle = s2.basin(basin_name.clone());
 
-        if create_stream {
+        if ensure_stream {
             basin_handle
                 .ensure_stream(EnsureStreamInput::new(stream_name.clone()))
                 .await
@@ -270,7 +284,7 @@ impl SinkPlugin for S2Sink {
 
         info!(
             stream_id = %stream_id,
-            create_stream,
+            ensure_stream,
             request_timeout_ms,
             linger_ms,
             "S2 sink initialized successfully"

@@ -52,7 +52,7 @@ aws-credential-types = "1"
 aws-types = "1"
 
 # S2 (s2.dev) sink
-s2-sdk = "0.31.5"
+s2-sdk = "0.31.6"
 # rustls is a direct dep so the S2 sink can install the aws-lc-rs CryptoProvider
 # at startup. s2-sdk pulls rustls in via its default feature; we want to be
 # explicit because more than one TLS-using crate is linked (aws-smithy-http-client
@@ -62,6 +62,7 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 regex = "1.11.1"
+s2-testcontainers = "0.36.8"
 serde = "1.0"
 serde_json = "1.0"
 sqlx = { version = "0.8.5", features = ["runtime-tokio", "mysql", "tls-rustls"] }
