@@ -1,4 +1,4 @@
-//! S2 (s2.dev) sink — appends each Arrow row as a JSON record to an S2 stream.
+//! S2 (s2.dev) sink - appends each Arrow row as a JSON record to an S2 stream.
 //!
 //! ## Configuration
 //!
@@ -9,76 +9,80 @@
 //! - stream — S2 stream name within the basin.
 //!
 //! Optional:
-//! - create_stream (default true) — call basin.ensure_stream at init so the
+//! - ensure_stream (default true) — call basin.ensure_stream at init so the
 //!   stream is created if missing (idempotent). Disable if the access token
 //!   only has append scope.
+//! - endpoint — optional S2-compatible endpoint, useful for s2-lite.
 //! - request_timeout_ms (default 5000) — per-request HTTP timeout passed to
 //!   S2Config::with_request_timeout.
+//! - linger_ms (default 5) - how long the SDK Producer waits for more records
+//!   before flushing a partial batch.
 //!
 //! Each option can be overridden by the matching STREAMLING__PLUGIN__S2_SINK__<KEY>
 //! env var; the env var wins when both are set.
 //!
 //! ## Delivery
 //!
-//! Each process_batch packs the incoming RecordBatch's JSON rows into
-//! AppendRecordBatch chunks (≤1000 records / ≤1 MiB, per s2-sdk's
-//! RECORD_BATCH_MAX) and calls stream.append sequentially. If a later
-//! chunk fails after earlier ones succeed, process_batch returns an
-//! error and the entire batch is replayed — duplicates from the
-//! already-acked chunks are standard at-least-once semantics.
+//! Each process_batch converts the incoming RecordBatch's rows into JSON
+//! AppendRecords and submits them to the s2-sdk Producer. The Producer batches
+//! records internally and uses an append session for high-throughput appends.
+//! process_batch returns once records have been accepted by the Producer; the
+//! checkpoint marker is the durability barrier.
 //!
-//! Retries are delegated to the SDK via S2Config::with_retry: max_attempts
-//! = u32::MAX with capped exponential backoff (250ms → 15s) so transient
-//! errors retry until the pipeline shuts down. AppendRetryPolicy::NoSideEffects
-//! avoids duplicate appends at the cost of occasionally surfacing a Server
-//! error when the SDK cannot prove the request didn't reach the broker; the
-//! streamling supervisor then restarts from the last checkpoint.
-//!
-//! Checkpoint hooks are no-ops because stream.append returns once durable.
+//! A checkpoint marker awaits all outstanding Producer record tickets before
+//! returning, so the dispatcher only acknowledges the checkpoint after S2 has
+//! durably appended every record submitted before the marker. Termination drains
+//! pending tickets and then closes the Producer.
 
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use s2_sdk::{
-    S2, S2Stream,
+    S2,
+    batching::BatchingConfig,
+    producer::{Producer, ProducerConfig, RecordSubmitTicket},
     types::{
-        AppendInput, AppendRecord, AppendRecordBatch, AppendRetryPolicy, BasinName,
-        EnsureStreamInput, RetryConfig, S2Config, StreamName,
+        AccountEndpoint, AppendRecord, AppendRetryPolicy, BasinEndpoint, BasinName,
+        EnsureStreamInput, RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::num::NonZeroU32;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use streamling_plugin::r#api::PluginStateBackendFactory;
 use streamling_plugin::api::SupportsGracefulShutdown;
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
 use crate::utils::plugin_options::PluginOptions;
 use crate::utils::record_batch_json;
 
-/// Per-record overhead applied by the S2 metered-bytes formula
-/// (`8 + 2*len(headers) + sum(name+value) + len(body)`). We never set
-/// headers, so the overhead is the constant `8`.
-const APPEND_RECORD_OVERHEAD: usize = 8;
+struct ProducerState {
+    producer: Producer,
+    pending: VecDeque<RecordSubmitTicket>,
+}
 
-/// Maximum records per `AppendRecordBatch`, mirroring `s2_common::caps::RECORD_BATCH_MAX.count`.
-/// The s2-sdk doesn't re-export the constant, so we duplicate it here.
-const APPEND_RECORD_BATCH_MAX_COUNT: usize = 1000;
-
-/// Maximum metered bytes per `AppendRecordBatch`, mirroring
-/// `s2_common::caps::RECORD_BATCH_MAX.bytes` (1 MiB).
-const APPEND_RECORD_BATCH_MAX_BYTES: usize = 1024 * 1024;
+impl ProducerState {
+    fn new(producer: Producer) -> Self {
+        Self {
+            producer,
+            pending: VecDeque::new(),
+        }
+    }
+}
 
 pub struct S2Sink {
     opts: PluginOptions,
     _schema: SchemaRef,
-    stream: OnceLock<S2Stream>,
+    producer: Mutex<Option<ProducerState>>,
     stream_id: OnceLock<String>,
     running: Arc<AtomicBool>,
 }
@@ -94,10 +98,52 @@ impl S2Sink {
         S2Sink {
             opts: PluginOptions::new(options, "s2_sink", "STREAMLING__PLUGIN__S2_SINK"),
             _schema: schema,
-            stream: OnceLock::new(),
+            producer: Mutex::new(None),
             stream_id: OnceLock::new(),
             running: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    fn stream_id_for_logs(&self) -> String {
+        self.stream_id
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "<uninit>".to_string())
+    }
+
+    async fn submit_records(
+        &self,
+        records: Vec<AppendRecord>,
+    ) -> Result<(usize, usize), PluginError> {
+        let stream_id = self.stream_id_for_logs();
+        let mut producer_guard = self.producer.lock().await;
+        let state = producer_guard
+            .as_mut()
+            .ok_or_else(|| PluginError::Internal("S2 producer is not initialized".to_string()))?;
+
+        let acknowledged_records = drain_ready_record_tickets(&stream_id, &mut state.pending)?;
+
+        for record in records {
+            let ticket = state.producer.submit(record).await.map_err(|e| {
+                PluginError::Internal(format!("failed to submit record to S2 Producer: {}", e))
+            })?;
+            state.pending.push_back(ticket);
+        }
+
+        Ok((state.pending.len(), acknowledged_records))
+    }
+
+    async fn flush_pending_records(&self) -> Result<usize, PluginError> {
+        let stream_id = self.stream_id_for_logs();
+        let tickets = {
+            let mut producer_guard = self.producer.lock().await;
+            let state = producer_guard.as_mut().ok_or_else(|| {
+                PluginError::Internal("S2 producer is not initialized".to_string())
+            })?;
+            std::mem::take(&mut state.pending)
+        };
+
+        await_record_tickets(&stream_id, tickets).await
     }
 }
 
@@ -109,6 +155,28 @@ impl SupportsGracefulShutdown for S2Sink {
 
     async fn terminate(&self) -> Result<(), PluginError> {
         self.running.store(false, Ordering::SeqCst);
+
+        let stream_id = self.stream_id_for_logs();
+        let Some(state) = self.producer.lock().await.take() else {
+            return Ok(());
+        };
+
+        let flush_result = await_record_tickets(&stream_id, state.pending).await;
+        let close_result = state.producer.close().await.map_err(|e| {
+            PluginError::Internal(format!(
+                "stream '{}': failed to close S2 Producer: {}",
+                stream_id, e
+            ))
+        });
+
+        let flushed_records = flush_result?;
+        close_result?;
+
+        info!(
+            stream_id = %stream_id,
+            flushed_records,
+            "S2 sink terminated after closing Producer"
+        );
         Ok(())
     }
 }
@@ -116,7 +184,7 @@ impl SupportsGracefulShutdown for S2Sink {
 #[async_trait]
 impl SinkPlugin for S2Sink {
     async fn initialize(&self) -> Result<(), PluginError> {
-        if self.stream.get().is_some() {
+        if self.producer.lock().await.is_some() {
             return Ok(());
         }
 
@@ -134,12 +202,12 @@ impl SinkPlugin for S2Sink {
         let basin = self.opts.get("basin")?;
         let stream = self.opts.get("stream")?;
 
-        let create_stream: bool =
+        let ensure_stream: bool =
             self.opts
-                .get_or("create_stream", "true")
+                .get_or("ensure_stream", "true")
                 .parse()
                 .map_err(|e| {
-                    PluginError::Internal(format!("create_stream is not a valid bool: {}", e))
+                    PluginError::Internal(format!("ensure_stream is not a valid bool: {}", e))
                 })?;
 
         let request_timeout_ms: u64 = self
@@ -149,6 +217,14 @@ impl SinkPlugin for S2Sink {
             .map_err(|e| {
                 PluginError::Internal(format!("request_timeout_ms is not a valid u64: {}", e))
             })?;
+        let endpoint = self.opts.get_or("endpoint", "");
+        let linger_ms: u64 =
+            self.opts.get_or("linger_ms", "5").parse().map_err(|e| {
+                PluginError::Internal(format!("linger_ms is not a valid u64: {}", e))
+            })?;
+
+        let batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
+        let producer_config = ProducerConfig::new().with_batching(batching);
 
         let basin_name: BasinName = basin
             .parse()
@@ -157,21 +233,33 @@ impl SinkPlugin for S2Sink {
             PluginError::Internal(format!("invalid stream name '{}': {}", stream, e))
         })?;
 
-        let cfg = S2Config::new(access_token)
+        let mut cfg = S2Config::new(access_token)
             .with_request_timeout(Duration::from_millis(request_timeout_ms))
             .with_retry(
                 RetryConfig::new()
                     .with_max_attempts(NonZeroU32::new(u32::MAX).expect("u32::MAX is nonzero"))
                     .with_min_base_delay(Duration::from_millis(250))
                     .with_max_base_delay(Duration::from_secs(15))
-                    .with_append_retry_policy(AppendRetryPolicy::NoSideEffects),
+                    .with_append_retry_policy(AppendRetryPolicy::All),
             );
+        if !endpoint.is_empty() {
+            let endpoints = S2Endpoints::new(
+                AccountEndpoint::new(&endpoint).map_err(|e| {
+                    PluginError::Internal(format!("invalid S2 account endpoint: {}", e))
+                })?,
+                BasinEndpoint::new(&endpoint).map_err(|e| {
+                    PluginError::Internal(format!("invalid S2 basin endpoint: {}", e))
+                })?,
+            )
+            .map_err(|e| PluginError::Internal(format!("invalid S2 endpoints: {}", e)))?;
+            cfg = cfg.with_endpoints(endpoints);
+        }
 
         let s2 = S2::new(cfg)
             .map_err(|e| PluginError::Internal(format!("failed to construct S2 client: {}", e)))?;
         let basin_handle = s2.basin(basin_name.clone());
 
-        if create_stream {
+        if ensure_stream {
             basin_handle
                 .ensure_stream(EnsureStreamInput::new(stream_name.clone()))
                 .await
@@ -183,16 +271,22 @@ impl SinkPlugin for S2Sink {
                 })?;
         }
 
-        let s2_stream: S2Stream = basin_handle.stream(stream_name.clone());
+        let s2_stream = basin_handle.stream(stream_name.clone());
+        let producer = s2_stream.producer(producer_config);
         let stream_id = format!("{}/{}", basin_name, stream_name);
 
-        let _ = self.stream.set(s2_stream);
         let _ = self.stream_id.set(stream_id.clone());
+        let mut producer_guard = self.producer.lock().await;
+        if producer_guard.is_some() {
+            return Ok(());
+        }
+        *producer_guard = Some(ProducerState::new(producer));
 
         info!(
             stream_id = %stream_id,
-            create_stream,
+            ensure_stream,
             request_timeout_ms,
+            linger_ms,
             "S2 sink initialized successfully"
         );
         Ok(())
@@ -209,33 +303,48 @@ impl SinkPlugin for S2Sink {
             return Ok(());
         }
 
-        let stream = self
-            .stream
-            .get()
-            .ok_or_else(|| PluginError::Internal("S2 stream is not initialized".to_string()))?;
-        let stream_id = self
-            .stream_id
-            .get()
-            .map(String::as_str)
-            .unwrap_or("<uninit>");
-
-        append_record_batch(stream, &batch)
-            .await
-            .map_err(|e| match e {
+        let stream_id = self.stream_id_for_logs();
+        let json_rows =
+            record_batch_json::record_batch_to_line_delimited_json(&batch).map_err(|e| {
+                PluginError::Internal(format!(
+                    "stream '{}': failed to convert batch to JSON: {}",
+                    stream_id, e
+                ))
+            })?;
+        let total = json_rows.len();
+        let records = append_records_from_json_rows(json_rows).map_err(|e| match e {
+            PluginError::Internal(msg) => {
+                PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
+            }
+            other => other,
+        })?;
+        let (pending_records, acknowledged_records) =
+            self.submit_records(records).await.map_err(|e| match e {
                 PluginError::Internal(msg) => {
                     PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
                 }
                 other => other,
-            })
+            })?;
+
+        debug!(
+            stream_id = %stream_id,
+            rows = total,
+            acknowledged_records,
+            pending_records,
+            "Submitted records to S2 Producer"
+        );
+        Ok(())
     }
 
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
-        let stream_id = self
-            .stream_id
-            .get()
-            .map(String::as_str)
-            .unwrap_or("<uninit>");
-        info!(stream_id = %stream_id, ?epoch, "S2 sink received checkpoint marker");
+        let stream_id = self.stream_id_for_logs();
+        let flushed_records = self.flush_pending_records().await?;
+        info!(
+            stream_id = %stream_id,
+            ?epoch,
+            flushed_records,
+            "S2 sink flushed pending records for checkpoint marker"
+        );
         Ok(())
     }
 
@@ -247,83 +356,88 @@ impl SinkPlugin for S2Sink {
     }
 }
 
-/// Pack pre-encoded JSON rows into `AppendRecordBatch` chunks that satisfy
-/// the s2-sdk's `RECORD_BATCH_MAX` limit (≤1000 records and ≤1 MiB in
-/// metered bytes). `AppendRecordBatch` does not expose a public `push` /
-/// `new`; we accumulate `Vec<AppendRecord>` chunks and convert via
-/// `try_from_iter`, tracking the metered-bytes budget ourselves so the
-/// final conversion can't reject the batch.
-pub(crate) fn pack_into_append_record_batches(
+pub(crate) fn append_records_from_json_rows(
     json_rows: Vec<Vec<u8>>,
-) -> Result<Vec<AppendRecordBatch>, PluginError> {
-    let mut out: Vec<AppendRecordBatch> = Vec::new();
-    let mut current: Vec<AppendRecord> = Vec::new();
-    let mut current_bytes: usize = 0;
-
-    for row in json_rows {
-        let row_len = row.len();
-        let record_bytes = APPEND_RECORD_OVERHEAD + row_len;
-        let record = AppendRecord::new(row).map_err(|e| {
-            PluginError::Internal(format!(
-                "failed to build S2 AppendRecord (row {} bytes): {}",
-                row_len, e
-            ))
-        })?;
-
-        let would_overflow = !current.is_empty()
-            && (current.len() + 1 > APPEND_RECORD_BATCH_MAX_COUNT
-                || current_bytes + record_bytes > APPEND_RECORD_BATCH_MAX_BYTES);
-
-        if would_overflow {
-            let batch =
-                AppendRecordBatch::try_from_iter(std::mem::take(&mut current)).map_err(|e| {
-                    PluginError::Internal(format!("failed to build S2 AppendRecordBatch: {}", e))
-                })?;
-            out.push(batch);
-            current_bytes = 0;
-        }
-
-        current_bytes += record_bytes;
-        current.push(record);
-    }
-
-    if !current.is_empty() {
-        let batch = AppendRecordBatch::try_from_iter(current).map_err(|e| {
-            PluginError::Internal(format!("failed to build S2 AppendRecordBatch: {}", e))
-        })?;
-        out.push(batch);
-    }
-
-    Ok(out)
+) -> Result<Vec<AppendRecord>, PluginError> {
+    json_rows
+        .into_iter()
+        .map(|row| {
+            let row_len = row.len();
+            AppendRecord::new(row).map_err(|e| {
+                PluginError::Internal(format!(
+                    "failed to build S2 AppendRecord (row {} bytes): {}",
+                    row_len, e
+                ))
+            })
+        })
+        .collect()
 }
 
-/// Convert a `RecordBatch` into newline-delimited JSON rows, pack them into
-/// `AppendRecordBatch` chunks, and append each chunk to the given S2 stream.
-/// Extracted from [`S2Sink`] so the logic can be exercised in unit tests.
-pub(crate) async fn append_record_batch(
-    stream: &S2Stream,
-    batch: &RecordBatch,
-) -> Result<(), PluginError> {
-    let json_rows = record_batch_json::record_batch_to_line_delimited_json(batch)
-        .map_err(|e| PluginError::Internal(format!("failed to convert batch to JSON: {}", e)))?;
+fn drain_ready_record_tickets(
+    stream_id: &str,
+    tickets: &mut VecDeque<RecordSubmitTicket>,
+) -> Result<usize, PluginError> {
+    let waker = futures::task::noop_waker_ref();
+    let mut cx = Context::from_waker(waker);
+    let mut acknowledged = 0;
+    let mut last_seq_num = None;
 
-    if json_rows.is_empty() {
-        return Ok(());
+    while let Some(ticket) = tickets.front_mut() {
+        match Future::poll(Pin::new(ticket), &mut cx) {
+            Poll::Ready(Ok(ack)) => {
+                acknowledged += 1;
+                last_seq_num = Some(ack.seq_num);
+                tickets.pop_front();
+            }
+            Poll::Ready(Err(e)) => {
+                return Err(PluginError::Internal(format!(
+                    "failed to append pending S2 Producer record: {}",
+                    e
+                )));
+            }
+            Poll::Pending => {
+                break;
+            }
+        }
     }
 
-    let total = json_rows.len();
-    let append_batches = pack_into_append_record_batches(json_rows)?;
-    let chunks = append_batches.len();
-
-    for b in append_batches {
-        stream
-            .append(AppendInput::new(b))
-            .await
-            .map_err(|e| PluginError::Internal(format!("failed to append to S2: {}", e)))?;
+    if acknowledged > 0 {
+        debug!(
+            stream_id = %stream_id,
+            acknowledged_records = acknowledged,
+            pending_records = tickets.len(),
+            ?last_seq_num,
+            "Drained acknowledged S2 Producer tickets"
+        );
     }
 
-    debug!(rows = total, chunks, "Appended to S2");
-    Ok(())
+    Ok(acknowledged)
+}
+
+async fn await_record_tickets(
+    stream_id: &str,
+    tickets: VecDeque<RecordSubmitTicket>,
+) -> Result<usize, PluginError> {
+    let total = tickets.len();
+    let mut last_seq_num = None;
+
+    for ticket in tickets {
+        let ack = ticket.await.map_err(|e| {
+            PluginError::Internal(format!(
+                "stream '{}': failed to append pending S2 Producer record: {}",
+                stream_id, e
+            ))
+        })?;
+        last_seq_num = Some(ack.seq_num);
+    }
+
+    debug!(
+        stream_id = %stream_id,
+        records = total,
+        ?last_seq_num,
+        "S2 Producer records acknowledged"
+    );
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -331,50 +445,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pack_empty_rows_produces_no_batches() {
-        let batches = pack_into_append_record_batches(Vec::new()).expect("pack empty");
+    fn test_empty_rows_produce_no_append_records() {
+        let records = append_records_from_json_rows(Vec::new()).expect("convert empty");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_json_rows_are_converted_to_append_records_in_order() {
+        let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
+        let records = append_records_from_json_rows(rows).expect("convert rows");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].body(), br#"{"id":1}"#);
+        assert_eq!(records[1].body(), br#"{"id":2}"#);
+    }
+
+    #[test]
+    fn test_oversized_json_row_returns_error() {
+        let rows = vec![vec![b'y'; 1024 * 1024]];
+        let err = append_records_from_json_rows(rows).expect_err("oversized row should fail");
+
         assert!(
-            batches.is_empty(),
-            "expected no batches, got {}",
-            batches.len()
+            err.to_string().contains("failed to build S2 AppendRecord"),
+            "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn test_pack_many_small_rows_fans_out_when_over_record_count_cap() {
-        let rows: Vec<Vec<u8>> = (0..1500).map(|_| b"x".to_vec()).collect();
-        let batches = pack_into_append_record_batches(rows).expect("pack 1500 rows");
-        assert_eq!(
-            batches.len(),
-            2,
-            "expected 2 batches, got {}",
-            batches.len()
-        );
-        assert_eq!(
-            batches[0].len(),
-            1000,
-            "first batch should be at the 1000-record cap"
-        );
-        assert_eq!(
-            batches[1].len(),
-            500,
-            "second batch should hold the remainder"
-        );
-    }
-
-    #[test]
-    fn test_pack_oversized_single_record_in_own_batch() {
-        // 900 KiB row: well below the 1 MiB single-record cap, but two of them
-        // would exceed the 1 MiB batch byte cap, so each must land in its own batch.
-        let big = vec![b'y'; 900 * 1024];
-        let rows = vec![big.clone(), big];
-        let batches = pack_into_append_record_batches(rows).expect("pack oversized");
-        assert_eq!(
-            batches.len(),
-            2,
-            "two 900 KiB rows must split across two batches"
-        );
-        assert_eq!(batches[0].len(), 1);
-        assert_eq!(batches[1].len(), 1);
     }
 }
