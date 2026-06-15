@@ -81,7 +81,25 @@ impl MySqlSink {
             .collect()
     }
 
+    async fn table_exists(&self, pool: &MySqlPool) -> Result<bool, PluginError> {
+        let table = self.opts.get("table")?;
+        let database = self.opts.get("database")?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ? LIMIT 1",
+        )
+        .bind(&database)
+        .bind(&table)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| PluginError::Internal(format!("failed to check table existence: {}", e)))?;
+        Ok(row.is_some())
+    }
+
     async fn create_table_if_needed(&self, pool: &MySqlPool) -> Result<(), PluginError> {
+        if self.table_exists(pool).await? {
+            return Ok(());
+        }
+
         let table = self.opts.get("table")?;
         let database = self.opts.get("database")?;
         let pk_columns = self.primary_key_columns();
@@ -104,7 +122,22 @@ impl MySqlSink {
         );
 
         if !pk_columns.is_empty() {
-            let pk_quoted: Vec<String> = pk_columns.iter().map(|c| format!("`{}`", c)).collect();
+            let pk_quoted: Vec<String> = pk_columns
+                .iter()
+                .map(|c| {
+                    let needs_key_length = self
+                        .schema
+                        .field_with_name(c)
+                        .ok()
+                        .map(|f| pk_needs_key_length(f.data_type()))
+                        .unwrap_or(false);
+                    if needs_key_length {
+                        format!("`{}`(255)", c)
+                    } else {
+                        format!("`{}`", c)
+                    }
+                })
+                .collect();
             sql.push_str(&format!(", PRIMARY KEY ({})", pk_quoted.join(", ")));
         }
         sql.push(')');
@@ -283,7 +316,7 @@ impl SinkPlugin for MySqlSink {
         let user = self.opts.get("user")?;
         let password = self.opts.get("password")?;
         let database = self.opts.get("database")?;
-        let sslmode = self.opts.get_or("sslmode", "disabled");
+        let sslmode = self.opts.get_or("sslmode", "preferred");
 
         info!(
             "Connecting to MySQL: {}@{}:{}/{}",
@@ -396,6 +429,17 @@ impl SinkPlugin for MySqlSink {
 // ---------------------------------------------------------------------------
 // Arrow → MySQL type mapping
 // ---------------------------------------------------------------------------
+
+fn pk_needs_key_length(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+    )
+}
 
 fn arrow_to_mysql_type(dt: &DataType) -> String {
     match dt {
