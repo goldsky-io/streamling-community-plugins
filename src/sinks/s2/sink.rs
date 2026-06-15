@@ -46,7 +46,7 @@ use s2_sdk::{
         EnsureStreamInput, RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::pin::Pin;
@@ -67,14 +67,14 @@ use crate::utils::record_batch_json;
 
 struct ProducerState {
     producer: Producer,
-    pending: Vec<RecordSubmitTicket>,
+    pending: VecDeque<RecordSubmitTicket>,
 }
 
 impl ProducerState {
     fn new(producer: Producer) -> Self {
         Self {
             producer,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }
     }
 }
@@ -127,7 +127,7 @@ impl S2Sink {
             let ticket = state.producer.submit(record).await.map_err(|e| {
                 PluginError::Internal(format!("failed to submit record to S2 Producer: {}", e))
             })?;
-            state.pending.push(ticket);
+            state.pending.push_back(ticket);
         }
 
         Ok((state.pending.len(), acknowledged_records))
@@ -375,20 +375,19 @@ pub(crate) fn append_records_from_json_rows(
 
 fn drain_ready_record_tickets(
     stream_id: &str,
-    tickets: &mut Vec<RecordSubmitTicket>,
+    tickets: &mut VecDeque<RecordSubmitTicket>,
 ) -> Result<usize, PluginError> {
     let waker = futures::task::noop_waker_ref();
     let mut cx = Context::from_waker(waker);
     let mut acknowledged = 0;
     let mut last_seq_num = None;
-    let mut idx = 0;
 
-    while idx < tickets.len() {
-        match Future::poll(Pin::new(&mut tickets[idx]), &mut cx) {
+    while let Some(ticket) = tickets.front_mut() {
+        match Future::poll(Pin::new(ticket), &mut cx) {
             Poll::Ready(Ok(ack)) => {
                 acknowledged += 1;
                 last_seq_num = Some(ack.seq_num);
-                tickets.swap_remove(idx);
+                tickets.pop_front();
             }
             Poll::Ready(Err(e)) => {
                 return Err(PluginError::Internal(format!(
@@ -397,7 +396,7 @@ fn drain_ready_record_tickets(
                 )));
             }
             Poll::Pending => {
-                idx += 1;
+                break;
             }
         }
     }
@@ -417,7 +416,7 @@ fn drain_ready_record_tickets(
 
 async fn await_record_tickets(
     stream_id: &str,
-    tickets: Vec<RecordSubmitTicket>,
+    tickets: VecDeque<RecordSubmitTicket>,
 ) -> Result<usize, PluginError> {
     let total = tickets.len();
     let mut last_seq_num = None;
