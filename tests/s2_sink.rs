@@ -29,11 +29,6 @@ const TEST_SCHEMA: &str = r#"{
 
 #[tokio::test]
 async fn test_s2_sink_writes_records_to_s2_lite() {
-    if !s2_lite_enabled() {
-        eprintln!("skipping s2-lite e2e; set E2E_S2_LITE=1 to run it");
-        return;
-    }
-
     init_tracing();
 
     let s2_lite = S2Lite::start().await.expect("failed to start s2-lite");
@@ -146,10 +141,4 @@ sinks:
         .collect();
     let expected_ids: BTreeSet<i64> = (1..=records_to_produce).collect();
     assert_eq!(ids, expected_ids);
-}
-
-fn s2_lite_enabled() -> bool {
-    std::env::var("E2E_S2_LITE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
 }
