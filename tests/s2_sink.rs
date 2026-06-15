@@ -138,6 +138,16 @@ sinks:
         .map(|record| {
             let value: serde_json::Value =
                 serde_json::from_slice(&record.body).expect("S2 record should be JSON");
+            assert!(
+                value.get("_gs_op").is_none(),
+                "S2 record body should not duplicate operation metadata"
+            );
+            let op_header = record
+                .headers
+                .iter()
+                .find(|header| header.name.as_ref() == b"dbz.op")
+                .expect("S2 record should include operation header");
+            assert_eq!(op_header.value.as_ref(), b"c");
             value
                 .get("id")
                 .and_then(serde_json::Value::as_i64)
