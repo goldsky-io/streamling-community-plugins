@@ -62,6 +62,22 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 | `secret_access_key` | no | AWS secret key (env var preferred) |
 | `session_token` | no | STS session token (env var preferred) |
 
+### S2 Sink (`s2_sink`)
+
+Appends each row as a JSON record to a stream on [s2.dev](https://s2.dev) — a durable streaming service — via the `s2-sdk` Producer. Rows are JSON-serialized and submitted to the Producer, which batches them internally; checkpoint markers drain pending record tickets, so the dispatcher only acknowledges a checkpoint after S2 has durably appended every record submitted before it.
+
+All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `access_token` | yes | — | S2 access token (env var preferred) |
+| `basin` | yes | — | S2 basin name (must already exist) |
+| `stream` | yes | — | S2 stream name within the basin |
+| `ensure_stream` | no | `true` | Create the stream if missing (idempotent). Disable if the token only has append scope |
+| `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
+| `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
+| `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
+
 ### Quick start
 
 ```bash
