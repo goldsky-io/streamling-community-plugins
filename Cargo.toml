@@ -75,6 +75,6 @@ crate-type = ["cdylib", "rlib"]
 
 [patch.crates-io]
 # Upgrade thrift to fix CVE-2026-43868 (Memory Allocation with Excessive Size Value).
-# parquet depends on thrift ^0.17 which resolves to the vulnerable 0.17.0; this
-# patch forces 0.23.0 (the first release that addresses the CVE) to be used instead.
-thrift = "0.23.0"
+# parquet depends on thrift ^0.17 which cannot resolve to the fixed 0.23.0 via the
+# registry alone (semver incompatibility); the git patch bypasses the constraint.
+thrift = { git = "https://github.com/apache/thrift", tag = "v0.23.0" }
