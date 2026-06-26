@@ -72,3 +72,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [lib]
 name = "community_plugins"
 crate-type = ["cdylib", "rlib"]
+
+[patch.crates-io]
+# Upgrade thrift to fix CVE-2026-43868 (Memory Allocation with Excessive Size Value).
+# parquet depends on thrift ^0.17 which resolves to the vulnerable 0.17.0; this
+# patch forces 0.23.0 (the first release that addresses the CVE) to be used instead.
+thrift = "0.23.0"
