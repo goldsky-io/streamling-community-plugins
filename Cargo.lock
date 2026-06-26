@@ -5918,7 +5918,7 @@ dependencies = [
 
 [[package]]
 name = "thrift"
-version = "0.23.0"
+version = "0.17.0"
 source = "git+https://github.com/apache/thrift?tag=v0.23.0#e4b684f5ff4f9c3a42cd7ec0a667c3d9bd7f6ac1"
 dependencies = [
  "byteorder",

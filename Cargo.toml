@@ -73,8 +73,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 name = "community_plugins"
 crate-type = ["cdylib", "rlib"]
 
-[patch.crates-io]
+[replace]
 # Upgrade thrift to fix CVE-2026-43868 (Memory Allocation with Excessive Size Value).
 # parquet depends on thrift ^0.17 which cannot resolve to the fixed 0.23.0 via the
-# registry alone (semver incompatibility); the git patch bypasses the constraint.
-thrift = { git = "https://github.com/apache/thrift", tag = "v0.23.0" }
+# registry alone (semver incompatibility). [replace] bypasses the constraint, unlike
+# [patch] which enforces semver compat between the patch version and the dependency req.
+"thrift:0.17.0" = { git = "https://github.com/apache/thrift", tag = "v0.23.0" }
