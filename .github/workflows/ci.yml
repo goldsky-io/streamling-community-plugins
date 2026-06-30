@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.93.1
         with:
           components: clippy, rustfmt
       - name: Install sccache
@@ -39,9 +39,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-plugins-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          key: sccache-plugins-${{ runner.os }}-1.93.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            sccache-plugins-${{ runner.os }}-1.90.0-
+            sccache-plugins-${{ runner.os }}-1.93.1-
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
@@ -80,7 +80,7 @@ jobs:
           tar -xzf streamling.tar.gz -C streamling-bin
           chmod +x streamling-bin/streamling
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.93.1
       - name: Install sccache
         uses: taiki-e/install-action@v2
         with:
@@ -93,9 +93,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-${{ runner.os }}-${{ runner.arch }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          key: sccache-release-${{ runner.os }}-${{ runner.arch }}-1.93.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            sccache-release-${{ runner.os }}-${{ runner.arch }}-1.90.0-
+            sccache-release-${{ runner.os }}-${{ runner.arch }}-1.93.1-
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
@@ -155,7 +155,7 @@ jobs:
           echo "STREAMLING__PLUGIN__PATH=$GITHUB_WORKSPACE/artifacts/target/release/libcommunity_plugins.so" >> $GITHUB_ENV
       # Rust + caching (only for compiling the test binary, not streamling)
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.93.1
       - name: Install sccache
         uses: taiki-e/install-action@v2
         with:
@@ -168,9 +168,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-plugin-e2e-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          key: sccache-plugin-e2e-${{ runner.os }}-1.93.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            sccache-plugin-e2e-${{ runner.os }}-1.90.0-
+            sccache-plugin-e2e-${{ runner.os }}-1.93.1-
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
