@@ -188,6 +188,24 @@ jobs:
         working-directory: streamling
         run: ./scripts/k3s-setup.sh
         timeout-minutes: 5
+      # Postgres with logical replication for the postgres_cdc_source e2e
+      # tests (they self-skip without E2E_POSTGRES_CDC_URL). GHA service
+      # containers can't pass a custom CMD, so start one with
+      # `wal_level=logical` via docker run.
+      - name: Start Postgres (logical replication) for CDC e2e
+        run: |
+          set -euo pipefail
+          docker run -d --name pg-cdc \
+            -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=cdc \
+            postgres:16 \
+            -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+          for i in $(seq 1 30); do
+            docker exec pg-cdc pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec pg-cdc pg_isready -U postgres
       # Run plugin e2e tests
       - name: Run plugin e2e tests
         run: |
@@ -195,7 +213,7 @@ jobs:
           eval "$(cd streamling && ./scripts/k3s-setup.sh --env-only)"
           cargo nextest run --test '*'
         env:
-          RUST_LOG: info
+          E2E_POSTGRES_CDC_URL: postgres://postgres:postgres@localhost:5432/cdc
           CARGO_INCREMENTAL: 0
           CARGO_PROFILE_TEST_DEBUG: 0
         timeout-minutes: 10

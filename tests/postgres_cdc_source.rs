@@ -310,7 +310,7 @@ async fn auto_create_publication_creates_and_streams() {
     }
     options.insert("publication_name".into(), publication.clone());
     options.insert("table".into(), format!("public.{table}"));
-    options.insert("slot_name".into(), format!("e2e_{pipeline_id}"));
+    options.insert("slot_name".into(), format!("ac_{pipeline_id}"));
     options.insert("batch_interval_ms".into(), "200".into());
     options.insert("auto_create_publication".into(), "true".into());
 
