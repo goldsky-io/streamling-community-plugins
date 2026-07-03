@@ -231,28 +231,165 @@ async fn copy_then_stream_insert_update_delete() {
 
     source.terminate().await.expect("terminate");
 
-    // Cleanup: etl at the pinned rev does NOT drop the apply replication
-    // slot on shutdown, and inactive slots pin WAL on the shared e2e
-    // database. Best-effort drop all inactive supabase_etl_% slots,
-    // retrying once if a slot is still releasing.
+    cleanup_pub_slot_and_table(&pool, &publication, &table).await;
+}
+
+/// Drops inactive etl replication slots (the pinned etl rev does not drop the
+/// apply slot on shutdown, and inactive slots pin WAL on the shared e2e db),
+/// then the publication and table. Best-effort.
+async fn cleanup_pub_slot_and_table(pool: &sqlx::PgPool, publication: &str, table: &str) {
     let drop_slots = "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
                       WHERE slot_name LIKE 'supabase_etl_%' AND active = false";
-    let count_slots = "SELECT count(*) FROM pg_replication_slots \
-                       WHERE slot_name LIKE 'supabase_etl_%'";
-    let _ = sqlx::query(drop_slots).execute(&pool).await;
+    let count_slots =
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'supabase_etl_%'";
+    let _ = sqlx::query(drop_slots).execute(pool).await;
     let remaining: i64 = sqlx::query_scalar(count_slots)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap_or(0);
     if remaining > 0 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let _ = sqlx::query(drop_slots).execute(&pool).await;
+        let _ = sqlx::query(drop_slots).execute(pool).await;
     }
-
     let _ = sqlx::query(&format!("DROP PUBLICATION IF EXISTS {publication}"))
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-        .execute(&pool)
+        .execute(pool)
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_create_publication_creates_and_streams() {
+    let Ok(url) = std::env::var("E2E_POSTGRES_CDC_URL") else {
+        eprintln!("skipping: E2E_POSTGRES_CDC_URL not set");
+        return;
+    };
+
+    let parsed = url::Url::parse(&url).expect("valid E2E_POSTGRES_CDC_URL");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let table = format!("cdc_autopub_{nonce}");
+    let publication = format!("cdc_autopub_pub_{nonce}");
+    let pipeline_id = nonce % 1_000_000;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect to e2e postgres");
+
+    // Deliberately do NOT create the publication — the plugin must create it.
+    sqlx::query(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name TEXT)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!("ALTER TABLE {table} REPLICA IDENTITY FULL"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("INSERT INTO {table} VALUES (1, 'seed')"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut options: HashMap<String, String> = HashMap::new();
+    options.insert("host".into(), parsed.host_str().unwrap().to_string());
+    options.insert("port".into(), parsed.port().unwrap_or(5432).to_string());
+    options.insert(
+        "database".into(),
+        parsed.path().trim_start_matches('/').to_string(),
+    );
+    options.insert("username".into(), parsed.username().to_string());
+    if let Some(p) = parsed.password() {
+        options.insert("password".into(), p.to_string());
+    }
+    options.insert("publication_name".into(), publication.clone());
+    options.insert("table".into(), format!("public.{table}"));
+    options.insert("slot_name".into(), format!("e2e_{pipeline_id}"));
+    options.insert("batch_interval_ms".into(), "200".into());
+    options.insert("auto_create_publication".into(), "true".into());
+
+    let source = PostgresCdcSource::new(
+        DirectTokioProxy::new().into_async_runtime_obj(),
+        test_state_backend(),
+        test_metrics(),
+        options,
+    )
+    .expect("source construction");
+    source.initialize().await.expect("initialize");
+
+    // The plugin must have created the publication containing our table.
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_publication_tables \
+         WHERE pubname = $1 AND schemaname = 'public' AND tablename = $2",
+    )
+    .bind(&publication)
+    .bind(&table)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(exists, 1, "auto_create_publication did not add the table");
+
+    // Phase 1: initial copy of the seed row.
+    let mut seen: Vec<ObservedRow> = Vec::new();
+    let mut epoch = 1u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !seen.iter().any(|(op, id, _)| op == "i" && *id == 1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for copy row; saw {seen:?}"
+        );
+        let batch = source.generate_batch().await.expect("generate_batch");
+        if batch.num_rows() > 0 {
+            seen.extend(collect_rows(&batch));
+        }
+        source
+            .process_checkpoint_marker(CheckpointEpoch(epoch))
+            .await
+            .unwrap();
+        source
+            .process_checkpoint_finalizer(CheckpointEpoch(epoch))
+            .await
+            .unwrap();
+        epoch += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Phase 2: a live insert must stream through the auto-created publication.
+    sqlx::query(&format!("INSERT INTO {table} VALUES (2, 'live')"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !seen.iter().any(|(op, id, _)| op == "i" && *id == 2) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for live insert; saw {seen:?}"
+        );
+        let batch = source.generate_batch().await.expect("generate_batch");
+        if batch.num_rows() > 0 {
+            seen.extend(collect_rows(&batch));
+        }
+        source
+            .process_checkpoint_marker(CheckpointEpoch(epoch))
+            .await
+            .unwrap();
+        source
+            .process_checkpoint_finalizer(CheckpointEpoch(epoch))
+            .await
+            .unwrap();
+        epoch += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(seen.contains(&("i".into(), 1, Some("seed".into()))));
+    assert!(seen.contains(&("i".into(), 2, Some("live".into()))));
+
+    source.terminate().await.expect("terminate");
+    cleanup_pub_slot_and_table(&pool, &publication, &table).await;
 }

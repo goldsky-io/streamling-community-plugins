@@ -1,7 +1,7 @@
 //! Bridges etl's push-based `Destination` into a pull-based mpsc stream of
 //! aligned CDC-row units.
 //!
-//! Each `write_events` / `write_table_rows` call fans out to one `Unit` per
+//! Each `write_events` / `write_table_rows` call fans out to one `WriteUnit` per
 //! subscriber table, carrying rows aligned to that table's output columns plus
 //! a slice of the shared etl ack (`SourceAckHandle`). Acks are NOT resolved
 //! here — each source arms its slice in the `AckLedger` once delivered and
@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 
 /// One destination write destined for a single subscriber: that table's
 /// aligned rows + its slice of the shared etl ack.
-pub struct Unit {
+pub struct WriteUnit {
     pub rows: Vec<CdcRow>,
     pub ack: SourceAckHandle,
 }
@@ -219,7 +219,7 @@ pub struct Subscriber {
     pub source_id: SourceId,
     pub table_label: String,
     pub converter: RowConverter,
-    pub tx: mpsc::Sender<Unit>,
+    pub tx: mpsc::Sender<WriteUnit>,
 }
 
 /// etl `Destination` that fans each write out to per-table subscriber channels.
@@ -251,19 +251,19 @@ impl ChannelDestination {
         }
     }
 
-    /// Sends one `Unit` per subscriber that produced rows; builds a `SharedAck`
+    /// Sends one `WriteUnit` per subscriber that produced rows; builds a `SharedAck`
     /// over exactly those subscribers (empty set ⇒ acks immediately). A failed
     /// send (receiver gone) leaves that subscriber's slice unreleased, so the
     /// etl ack never fires and etl stops the pipeline — correct on shutdown.
     async fn fan_out(
         &self,
-        per_sub: Vec<(SourceId, mpsc::Sender<Unit>, Vec<CdcRow>)>,
+        per_sub: Vec<(SourceId, mpsc::Sender<WriteUnit>, Vec<CdcRow>)>,
         async_result: AsyncResult<()>,
     ) {
         let pending: HashSet<SourceId> = per_sub.iter().map(|(id, _, _)| *id).collect();
         let shared = SharedAck::new(async_result, pending);
         for (source_id, tx, rows) in per_sub {
-            let unit = Unit {
+            let unit = WriteUnit {
                 rows,
                 ack: (shared.clone(), source_id),
             };

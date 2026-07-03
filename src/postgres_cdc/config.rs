@@ -11,7 +11,9 @@
 //! Postgres gets an `etl` schema created by migrations),
 //! `batch_max_fill_ms` (1000), `batch_max_bytes` (8 MiB),
 //! `max_table_sync_workers` (4), `batch_size` (1000 envelope rows),
-//! `batch_interval_ms` (100), `max_buffered_units` (8).
+//! `batch_interval_ms` (100), `max_buffered_units` (8),
+//! `auto_create_publication` (false: create the publication / add missing
+//! tables before starting — needs CREATE/ownership privileges).
 
 use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
@@ -58,6 +60,11 @@ pub struct SourceSettings {
     pub batch_interval_ms: u64,
     /// Bounded channel capacity, in units.
     pub max_buffered_units: usize,
+    /// Create the publication if missing and `ALTER ... ADD TABLE` any
+    /// registered tables not yet in it, before starting. Off by default —
+    /// managing the publication is usually an operator concern. Requires a
+    /// role with `CREATE` on the database / table ownership; see the README.
+    pub auto_create_publication: bool,
 }
 
 #[derive(Debug)]
@@ -203,6 +210,7 @@ pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, 
             batch_size,
             batch_interval_ms: parse_opt(options, "batch_interval_ms", 100u64)?,
             max_buffered_units,
+            auto_create_publication: parse_opt(options, "auto_create_publication", false)?,
         },
     })
 }
@@ -244,6 +252,7 @@ mod tests {
         assert_eq!(cfg.settings.batch_size, 1000);
         assert_eq!(cfg.settings.batch_interval_ms, 100);
         assert_eq!(cfg.settings.max_buffered_units, 8);
+        assert!(!cfg.settings.auto_create_publication);
     }
 
     #[test]
@@ -362,5 +371,12 @@ mod tests {
         let cfg = parse_options(&opts).unwrap();
         assert!(cfg.pipeline.pg_connection.tls.enabled);
         assert_eq!(cfg.pipeline.pg_connection.tls.trusted_root_certs, "PEMPEM");
+    }
+    #[test]
+    fn auto_create_publication_parses_and_defaults_false() {
+        let mut opts = base_options();
+        opts.insert("auto_create_publication".into(), "true".into());
+        let cfg = parse_options(&opts).unwrap();
+        assert!(cfg.settings.auto_create_publication);
     }
 }

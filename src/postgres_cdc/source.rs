@@ -35,11 +35,11 @@
 //! `batch_max_bytes`/`batch_max_fill_ms` upward for high-volume tables.
 
 use crate::postgres_cdc::arrow::{CdcRow, rows_to_record_batch};
-use crate::postgres_cdc::bridge::Unit;
+use crate::postgres_cdc::bridge::WriteUnit;
 use crate::postgres_cdc::config::{ParsedConfig, SourceSettings, parse_options};
 use crate::postgres_cdc::discovery::{build_output_schema, discover_columns_blocking};
 use crate::postgres_cdc::ledger::{AckLedger, SourceAckHandle};
-use crate::postgres_cdc::shared::{self, SharedPipeline, Subscription};
+use crate::postgres_cdc::pipeline::{self, SharedPipeline, Subscription};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -66,9 +66,9 @@ fn install_crypto_provider() {
 }
 
 struct RecvState {
-    rx: tokio::sync::mpsc::Receiver<Unit>,
-    /// Unit partially emitted by a previous generate_batch call.
-    carry: Option<Unit>,
+    rx: tokio::sync::mpsc::Receiver<WriteUnit>,
+    /// `WriteUnit` partially emitted by a previous generate_batch call.
+    carry: Option<WriteUnit>,
 }
 
 struct RunningState {
@@ -118,13 +118,14 @@ impl PostgresCdcSource {
             "{}.{}",
             parsed.settings.table_schema, parsed.settings.table_name
         );
-        let subscription = shared::register(
+        let subscription = pipeline::register(
             &parsed.settings.slot_name,
             parsed.pipeline.clone(),
             parsed.group_identity(),
             table_label,
             data_columns,
             parsed.settings.max_buffered_units,
+            parsed.settings.auto_create_publication,
         )
         .map_err(|e| PluginInitializationError::Configuration(e.into()))?;
 
@@ -216,7 +217,7 @@ impl SourcePlugin for PostgresCdcSource {
 
             // Move up to `limit` rows out of `unit`; returns the ack when the
             // unit is exhausted, otherwise re-carries it.
-            fn take_from(unit: &mut Unit, rows: &mut Vec<CdcRow>, batch_size: usize) -> bool {
+            fn take_from(unit: &mut WriteUnit, rows: &mut Vec<CdcRow>, batch_size: usize) -> bool {
                 let n = (batch_size - rows.len()).min(unit.rows.len());
                 rows.extend(unit.rows.drain(..n));
                 unit.rows.is_empty()

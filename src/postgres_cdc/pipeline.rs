@@ -1,14 +1,22 @@
 //! Process-global registry that lets `postgres_cdc_source` instances sharing a
-//! `slot_name` share one etl `Pipeline` + replication slot. Keyed by
-//! `slot_name`; each group is one `SharedPipeline` owning the etl pipeline and
-//! fanning decoded rows out to per-table subscriber channels.
+//! `slot_name` share one etl `Pipeline` + replication slot.
 //!
+//! Keyed by `slot_name`; each group is one [`SharedPipeline`] owning the etl
+//! pipeline and fanning decoded rows out to per-table subscriber channels.
 //! Registration happens in each source's `new()`. Because streamling
 //! constructs every source before running any `initialize()`, the group's
-//! membership is complete before the first `ensure_started()` builds the
-//! fan-out destination and starts the one etl pipeline.
+//! membership is complete before the first [`SharedPipeline::ensure_started`]
+//! builds the fan-out destination and starts the one etl pipeline.
+//!
+//! ## Metadata store
+//! etl persists its replication state (table schemas, per-table sync progress,
+//! slot state) via its built-in [`PostgresStore`]. By default that store is the
+//! same database as the source (`pg_connection`); override with the `store_*`
+//! options to keep this bookkeeping out of the source database. etl also
+//! installs an `etl` schema (helper functions + a DDL trigger) in the source
+//! database on pipeline start, regardless of the store setting.
 
-use crate::postgres_cdc::bridge::{ChannelDestination, Subscriber, Unit};
+use crate::postgres_cdc::bridge::{ChannelDestination, Subscriber, WriteUnit};
 use crate::postgres_cdc::config::GroupIdentity;
 use crate::postgres_cdc::ledger::SourceId;
 use etl::config::PipelineConfig;
@@ -30,7 +38,7 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<SharedPipeline>>> {
 /// pipeline it belongs to.
 pub struct Subscription {
     pub source_id: SourceId,
-    pub rx: mpsc::Receiver<Unit>,
+    pub rx: mpsc::Receiver<WriteUnit>,
     pub shared: Arc<SharedPipeline>,
 }
 
@@ -47,7 +55,7 @@ struct PendingSub {
     source_id: SourceId,
     table_label: String,
     data_columns: Vec<String>,
-    tx: mpsc::Sender<Unit>,
+    tx: mpsc::Sender<WriteUnit>,
 }
 
 pub struct SharedPipeline {
@@ -55,6 +63,10 @@ pub struct SharedPipeline {
     identity: GroupIdentity,
     /// Config from the first registrant; used to start the one etl pipeline.
     pipeline_config: Mutex<Option<PipelineConfig>>,
+    /// Whether to auto-create the publication / add missing tables before
+    /// starting. Taken from the first registrant (the publication is shared by
+    /// the whole group, so all sources implicitly agree on it).
+    auto_create_publication: bool,
     inner: Mutex<Inner>,
     running: Arc<AtomicBool>,
 }
@@ -77,6 +89,7 @@ pub fn register(
     table_label: String,
     data_columns: Vec<String>,
     capacity: usize,
+    auto_create_publication: bool,
 ) -> Result<Subscription, String> {
     let shared = {
         let mut map = registry().lock().expect("registry poisoned");
@@ -95,6 +108,7 @@ pub fn register(
                     slot_name: slot_name.to_string(),
                     identity,
                     pipeline_config: Mutex::new(Some(pipeline)),
+                    auto_create_publication,
                     inner: Mutex::new(Inner {
                         next_source_id: 0,
                         refcount: 0,
@@ -172,6 +186,19 @@ impl SharedPipeline {
             .take()
             .ok_or_else(|| "shared pipeline already consumed its config".to_string())?;
 
+        // The publication must exist and include every replicated table before
+        // etl validates it in `Pipeline::start`; create it (or add missing
+        // tables) when auto_create_publication is set. This touches the SOURCE
+        // database — publications live there regardless of the store setting.
+        if self.auto_create_publication {
+            let tables: Vec<String> = subscribers.iter().map(|s| s.table_label.clone()).collect();
+            ensure_publication(
+                &pipeline_config.pg_connection,
+                &pipeline_config.publication_name,
+                &tables,
+            )
+            .await?;
+        }
         let store_conn = pipeline_config
             .store_pg_connection
             .clone()
@@ -228,6 +255,124 @@ impl SharedPipeline {
                 .remove(&self.slot_name);
         }
     }
+}
+/// Ensures the Postgres publication `publication_name` exists and contains
+/// every table in `tables` (each a "schema.name" label). Creates the
+/// publication if missing, or `ALTER ... ADD TABLE`s any registered tables not
+/// yet in it. A no-op for a `FOR ALL TABLES` publication.
+///
+/// Runs against the SOURCE database (where publications live), using the
+/// source connection. Requires a role with `CREATE` on the database (to create
+/// a publication) and/or ownership of the tables (to add them); a plain
+/// replication role usually lacks these and should manage the publication
+/// manually instead.
+async fn ensure_publication(
+    conn: &etl::config::PgConnectionConfig,
+    publication_name: &str,
+    tables: &[String],
+) -> Result<(), String> {
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+
+    let opts = crate::postgres_cdc::discovery::pg_connect_options(conn);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(opts)
+        .await
+        .map_err(|e| format!("postgres_cdc_source: auto-publication connect: {e}"))?;
+
+    // `puballtables` is NULL when the publication does not exist.
+    let puballtables: Option<bool> =
+        sqlx::query_scalar("SELECT puballtables FROM pg_publication WHERE pubname = $1")
+            .bind(publication_name)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("postgres_cdc_source: auto-publication read: {e}"))?;
+
+    match puballtables {
+        None => {
+            let mut sql = format!(
+                "CREATE PUBLICATION {} FOR TABLE",
+                quote_ident(publication_name)
+            );
+            for (i, label) in tables.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push(' ');
+                sql.push_str(&quote_table_label(label));
+            }
+            sqlx::query(&sql).execute(&pool).await.map_err(|e| {
+                format!(
+                    "postgres_cdc_source: auto-publication create failed (the role needs \
+                         CREATE privilege on the database, or create the publication manually): \
+                         {e}"
+                )
+            })?;
+            info!(
+                publication = publication_name,
+                "postgres_cdc_source: created publication"
+            );
+        }
+        Some(true) => {
+            // `FOR ALL TABLES` already covers every table; adding is an error.
+        }
+        Some(false) => {
+            let have: Vec<String> = sqlx::query_scalar(
+                "SELECT schemaname::text || '.' || tablename::text \
+                 FROM pg_publication_tables WHERE pubname = $1",
+            )
+            .bind(publication_name)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("postgres_cdc_source: auto-publication read tables: {e}"))?;
+            let missing: Vec<&String> = tables
+                .iter()
+                .filter(|t| !have.iter().any(|h| h == *t))
+                .collect();
+            if missing.is_empty() {
+                pool.close().await;
+                return Ok(());
+            }
+            let mut sql = format!(
+                "ALTER PUBLICATION {} ADD TABLE",
+                quote_ident(publication_name)
+            );
+            for (i, label) in missing.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push(' ');
+                sql.push_str(&quote_table_label(label));
+            }
+            sqlx::query(&sql).execute(&pool).await.map_err(|e| {
+                format!(
+                    "postgres_cdc_source: auto-publication add-table failed (the role needs \
+                         ownership of the tables, or add them manually): {e}"
+                )
+            })?;
+            info!(
+                publication = publication_name,
+                added = missing.len(),
+                "postgres_cdc_source: added tables to publication"
+            );
+        }
+    }
+    pool.close().await;
+    Ok(())
+}
+
+/// Quotes a SQL identifier (publication or table name), doubling embedded
+/// double quotes per the PostgreSQL identifier rules.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Quotes a "schema.name" label as two separate identifiers.
+fn quote_table_label(label: &str) -> String {
+    let (schema, name) = label.split_once('.').unwrap_or((label, ""));
+    format!("{}.{}", quote_ident(schema), quote_ident(name))
 }
 
 #[cfg(test)]
@@ -289,6 +434,7 @@ mod tests {
             "public.a".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap();
         let s2 = register(
@@ -298,6 +444,7 @@ mod tests {
             "public.b".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap();
         assert_ne!(s1.source_id, s2.source_id);
@@ -316,6 +463,7 @@ mod tests {
             "public.a".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap();
         let err = register(
@@ -325,6 +473,7 @@ mod tests {
             "public.a".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("already registered"));
@@ -340,6 +489,7 @@ mod tests {
             "public.a".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap();
         let err = register(
@@ -349,6 +499,7 @@ mod tests {
             "public.b".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("must match"));
@@ -364,10 +515,26 @@ mod tests {
             "public.a".into(),
             vec!["id".into()],
             4,
+            false,
         )
         .unwrap();
         assert!(registry().lock().unwrap().contains_key(g));
         s1.shared.deregister(s1.source_id);
         assert!(!registry().lock().unwrap().contains_key(g));
+    }
+
+    #[test]
+    fn quote_helpers_quote_identifiers_safely() {
+        // Plain identifier wrapped in double quotes.
+        assert_eq!(quote_ident("my_pub"), r#""my_pub""#);
+        // Embedded double quote is doubled (SQL identifier escaping).
+        assert_eq!(quote_ident(r#"a"b"#), r#""a""b""#);
+        // schema.name is split into two separately-quoted identifiers.
+        assert_eq!(quote_table_label("public.users"), r#""public"."users""#);
+        // A quoted table name containing a dot survives correctly.
+        assert_eq!(
+            quote_table_label(r#"public.odd"name"#),
+            r#""public"."odd""name""#
+        );
     }
 }

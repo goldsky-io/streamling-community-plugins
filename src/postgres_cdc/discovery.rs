@@ -85,15 +85,9 @@ pub fn build_output_schema(columns: &[DiscoveredColumn]) -> Result<Schema, Strin
     Ok(Schema::new(fields))
 }
 
-/// Fetches the table's column names and type OIDs, blocking the caller.
-///
-/// Spawns a scratch thread with a current-thread runtime so it is safe to
-/// call from both plain and tokio threads.
-pub fn discover_columns_blocking(
-    conn: &PgConnectionConfig,
-    table_schema: &str,
-    table_name: &str,
-) -> Result<Vec<DiscoveredColumn>, String> {
+/// Builds sqlx connect options from an etl `PgConnectionConfig`, including TLS
+/// mode and password. Shared by schema discovery and auto-publication setup.
+pub(crate) fn pg_connect_options(conn: &PgConnectionConfig) -> PgConnectOptions {
     let mut opts = PgConnectOptions::new()
         .host(&conn.host)
         .port(conn.port)
@@ -107,6 +101,18 @@ pub fn discover_columns_blocking(
     if let Some(password) = &conn.password {
         opts = opts.password(password.expose_secret());
     }
+    opts
+}
+/// Fetches the table's column names and type OIDs, blocking the caller.
+///
+/// Spawns a scratch thread with a current-thread runtime so it is safe to
+/// call from both plain and tokio threads.
+pub fn discover_columns_blocking(
+    conn: &PgConnectionConfig,
+    table_schema: &str,
+    table_name: &str,
+) -> Result<Vec<DiscoveredColumn>, String> {
+    let opts = pg_connect_options(conn);
     let (table_schema, table_name) = (table_schema.to_string(), table_name.to_string());
 
     std::thread::spawn(move || -> Result<Vec<DiscoveredColumn>, String> {

@@ -78,6 +78,61 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` enviro
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 | `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
 
+### Postgres CDC Source (`postgres_cdc_source`)
+
+Streams Postgres logical-replication changes (an initial table copy followed by
+continuous CDC) by embedding the [`supabase/etl`](https://github.com/supabase/etl)
+pipeline. One source instance replicates exactly one table. The output is the
+table's own typed columns plus a `_gs_op` column (`i` = insert/copy, `u` =
+update, `d` = delete) — no CDC envelope. Sinks should upsert by primary key and
+delete on `_gs_op = "d"`; delivery is at-least-once, so replays are idempotent.
+
+Sources that share a `slot_name` share one replication slot and one etl pipeline
+(coordinated fan-out and acks); give each source its own `slot_name` otherwise.
+
+**Requirements & caveats:**
+
+- **Postgres >= 14** and `wal_level = logical` (Postgres 13 does not work).
+- The connecting role needs `REPLICATION` plus `SELECT` on the replicated table.
+  For `auto_create_publication`, it additionally needs `CREATE` on the database
+  (to create the publication) and/or ownership of the tables (to add them).
+- **Schema evolution is not supported.** The output schema is fixed at startup
+  from the table's columns; columns added later are dropped, dropped columns
+  become null, and type/constraint changes are not applied. Recreate the source
+  after DDL.
+- `UPDATE`/`DELETE` carry a full old-row image only with
+  `ALTER TABLE ... REPLICA IDENTITY FULL`; the default emits key-only images for
+  deletes (and unchanged-TOAST columns are null on updates).
+- **Metadata storage:** etl persists replication state (table schemas, sync
+  progress, slot state) in a `PostgresStore`, and installs an `etl` schema
+  (helper functions + a DDL trigger) in the source database on start. By default
+  the store is the source database; set the `store_*` options to keep this
+  bookkeeping elsewhere. (A future version may use Streamling's own state store.)
+
+All YAML options can also be set via `STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE__<KEY>`
+environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `host` | yes | — | Postgres host |
+| `database` | yes | — | Database name |
+| `username` | yes | — | Role with `REPLICATION` |
+| `password` | no | — | Postgres password (env var preferred) |
+| `port` | no | `5432` | Postgres port |
+| `publication_name` | yes | — | Logical-replication publication (auto-created when `auto_create_publication` is set) |
+| `table` | yes | — | Replicated table, `schema.name` (bare names default to `public`) |
+| `slot_name` | yes | — | Replication-slot group key; sources sharing it share one slot |
+| `auto_create_publication` | no | `false` | Create the publication if missing and add any registered tables not yet in it (needs CREATE/ownership) |
+| `tls_enabled` | no | `false` | Require TLS |
+| `trusted_root_certs` | no | — | PEM-encoded CA bundle |
+| `store_host` / `store_port` / `store_database` / `store_username` / `store_password` | no | source connection | Separate metadata-store database (host/database/username required together; password optional) |
+| `batch_max_fill_ms` | no | `1000` | etl batch fill window |
+| `batch_max_bytes` | no | `8388608` | etl batch byte budget |
+| `max_table_sync_workers` | no | `4` | Parallel initial-copy workers |
+| `batch_size` | no | `1000` | Max rows per generated output batch |
+| `batch_interval_ms` | no | `100` | Max wait for the first row of a batch |
+| `max_buffered_units` | no | `8` | Bounded in-flight write-unit buffer |
+
 ### Quick start
 
 ```bash
