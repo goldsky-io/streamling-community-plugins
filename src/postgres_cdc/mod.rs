@@ -12,4 +12,5 @@ mod ledger;
 mod pipeline;
 mod source;
 
+pub use config::hash_slot_name;
 pub use source::PostgresCdcSource;

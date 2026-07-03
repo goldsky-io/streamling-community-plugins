@@ -169,16 +169,22 @@ async fn two_tables_share_one_slot() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Exactly one apply slot for the shared group.
-    let slots: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'supabase_etl_apply_%'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    // Exactly one apply slot for this shared group, named by the group's
+    // pipeline id. Other e2e tests run concurrently in the same DB with their
+    // own apply slots, so scope the count to this group's slot.
+    let apply_slot = format!(
+        "supabase_etl_apply_{}",
+        community_plugins::postgres_cdc::hash_slot_name(&slot)
+    );
+    let slots: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1")
+            .bind(&apply_slot)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         slots, 1,
-        "expected exactly one shared apply slot, found {slots}"
+        "expected exactly one shared apply slot ({apply_slot}), found {slots}"
     );
 
     src_a.terminate().await.unwrap();
