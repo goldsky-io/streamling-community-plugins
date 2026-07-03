@@ -12,8 +12,8 @@
 //! `batch_max_fill_ms` (1000), `batch_max_bytes` (8 MiB),
 //! `max_table_sync_workers` (4), `batch_size` (1000 envelope rows),
 //! `batch_interval_ms` (100), `max_buffered_units` (8),
-//! `auto_create_publication` (false: create the publication / add missing
-//! tables before starting — needs CREATE/ownership privileges).
+//! `auto_create_publication` (true (default): create the publication / add
+//! missing tables before starting — needs CREATE/ownership privileges).
 
 use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
@@ -210,7 +210,7 @@ pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, 
             batch_size,
             batch_interval_ms: parse_opt(options, "batch_interval_ms", 100u64)?,
             max_buffered_units,
-            auto_create_publication: parse_opt(options, "auto_create_publication", false)?,
+            auto_create_publication: parse_opt(options, "auto_create_publication", true)?,
         },
     })
 }
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(cfg.settings.batch_size, 1000);
         assert_eq!(cfg.settings.batch_interval_ms, 100);
         assert_eq!(cfg.settings.max_buffered_units, 8);
-        assert!(!cfg.settings.auto_create_publication);
+        assert!(cfg.settings.auto_create_publication);
     }
 
     #[test]
@@ -373,10 +373,15 @@ mod tests {
         assert_eq!(cfg.pipeline.pg_connection.tls.trusted_root_certs, "PEMPEM");
     }
     #[test]
-    fn auto_create_publication_parses_and_defaults_false() {
-        let mut opts = base_options();
-        opts.insert("auto_create_publication".into(), "true".into());
-        let cfg = parse_options(&opts).unwrap();
+    fn auto_create_publication_defaults_true_and_parses() {
+        // Defaults to true when unset.
+        let cfg = parse_options(&base_options()).unwrap();
         assert!(cfg.settings.auto_create_publication);
+
+        // Explicit opt-out.
+        let mut opts = base_options();
+        opts.insert("auto_create_publication".into(), "false".into());
+        let cfg = parse_options(&opts).unwrap();
+        assert!(!cfg.settings.auto_create_publication);
     }
 }

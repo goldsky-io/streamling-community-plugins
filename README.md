@@ -93,9 +93,7 @@ Sources that share a `slot_name` share one replication slot and one etl pipeline
 **Requirements & caveats:**
 
 - **Postgres >= 14** and `wal_level = logical` (Postgres 13 does not work).
-- The connecting role needs `REPLICATION` plus `SELECT` on the replicated table.
-  For `auto_create_publication`, it additionally needs `CREATE` on the database
-  (to create the publication) and/or ownership of the tables (to add them).
+- The connecting role needs specific privileges; see **Permissions** below.
 - **Schema evolution is not supported.** The output schema is fixed at startup
   from the table's columns; columns added later are dropped, dropped columns
   become null, and type/constraint changes are not applied. Recreate the source
@@ -109,6 +107,35 @@ Sources that share a `slot_name` share one replication slot and one etl pipeline
   the store is the source database; set the `store_*` options to keep this
   bookkeeping elsewhere. (A future version may use Streamling's own state store.)
 
+**Permissions**
+
+The connecting role needs the `REPLICATION` attribute (for logical replication)
+and `SELECT` on the replicated table (for the initial copy). Because
+`auto_create_publication` is on by default, the role must also be able to
+create/alter the publication and etl's metadata schema: grant `CREATE` on the
+database, and the role must **own** the replicated table(s) — only the owner
+(or a superuser) can add a table to a publication. Example least-privilege
+setup:
+
+```sql
+-- A login role with the REPLICATION attribute.
+CREATE ROLE cdc_user WITH LOGIN REPLICATION PASSWORD 'change-me';
+
+-- Run these in the database you replicate from:
+GRANT CONNECT ON DATABASE mydb TO cdc_user;
+GRANT USAGE  ON SCHEMA public TO cdc_user;
+GRANT SELECT ON TABLE public.users TO cdc_user;   -- initial table copy
+GRANT CREATE ON DATABASE mydb TO cdc_user;         -- publication + etl schema
+
+-- The role must own the table to add it to a publication. Either create the
+-- table as cdc_user, or transfer ownership:
+ALTER TABLE public.users OWNER TO cdc_user;
+```
+
+If the role can't own the tables (or you'd rather manage the publication
+yourself), create the publication with a privileged role and set
+`auto_create_publication: false`.
+
 All YAML options can also be set via `STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE__<KEY>`
 environment variables (uppercase key). Env vars take precedence over YAML.
 
@@ -119,10 +146,10 @@ environment variables (uppercase key). Env vars take precedence over YAML.
 | `username` | yes | — | Role with `REPLICATION` |
 | `password` | no | — | Postgres password (env var preferred) |
 | `port` | no | `5432` | Postgres port |
-| `publication_name` | yes | — | Logical-replication publication (auto-created when `auto_create_publication` is set) |
+| `publication_name` | yes | — | Logical-replication publication (auto-created by default; disable with `auto_create_publication: false`) |
 | `table` | yes | — | Replicated table, `schema.name` (bare names default to `public`) |
 | `slot_name` | yes | — | Replication-slot group key; sources sharing it share one slot |
-| `auto_create_publication` | no | `false` | Create the publication if missing and add any registered tables not yet in it (needs CREATE/ownership) |
+| `auto_create_publication` | no | `true` | Create the publication if missing and add any registered tables not yet in it (needs CREATE on the DB + table ownership) |
 | `tls_enabled` | no | `false` | Require TLS |
 | `trusted_root_certs` | no | — | PEM-encoded CA bundle |
 | `store_host` / `store_port` / `store_database` / `store_username` / `store_password` | no | source connection | Separate metadata-store database (host/database/username required together; password optional) |
