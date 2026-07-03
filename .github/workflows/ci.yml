@@ -8,6 +8,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/**"
+      - ".config/**"
   workflow_dispatch:
 
 # Streamling release whose prebuilt binary + k3s setup scripts the e2e tests run
