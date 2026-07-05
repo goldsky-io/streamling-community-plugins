@@ -60,6 +60,29 @@
 //! checkpoint is finalized. On restart the source resumes from the persisted
 //! positions, so records emitted after the last finalized checkpoint are read
 //! again.
+//!
+//! ## Example
+//!
+//! JSON events flowing from S2 into ClickHouse:
+//!
+//! ```yaml
+//! sources:
+//!   events:
+//!     type: s2_source
+//!     basin: my-basin
+//!     stream_prefix: "events/"
+//!     schema: "id:int64,user:string,amount:float64,at:timestamp"
+//!     include_metadata: true
+//!
+//! transforms: {}
+//!
+//! sinks:
+//!   clickhouse:
+//!     type: clickhouse
+//!     from: events
+//!     table: events
+//!     primary_key: id
+//! ```
 
 mod config;
 mod convert;
