@@ -42,8 +42,8 @@ use s2_sdk::{
     batching::BatchingConfig,
     producer::{Producer, ProducerConfig, RecordSubmitTicket},
     types::{
-        AccountEndpoint, AppendRecord, AppendRetryPolicy, BasinEndpoint, BasinName,
-        EnsureStreamInput, RetryConfig, S2Config, S2Endpoints, StreamName,
+        AppendRecord, AppendRetryPolicy, BasinName, EnsureStreamInput, RetryConfig, S2Config,
+        StreamName,
     },
 };
 use std::collections::{HashMap, VecDeque};
@@ -243,16 +243,7 @@ impl SinkPlugin for S2Sink {
                     .with_append_retry_policy(AppendRetryPolicy::All),
             );
         if !endpoint.is_empty() {
-            let endpoints = S2Endpoints::new(
-                AccountEndpoint::new(&endpoint).map_err(|e| {
-                    PluginError::Internal(format!("invalid S2 account endpoint: {}", e))
-                })?,
-                BasinEndpoint::new(&endpoint).map_err(|e| {
-                    PluginError::Internal(format!("invalid S2 basin endpoint: {}", e))
-                })?,
-            )
-            .map_err(|e| PluginError::Internal(format!("invalid S2 endpoints: {}", e)))?;
-            cfg = cfg.with_endpoints(endpoints);
+            cfg = cfg.with_endpoints(crate::utils::s2::s2_endpoints(&endpoint)?);
         }
 
         let s2 = S2::new(cfg)

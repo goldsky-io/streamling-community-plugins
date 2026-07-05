@@ -78,6 +78,60 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` enviro
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 | `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
 
+### S2 Source (`s2_source`)
+
+Reads records from streams on [s2.dev](https://s2.dev) into Arrow batches. Each active stream is tailed by a long-lived S2 read session; with `stream_prefix` the stream list is refreshed periodically, so newly created streams are picked up automatically.
+
+Two output modes:
+
+- **Raw** (no `schema`): emits the S2 record envelope — `stream`, `seq_num`, `timestamp` (ms, UTC), `headers` (JSON object, null when empty), `body` — one row per record.
+- **Typed** (`schema` set): decodes JSON record bodies into the configured columns, e.g. `schema: "id:int64,value:string?,at:timestamp"` (`?` marks a column nullable). Set `include_metadata: true` to also attach `_s2_stream`, `_s2_seq_num`, `_s2_timestamp` columns.
+
+Both modes lead with streamling's `_gs_op` row-kind column, always `"i"` — S2 streams are append-only, so every record is an insert.
+
+Delivery is at-least-once: per-stream positions are snapshotted at each checkpoint marker and persisted when the checkpoint finalizes, so on restart the source resumes from the last finalized position.
+
+All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `access_token` | yes | — | S2 access token (env var preferred) |
+| `basin` | yes | — | S2 basin name |
+| `stream` / `streams` | one of | — | Exact stream name(s), comma-separated |
+| `stream_prefix` | one of | — | Read every stream whose name starts with this prefix |
+| `schema` | no | — | Typed mode: `name:type` columns decoded from JSON bodies (`bool`, `int8..64`, `uint8..64`, `float32/64`, `string`, `date`, `timestamp[_s/_ms/_us/_ns]`; `?` suffix = nullable) |
+| `include_metadata` | no | `false` | Typed mode: append `_s2_stream`, `_s2_seq_num`, `_s2_timestamp` columns |
+| `on_malformed` | no | `error` | Typed mode: `error` fails (and retries) the batch on an undecodable body; `skip` drops it with a WARN |
+| `start_position` | no | `earliest` | Where to start a stream with no checkpointed position: `earliest` or `latest` |
+| `batch_size` | no | `1000` | Max records per generated Arrow batch |
+| `batch_interval_ms` | no | `100` | Max wait for the first record before emitting an empty batch (ms) |
+| `max_buffered_batches` | no | `16` | Bounded buffer of S2 read batches shared by all readers (backpressure) |
+| `update_streams_interval_secs` | no | `60` | How often `stream_prefix` re-lists streams |
+| `ignore_command_records` | no | `true` | Filter out S2 command records (fence/trim) |
+| `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
+| `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
+
+Example — events flowing from S2 into ClickHouse:
+
+```yaml
+sources:
+  events:
+    type: s2_source
+    basin: my-basin
+    stream_prefix: "events/"
+    schema: "id:int64,user:string,amount:float64,at:timestamp"
+    include_metadata: true
+
+transforms: {}
+
+sinks:
+  clickhouse:
+    type: clickhouse
+    from: events
+    table: events
+    primary_key: id
+```
+
 ### Quick start
 
 ```bash
