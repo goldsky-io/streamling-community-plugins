@@ -17,6 +17,14 @@
 //!   S2Config::with_request_timeout.
 //! - linger_ms (default 5) - how long the SDK Producer waits for more records
 //!   before flushing a partial batch.
+//! - timestamp_column — name of a column carrying event time; its value is set
+//!   as the S2 record timestamp (epoch ms). Accepts Arrow Timestamp columns of
+//!   any unit, or Int64/UInt64 epoch milliseconds. The column stays in the
+//!   JSON body. Without it, S2 assigns arrival time.
+//! - drop_op_column (default false) — strip streamling's `_gs_op` row-kind
+//!   column from the JSON body. By default it is kept, so CDC updates and
+//!   deletes land as records tagged `"_gs_op": "u"` / `"d"` and the stream is
+//!   a faithful change log.
 //!
 //! Each option can be overridden by the matching STREAMLING__PLUGIN__S2_SINK__<KEY>
 //! env var; the env var wins when both are set.
@@ -33,6 +41,11 @@
 //! returning, so the dispatcher only acknowledges the checkpoint after S2 has
 //! durably appended every record submitted before the marker. Termination drains
 //! pending tickets and then closes the Producer.
+//!
+//! Delivery is at-least-once: appends are retried even when the outcome of a
+//! previous attempt is unknown (AppendRetryPolicy::All), and a pipeline
+//! restart replays from the last finalized checkpoint — either can duplicate
+//! records on the stream.
 
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -55,7 +68,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use streamling_plugin::r#api::PluginStateBackendFactory;
-use streamling_plugin::api::SupportsGracefulShutdown;
+use streamling_plugin::api::{STREAMLING_COLUMN_NAME_OP, SupportsGracefulShutdown};
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
@@ -64,6 +77,14 @@ use tracing::{debug, error, info};
 
 use crate::utils::plugin_options::PluginOptions;
 use crate::utils::record_batch_json;
+
+#[derive(Debug, Clone, Default)]
+struct WriteOptions {
+    /// Column carrying event time to use as the S2 record timestamp.
+    timestamp_column: Option<String>,
+    /// Strip `_gs_op` from the JSON body.
+    drop_op_column: bool,
+}
 
 struct ProducerState {
     producer: Producer,
@@ -84,6 +105,7 @@ pub struct S2Sink {
     _schema: SchemaRef,
     producer: Mutex<Option<ProducerState>>,
     stream_id: OnceLock<String>,
+    write_options: OnceLock<WriteOptions>,
     running: Arc<AtomicBool>,
 }
 
@@ -100,6 +122,7 @@ impl S2Sink {
             _schema: schema,
             producer: Mutex::new(None),
             stream_id: OnceLock::new(),
+            write_options: OnceLock::new(),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -223,6 +246,19 @@ impl SinkPlugin for S2Sink {
                 PluginError::Internal(format!("linger_ms is not a valid u64: {}", e))
             })?;
 
+        let timestamp_column = self.opts.get_or("timestamp_column", "");
+        let drop_op_column: bool = self
+            .opts
+            .get_or("drop_op_column", "false")
+            .parse()
+            .map_err(|e| {
+                PluginError::Internal(format!("drop_op_column is not a valid bool: {}", e))
+            })?;
+        let _ = self.write_options.set(WriteOptions {
+            timestamp_column: (!timestamp_column.is_empty()).then_some(timestamp_column),
+            drop_op_column,
+        });
+
         let batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
         let producer_config = ProducerConfig::new().with_batching(batching);
 
@@ -304,6 +340,17 @@ impl SinkPlugin for S2Sink {
         }
 
         let stream_id = self.stream_id_for_logs();
+        let write_options = self.write_options.get().cloned().unwrap_or_default();
+        let timestamps = write_options
+            .timestamp_column
+            .as_deref()
+            .map(|column| timestamps_ms_from_column(&batch, column))
+            .transpose()?;
+        let batch = if write_options.drop_op_column {
+            without_op_column(&batch)?
+        } else {
+            batch
+        };
         let json_rows =
             record_batch_json::record_batch_to_line_delimited_json(&batch).map_err(|e| {
                 PluginError::Internal(format!(
@@ -312,12 +359,14 @@ impl SinkPlugin for S2Sink {
                 ))
             })?;
         let total = json_rows.len();
-        let records = append_records_from_json_rows(json_rows).map_err(|e| match e {
-            PluginError::Internal(msg) => {
-                PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
-            }
-            other => other,
-        })?;
+        let records = append_records_from_json_rows(json_rows, timestamps.as_deref()).map_err(
+            |e| match e {
+                PluginError::Internal(msg) => {
+                    PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
+                }
+                other => other,
+            },
+        )?;
         let (pending_records, acknowledged_records) =
             self.submit_records(records).await.map_err(|e| match e {
                 PluginError::Internal(msg) => {
@@ -358,19 +407,131 @@ impl SinkPlugin for S2Sink {
 
 pub(crate) fn append_records_from_json_rows(
     json_rows: Vec<Vec<u8>>,
+    timestamps: Option<&[u64]>,
 ) -> Result<Vec<AppendRecord>, PluginError> {
+    if let Some(timestamps) = timestamps
+        && timestamps.len() != json_rows.len()
+    {
+        return Err(PluginError::Internal(format!(
+            "timestamp count {} does not match row count {}",
+            timestamps.len(),
+            json_rows.len()
+        )));
+    }
     json_rows
         .into_iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let row_len = row.len();
-            AppendRecord::new(row).map_err(|e| {
+            let record = AppendRecord::new(row).map_err(|e| {
                 PluginError::Internal(format!(
                     "failed to build S2 AppendRecord (row {} bytes): {}",
                     row_len, e
                 ))
+            })?;
+            Ok(match timestamps {
+                Some(timestamps) => record.with_timestamp(timestamps[index]),
+                None => record,
             })
         })
         .collect()
+}
+
+/// Extracts per-row epoch-millisecond timestamps from `column`. Accepts Arrow
+/// Timestamp columns of any unit, or Int64/UInt64 epoch milliseconds; nulls
+/// and pre-epoch values are errors.
+pub(crate) fn timestamps_ms_from_column(
+    batch: &RecordBatch,
+    column: &str,
+) -> Result<Vec<u64>, PluginError> {
+    use arrow::array::{
+        Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt64Array,
+    };
+    use arrow_schema::{DataType, TimeUnit};
+
+    let index = batch.schema().index_of(column).map_err(|_| {
+        PluginError::Internal(format!("timestamp_column '{column}' not found in batch"))
+    })?;
+    let array = batch.column(index);
+
+    fn collect_i64<'a>(
+        column: &str,
+        values: impl Iterator<Item = Option<i64>> + 'a,
+        to_ms: impl Fn(i64) -> Option<i64>,
+    ) -> Result<Vec<u64>, PluginError> {
+        values
+            .enumerate()
+            .map(|(row, value)| {
+                let value = value.ok_or_else(|| {
+                    PluginError::Internal(format!(
+                        "timestamp_column '{column}' is null at row {row}"
+                    ))
+                })?;
+                to_ms(value)
+                    .filter(|ms| *ms >= 0)
+                    .map(|ms| ms as u64)
+                    .ok_or_else(|| {
+                        PluginError::Internal(format!(
+                            "timestamp_column '{column}' value {value} at row {row} is not a \
+                             valid epoch-millisecond timestamp"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    macro_rules! downcast {
+        ($ty:ty) => {
+            array
+                .as_any()
+                .downcast_ref::<$ty>()
+                .expect("data type matches downcast")
+                .iter()
+        };
+    }
+
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            collect_i64(column, downcast!(TimestampSecondArray), |v| {
+                v.checked_mul(1000)
+            })
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            collect_i64(column, downcast!(TimestampMillisecondArray), Some)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            collect_i64(column, downcast!(TimestampMicrosecondArray), |v| {
+                Some(v / 1000)
+            })
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            collect_i64(column, downcast!(TimestampNanosecondArray), |v| {
+                Some(v / 1_000_000)
+            })
+        }
+        DataType::Int64 => collect_i64(column, downcast!(Int64Array), Some),
+        DataType::UInt64 => collect_i64(
+            column,
+            downcast!(UInt64Array).map(|v| v.map(|v| v as i64)),
+            Some,
+        ),
+        other => Err(PluginError::Internal(format!(
+            "timestamp_column '{column}' has unsupported type {other}; expected a Timestamp \
+             column or Int64/UInt64 epoch milliseconds"
+        ))),
+    }
+}
+
+/// Projects out streamling's `_gs_op` column; no-op when absent.
+pub(crate) fn without_op_column(batch: &RecordBatch) -> Result<RecordBatch, PluginError> {
+    let Ok(op_index) = batch.schema().index_of(STREAMLING_COLUMN_NAME_OP) else {
+        return Ok(batch.clone());
+    };
+    let keep: Vec<usize> = (0..batch.num_columns())
+        .filter(|index| *index != op_index)
+        .collect();
+    batch.project(&keep).map_err(PluginError::ArrowError)
 }
 
 fn drain_ready_record_tickets(
@@ -390,6 +551,9 @@ fn drain_ready_record_tickets(
                 tickets.pop_front();
             }
             Poll::Ready(Err(e)) => {
+                // Pop the completed ticket: leaving it queued would wedge the
+                // drain, and its oneshot panics if polled again.
+                tickets.pop_front();
                 return Err(PluginError::Internal(format!(
                     "failed to append pending S2 Producer record: {}",
                     e
@@ -443,31 +607,125 @@ async fn await_record_tickets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow_schema::{Field, Schema};
 
     #[test]
     fn test_empty_rows_produce_no_append_records() {
-        let records = append_records_from_json_rows(Vec::new()).expect("convert empty");
+        let records = append_records_from_json_rows(Vec::new(), None).expect("convert empty");
         assert!(records.is_empty());
     }
 
     #[test]
     fn test_json_rows_are_converted_to_append_records_in_order() {
         let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
-        let records = append_records_from_json_rows(rows).expect("convert rows");
+        let records = append_records_from_json_rows(rows, None).expect("convert rows");
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].body(), br#"{"id":1}"#);
         assert_eq!(records[1].body(), br#"{"id":2}"#);
+        assert_eq!(records[0].timestamp(), None);
     }
 
     #[test]
     fn test_oversized_json_row_returns_error() {
         let rows = vec![vec![b'y'; 1024 * 1024]];
-        let err = append_records_from_json_rows(rows).expect_err("oversized row should fail");
+        let err = append_records_from_json_rows(rows, None).expect_err("oversized row should fail");
 
         assert!(
             err.to_string().contains("failed to build S2 AppendRecord"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_timestamps_are_applied_to_append_records() {
+        let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
+        let records =
+            append_records_from_json_rows(rows, Some(&[1_000, 2_000])).expect("convert rows");
+        assert_eq!(records[0].timestamp(), Some(1_000));
+        assert_eq!(records[1].timestamp(), Some(2_000));
+
+        let err = append_records_from_json_rows(vec![br#"{"id":1}"#.to_vec()], Some(&[1, 2]))
+            .expect_err("mismatched timestamp count should fail");
+        assert!(err.to_string().contains("does not match"), "got {err}");
+    }
+
+    fn batch_with_columns(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, array)| Field::new(*name, array.data_type().clone(), true))
+            .collect();
+        let arrays = columns.into_iter().map(|(_, array)| array).collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("valid batch")
+    }
+
+    #[test]
+    fn test_timestamps_from_timestamp_and_integer_columns() {
+        let micros: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            1_700_000_000_123_456_i64,
+        ]));
+        let batch = batch_with_columns(vec![("at", micros)]);
+        assert_eq!(
+            timestamps_ms_from_column(&batch, "at").expect("micros convert"),
+            vec![1_700_000_000_123]
+        );
+
+        let millis: ArrayRef = Arc::new(Int64Array::from(vec![1_700_000_000_000_i64]));
+        let batch = batch_with_columns(vec![("at", millis)]);
+        assert_eq!(
+            timestamps_ms_from_column(&batch, "at").expect("int64 convert"),
+            vec![1_700_000_000_000]
+        );
+    }
+
+    #[test]
+    fn test_timestamp_column_errors() {
+        let batch = batch_with_columns(vec![(
+            "at",
+            Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef,
+        )]);
+        let err = timestamps_ms_from_column(&batch, "at").expect_err("null should fail");
+        assert!(err.to_string().contains("null at row 1"), "got {err}");
+
+        let err = timestamps_ms_from_column(&batch, "missing").expect_err("missing column");
+        assert!(err.to_string().contains("not found"), "got {err}");
+
+        let batch = batch_with_columns(vec![(
+            "at",
+            Arc::new(StringArray::from(vec!["2026-01-01"])) as ArrayRef,
+        )]);
+        let err = timestamps_ms_from_column(&batch, "at").expect_err("string type unsupported");
+        assert!(err.to_string().contains("unsupported type"), "got {err}");
+    }
+
+    #[test]
+    fn test_without_op_column_projects_it_out() {
+        let batch = batch_with_columns(vec![
+            (
+                STREAMLING_COLUMN_NAME_OP,
+                Arc::new(StringArray::from(vec!["i"])) as ArrayRef,
+            ),
+            ("id", Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef),
+        ]);
+        let projected = without_op_column(&batch).expect("project");
+        assert_eq!(projected.num_columns(), 1);
+        assert_eq!(projected.schema().field(0).name(), "id");
+
+        let no_op = batch_with_columns(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef,
+        )]);
+        let unchanged = without_op_column(&no_op).expect("no-op project");
+        assert_eq!(unchanged.num_columns(), 1);
+    }
+
+    #[test]
+    fn test_timestamp_second_overflow_is_an_error() {
+        // Timestamp(Second) columns multiply by 1000; guard against overflow.
+        let seconds: ArrayRef = Arc::new(arrow::array::TimestampSecondArray::from(vec![i64::MAX]));
+        let batch = batch_with_columns(vec![("at", seconds)]);
+        let err = timestamps_ms_from_column(&batch, "at").expect_err("overflow should fail");
+        assert!(err.to_string().contains("not a valid"), "got {err}");
     }
 }

@@ -100,6 +100,8 @@ sinks:
                 .env("STREAMLING__PLUGIN__S2_SINK__ENDPOINT", s2_lite.endpoint())
                 .env("STREAMLING__PLUGIN__S2_SINK__ENSURE_STREAM", "true")
                 .env("STREAMLING__PLUGIN__S2_SINK__LINGER_MS", "0")
+                .env("STREAMLING__PLUGIN__S2_SINK__TIMESTAMP_COLUMN", "timestamp")
+                .env("STREAMLING__PLUGIN__S2_SINK__DROP_OP_COLUMN", "true")
                 .timeout(Duration::from_secs(90)),
         )
         .await
@@ -133,10 +135,17 @@ sinks:
         .map(|record| {
             let value: serde_json::Value =
                 serde_json::from_slice(&record.body).expect("S2 record should be JSON");
-            value
+            assert!(
+                value.get("_gs_op").is_none(),
+                "drop_op_column should strip _gs_op, got {value}"
+            );
+            let id = value
                 .get("id")
                 .and_then(serde_json::Value::as_i64)
-                .expect("S2 record should include id")
+                .expect("S2 record should include id");
+            // timestamp_column: the record's S2 timestamp is the event time.
+            assert_eq!(record.timestamp, (1000 + id) as u64, "record {id}");
+            id
         })
         .collect();
     let expected_ids: BTreeSet<i64> = (1..=records_to_produce).collect();

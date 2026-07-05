@@ -66,6 +66,8 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 
 Appends each row as a JSON record to a stream on [s2.dev](https://s2.dev) — a durable streaming service — via the `s2-sdk` Producer. Rows are JSON-serialized and submitted to the Producer, which batches them internally; checkpoint markers drain pending record tickets, so the dispatcher only acknowledges a checkpoint after S2 has durably appended every record submitted before it.
 
+Delivery is at-least-once: appends are retried even when the outcome of a previous attempt is unknown, and a pipeline restart replays from the last finalized checkpoint — either can duplicate records on the stream. Rows keep streamling's `_gs_op` row-kind field by default, so CDC updates and deletes land as records tagged `"_gs_op": "u"` / `"d"` and the stream is a faithful change log; set `drop_op_column: true` for plain event payloads.
+
 All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
 
 | YAML option | Required | Default | Description |
@@ -74,6 +76,8 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` enviro
 | `basin` | yes | — | S2 basin name (must already exist) |
 | `stream` | yes | — | S2 stream name within the basin |
 | `ensure_stream` | no | `true` | Create the stream if missing (idempotent). Disable if the token only has append scope |
+| `timestamp_column` | no | — | Column carrying event time, set as the S2 record timestamp (Arrow Timestamp of any unit, or Int64/UInt64 epoch ms). Without it, S2 assigns arrival time |
+| `drop_op_column` | no | `false` | Strip the `_gs_op` row-kind field from record bodies |
 | `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 | `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
