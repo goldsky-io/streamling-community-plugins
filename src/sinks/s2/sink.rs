@@ -381,6 +381,9 @@ fn drain_ready_record_tickets(
                 tickets.pop_front();
             }
             Poll::Ready(Err(e)) => {
+                // Pop the completed ticket: leaving it queued would wedge the
+                // drain, and its oneshot panics if polled again.
+                tickets.pop_front();
                 return Err(PluginError::Internal(format!(
                     "failed to append pending S2 Producer record: {}",
                     e
