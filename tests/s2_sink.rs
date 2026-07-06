@@ -142,3 +142,113 @@ sinks:
     let expected_ids: BTreeSet<i64> = (1..=records_to_produce).collect();
     assert_eq!(ids, expected_ids);
 }
+
+/// `stream_template` routing: records fan out across streams resolved from
+/// row values, with streams created lazily on first use.
+#[tokio::test]
+async fn test_s2_sink_routes_records_by_template() {
+    init_tracing();
+
+    let s2_lite = S2Lite::start().await.expect("failed to start s2-lite");
+    let ctx = TestContext::with_options(TestContextOptions::new().with_plugin())
+        .await
+        .expect("failed to create test context");
+    let s2 = s2_lite.client().expect("failed to construct s2 client");
+    let basin = format!("basin-{}", &ctx.test_id[..8])
+        .parse::<BasinName>()
+        .expect("valid basin name");
+    s2.ensure_basin(EnsureBasinInput::new(basin.clone()))
+        .await
+        .expect("failed to ensure s2-lite basin");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("failed to register schema");
+
+    // Two tenants interleaved; target streams are NOT pre-created — the sink
+    // must ensure them lazily as the template resolves.
+    let records_to_produce = 10;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|id| TestRecord {
+            id,
+            value: format!("tenant-{}", id % 2),
+            timestamp: 1000 + id,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  s2_sink:
+    type: s2_sink
+    from: kafka_source
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let stream_prefix = format!("routed-{}", &ctx.test_id[..8]);
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__PLUGIN__S2_SINK__ACCESS_TOKEN", "ignored")
+                .env("STREAMLING__PLUGIN__S2_SINK__BASIN", basin.to_string())
+                .env(
+                    "STREAMLING__PLUGIN__S2_SINK__STREAM_TEMPLATE",
+                    format!("{stream_prefix}/{{value}}"),
+                )
+                .env("STREAMLING__PLUGIN__S2_SINK__ENDPOINT", s2_lite.endpoint())
+                .env("STREAMLING__PLUGIN__S2_SINK__LINGER_MS", "0")
+                .timeout(Duration::from_secs(90)),
+        )
+        .await
+        .expect("streamling execution failed");
+
+    assert!(status.success(), "streamling should exit successfully");
+
+    for tenant in ["tenant-0", "tenant-1"] {
+        let stream = format!("{stream_prefix}/{tenant}")
+            .parse::<StreamName>()
+            .expect("valid stream name");
+        let records =
+            s2.basin(basin.clone())
+                .stream(stream)
+                .read(
+                    ReadInput::new()
+                        .with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0)))
+                        .with_stop(ReadStop::new().with_limits(
+                            ReadLimits::new().with_count(records_to_produce as usize),
+                        )),
+                )
+                .await
+                .expect("failed to read s2-lite records")
+                .records;
+
+        assert_eq!(records.len(), 5, "each tenant stream should have 5 records");
+        for record in records {
+            let value: serde_json::Value =
+                serde_json::from_slice(&record.body).expect("S2 record should be JSON");
+            assert_eq!(
+                value.get("value").and_then(serde_json::Value::as_str),
+                Some(tenant),
+                "record routed to the wrong stream"
+            );
+        }
+    }
+}
