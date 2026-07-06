@@ -13,7 +13,13 @@
 //! `max_table_sync_workers` (4), `batch_size` (1000 envelope rows),
 //! `batch_interval_ms` (100), `max_buffered_units` (8),
 //! `auto_create_publication` (true (default): create the publication / add
-//! missing tables before starting — needs CREATE/ownership privileges).
+//! missing tables before starting — needs CREATE/ownership privileges),
+//! `memory_backpressure_enabled` (true (default): etl pauses the replication
+//! apply stream while *system* memory use is above the activate threshold; set
+//! false to disable — useful on dev machines whose system memory sits high, where
+//! the pause otherwise stalls live changes),
+//! `memory_backpressure_activate_threshold` (0.85),
+//! `memory_backpressure_resume_threshold` (0.75).
 
 use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
@@ -122,6 +128,37 @@ fn parse_table(raw: &str) -> Result<(String, String), String> {
     }
 }
 
+/// Builds etl's memory-backpressure config. `memory_backpressure_enabled=false`
+/// returns `None`, which disables etl's system-memory-driven pause of the
+/// replication apply stream entirely (the pause can otherwise stall live changes
+/// indefinitely on hosts whose overall memory use stays above the resume
+/// threshold). When enabled, thresholds default to etl's own defaults and are
+/// validated by [`MemoryBackpressureConfig::validate`]. Thresholds are ignored
+/// (unparsed) when disabled.
+fn parse_memory_backpressure(
+    options: &HashMap<String, String>,
+) -> Result<Option<MemoryBackpressureConfig>, String> {
+    if !parse_opt(options, "memory_backpressure_enabled", true)? {
+        return Ok(None);
+    }
+    let config = MemoryBackpressureConfig {
+        activate_threshold: parse_opt(
+            options,
+            "memory_backpressure_activate_threshold",
+            MemoryBackpressureConfig::DEFAULT_ACTIVATE_THRESHOLD,
+        )?,
+        resume_threshold: parse_opt(
+            options,
+            "memory_backpressure_resume_threshold",
+            MemoryBackpressureConfig::DEFAULT_RESUME_THRESHOLD,
+        )?,
+    };
+    config
+        .validate()
+        .map_err(|e| format!("postgres_cdc_source: invalid memory_backpressure config: {e}"))?;
+    Ok(Some(config))
+}
+
 pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, String> {
     let slot_name = required(options, "slot_name")?.to_string();
     let pipeline_id = hash_slot_name(&slot_name);
@@ -185,7 +222,7 @@ pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, 
         table_error_retry_max_attempts: 5,
         max_table_sync_workers: parse_opt(options, "max_table_sync_workers", 4u16)?,
         memory_refresh_interval_ms: 100,
-        memory_backpressure: Some(MemoryBackpressureConfig::default()),
+        memory_backpressure: parse_memory_backpressure(options)?,
         table_sync_copy: TableSyncCopyConfig::default(),
         invalidated_slot_behavior: InvalidatedSlotBehavior::default(),
         max_copy_connections_per_table: PipelineConfig::DEFAULT_MAX_COPY_CONNECTIONS_PER_TABLE,
@@ -253,6 +290,10 @@ mod tests {
         assert_eq!(cfg.settings.batch_interval_ms, 100);
         assert_eq!(cfg.settings.max_buffered_units, 8);
         assert!(cfg.settings.auto_create_publication);
+        assert_eq!(
+            cfg.pipeline.memory_backpressure,
+            Some(MemoryBackpressureConfig::default())
+        );
     }
 
     #[test]
@@ -383,5 +424,67 @@ mod tests {
         opts.insert("auto_create_publication".into(), "false".into());
         let cfg = parse_options(&opts).unwrap();
         assert!(!cfg.settings.auto_create_publication);
+    }
+
+    #[test]
+    fn memory_backpressure_can_be_disabled_and_tuned() {
+        // Disabled -> None (turns off etl's system-memory apply-stream pause).
+        let mut opts = base_options();
+        opts.insert("memory_backpressure_enabled".into(), "false".into());
+        let cfg = parse_options(&opts).unwrap();
+        assert!(cfg.pipeline.memory_backpressure.is_none());
+
+        // Enabled with custom thresholds.
+        let mut opts = base_options();
+        opts.insert(
+            "memory_backpressure_activate_threshold".into(),
+            "0.95".into(),
+        );
+        opts.insert("memory_backpressure_resume_threshold".into(), "0.9".into());
+        let bp = parse_options(&opts)
+            .unwrap()
+            .pipeline
+            .memory_backpressure
+            .expect("enabled by default");
+        assert_eq!(bp.activate_threshold, 0.95);
+        assert_eq!(bp.resume_threshold, 0.9);
+    }
+
+    #[test]
+    fn invalid_memory_backpressure_is_an_error() {
+        // resume must be lower than activate (etl's own validation).
+        let mut opts = base_options();
+        opts.insert(
+            "memory_backpressure_activate_threshold".into(),
+            "0.5".into(),
+        );
+        opts.insert("memory_backpressure_resume_threshold".into(), "0.8".into());
+        let err = parse_options(&opts).unwrap_err();
+        assert!(err.contains("memory_backpressure"), "got {err:?}");
+
+        // Non-numeric threshold.
+        let mut opts = base_options();
+        opts.insert(
+            "memory_backpressure_activate_threshold".into(),
+            "high".into(),
+        );
+        let err = parse_options(&opts).unwrap_err();
+        assert!(
+            err.contains("memory_backpressure_activate_threshold"),
+            "got {err:?}"
+        );
+
+        // Thresholds are ignored when disabled: out-of-range values do not error.
+        let mut opts = base_options();
+        opts.insert("memory_backpressure_enabled".into(), "false".into());
+        opts.insert("memory_backpressure_activate_threshold".into(), "0.1".into());
+        opts.insert("memory_backpressure_resume_threshold".into(), "0.9".into());
+        assert!(
+            parse_options(&opts)
+                .unwrap()
+                .pipeline
+                .memory_backpressure
+                .is_none()
+        );
     }
 }

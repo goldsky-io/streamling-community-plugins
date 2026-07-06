@@ -106,6 +106,14 @@ Sources that share a `slot_name` share one replication slot and one etl pipeline
   (helper functions + a DDL trigger) in the source database on start. By default
   the store is the source database; set the `store_*` options to keep this
   bookkeeping elsewhere. (A future version may use Streamling's own state store.)
+- **Memory backpressure can stall live changes.** etl pauses its replication
+  apply stream while *system-wide* memory use exceeds
+  `memory_backpressure_activate_threshold` (default 85%), resuming only once it
+  drops below `memory_backpressure_resume_threshold` (default 75%). On hosts that
+  sit above the resume threshold — common on local/dev machines where reported memory 
+  use stays high — the stream stays paused, so live changes stop arriving after 
+  the initial copy. Set `memory_backpressure_enabled: false` to turn it off for 
+  local/dev, or raise the thresholds.
 
 **Permissions**
 
@@ -159,6 +167,9 @@ environment variables (uppercase key). Env vars take precedence over YAML.
 | `batch_size` | no | `1000` | Max rows per generated output batch |
 | `batch_interval_ms` | no | `100` | Max wait for the first row of a batch |
 | `max_buffered_units` | no | `8` | Bounded in-flight write-unit buffer |
+| `memory_backpressure_enabled` | no | `true` | Pause the replication apply stream while *system* memory use exceeds the activate threshold. Disable (`false`) on hosts whose system memory stays high, where the pause otherwise stalls live changes (see caveats) |
+| `memory_backpressure_activate_threshold` | no | `0.85` | System-memory ratio above which backpressure activates (ignored when disabled) |
+| `memory_backpressure_resume_threshold` | no | `0.75` | System-memory ratio below which backpressure releases; must be `<` the activate threshold (ignored when disabled) |
 
 ### Quick start
 
