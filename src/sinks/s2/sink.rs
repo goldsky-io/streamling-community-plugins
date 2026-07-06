@@ -21,7 +21,9 @@
 //! - ensure_stream (default true) — create target streams if missing
 //!   (idempotent): at init for a fixed `stream`, on first use per resolved
 //!   `stream_template` name. Disable if the access token only has append
-//!   scope.
+//!   scope, or when the basin has `create_stream_on_append` enabled — the
+//!   natural pairing for `stream_template`, where the first append creates
+//!   each stream server-side with no extra RPCs.
 //! - endpoint — optional S2-compatible endpoint, useful for s2-lite.
 //! - request_timeout_ms (default 5000) — per-request HTTP timeout passed to
 //!   S2Config::with_request_timeout.

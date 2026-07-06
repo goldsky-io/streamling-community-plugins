@@ -74,7 +74,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` enviro
 | `basin` | yes | — | S2 basin name (must already exist) |
 | `stream` | one of | — | Fixed S2 stream name within the basin |
 | `stream_template` | one of | — | Per-row stream name with `{column}` placeholders (e.g. `events/{tenant}`); streams are created lazily as names resolve |
-| `ensure_stream` | no | `true` | Create target streams if missing (idempotent). Disable if the token only has append scope |
+| `ensure_stream` | no | `true` | Create target streams if missing (idempotent). Disable if the token only has append scope, or when the basin has `create_stream_on_append` enabled (the natural pairing for `stream_template`) |
 | `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 | `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
