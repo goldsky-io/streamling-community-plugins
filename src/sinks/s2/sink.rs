@@ -823,7 +823,7 @@ pub(crate) fn resolve_streams(
 }
 
 pub(crate) fn append_records_from_json_rows(
-    json_rows: Vec<Vec<u8>>,
+    json_rows: Vec<bytes::Bytes>,
     ops: &[&'static str],
 ) -> Result<Vec<AppendRecord>, PluginError> {
     if ops.len() != json_rows.len() {
@@ -949,7 +949,10 @@ mod tests {
 
     #[test]
     fn test_json_rows_are_converted_to_append_records_in_order() {
-        let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
+        let rows = vec![
+            bytes::Bytes::from_static(br#"{"id":1}"#),
+            bytes::Bytes::from_static(br#"{"id":2}"#),
+        ];
         let records = append_records_from_json_rows(rows, &["c", "c"]).expect("convert rows");
 
         assert_eq!(records.len(), 2);
@@ -959,7 +962,7 @@ mod tests {
 
     #[test]
     fn test_oversized_json_row_returns_error() {
-        let rows = vec![vec![b'y'; 1024 * 1024]];
+        let rows = vec![bytes::Bytes::from(vec![b'y'; 1024 * 1024])];
         let err =
             append_records_from_json_rows(rows, &["c"]).expect_err("oversized row should fail");
 
@@ -1110,7 +1113,10 @@ mod tests {
 
     #[test]
     fn test_ops_become_dbz_op_headers() {
-        let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
+        let rows = vec![
+            bytes::Bytes::from_static(br#"{"id":1}"#),
+            bytes::Bytes::from_static(br#"{"id":2}"#),
+        ];
         let records = append_records_from_json_rows(rows, &["c", "d"]).expect("convert rows");
 
         let headers = records[1].headers();
@@ -1118,8 +1124,11 @@ mod tests {
         assert_eq!(headers[0].name.as_ref(), OP_HEADER.as_bytes());
         assert_eq!(headers[0].value.as_ref(), b"d");
 
-        let err = append_records_from_json_rows(vec![br#"{"id":1}"#.to_vec()], &["c", "d"])
-            .expect_err("mismatched op count should fail");
+        let err = append_records_from_json_rows(
+            vec![bytes::Bytes::from_static(br#"{"id":1}"#)],
+            &["c", "d"],
+        )
+        .expect_err("mismatched op count should fail");
         assert!(err.to_string().contains("does not match"), "got {err}");
     }
 

@@ -8,6 +8,7 @@
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray};
 use arrow_json::LineDelimitedWriter;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
+use bytes::Bytes;
 use std::sync::Arc;
 
 #[allow(clippy::manual_div_ceil)]
@@ -90,22 +91,28 @@ fn transform_u256_columns(batch: &RecordBatch) -> Result<RecordBatch, ArrowError
 /// Convert a RecordBatch to newline-delimited JSON, one JSON object per row.
 ///
 /// U256 columns are serialized as decimal strings (e.g. `"12345678901234567890"`)
-/// instead of hex. Returns a vector of byte slices, one per row.
-pub fn record_batch_to_line_delimited_json(
-    batch: &RecordBatch,
-) -> Result<Vec<Vec<u8>>, ArrowError> {
+/// instead of hex. Rows are zero-copy slices of one shared buffer.
+pub fn record_batch_to_line_delimited_json(batch: &RecordBatch) -> Result<Vec<Bytes>, ArrowError> {
     let transformed = transform_u256_columns(batch)?;
 
     let mut json_buffer = Vec::new();
     let mut writer = LineDelimitedWriter::new(&mut json_buffer);
     writer.write(&transformed)?;
     writer.finish()?;
+    let json_buffer = Bytes::from(json_buffer);
 
-    let rows: Vec<Vec<u8>> = json_buffer
-        .split(|&b| b == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| line.to_vec())
-        .collect();
-
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    let mut start = 0;
+    for (index, byte) in json_buffer.iter().enumerate() {
+        if *byte == b'\n' {
+            if index > start {
+                rows.push(json_buffer.slice(start..index));
+            }
+            start = index + 1;
+        }
+    }
+    if start < json_buffer.len() {
+        rows.push(json_buffer.slice(start..));
+    }
     Ok(rows)
 }
