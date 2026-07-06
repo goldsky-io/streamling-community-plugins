@@ -8,9 +8,11 @@
 //!   optional `_s2_stream` / `_s2_seq_num` / `_s2_timestamp` metadata columns.
 //!
 //! Both modes lead with the streamling `_gs_op` row-kind column, restored
-//! from a record's Debezium-style `dbz.op` header when present (written by
-//! the s2_sink; c|r → i, u → u, d → d) and "i" otherwise.
+//! from a record's Debezium-style `dbz.op` header when present (the same
+//! convention streamling's Kafka sink uses; c|r → i, u → u, d → d) and "i"
+//! otherwise.
 
+use crate::utils::s2::DBZ_OP_HEADER;
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow_json::ReaderBuilder;
@@ -71,10 +73,6 @@ fn gs_op_field() -> Field {
     Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false)
 }
 
-/// Header carrying the row kind, Debezium-encoded — written by the s2_sink
-/// and matching streamling's Kafka `dbz.op` message header.
-const OP_HEADER: &[u8] = b"dbz.op";
-
 /// The `_gs_op` column, restored from each record's `dbz.op` header when
 /// present (c|r → i, u → u, d → d); records without one are inserts —
 /// the same defaulting as streamling's Kafka source.
@@ -85,10 +83,9 @@ fn gs_op_array(records: &[&SourceRecord]) -> ArrayRef {
 }
 
 fn gs_op(record: &SourceRecord) -> &'static str {
-    let op = record
-        .headers
-        .iter()
-        .find_map(|(name, value)| (name.as_ref() == OP_HEADER).then_some(value.as_ref()));
+    let op = record.headers.iter().find_map(|(name, value)| {
+        (name.as_ref() == DBZ_OP_HEADER.as_bytes()).then_some(value.as_ref())
+    });
     match op {
         None | Some(b"c") | Some(b"r") => "i",
         Some(b"u") => "u",
@@ -162,18 +159,16 @@ fn parse_data_type(data_type: &str) -> Result<DataType, PluginError> {
     }
 }
 
-enum Mode {
-    Raw,
-    Typed {
-        user_schema: SchemaRef,
-        include_metadata: bool,
-        on_malformed: OnMalformed,
-    },
+struct TypedMode {
+    user_schema: SchemaRef,
+    include_metadata: bool,
+    on_malformed: OnMalformed,
 }
 
 pub(crate) struct RecordConverter {
     schema: SchemaRef,
-    mode: Mode,
+    /// None → raw envelope mode.
+    typed: Option<TypedMode>,
 }
 
 impl RecordConverter {
@@ -188,37 +183,37 @@ impl RecordConverter {
                     Field::new("headers", DataType::Utf8, true),
                     Field::new("body", DataType::Utf8, false),
                 ])),
-                mode: Mode::Raw,
+                typed: None,
             }),
             OutputMode::Typed {
                 fields,
                 include_metadata,
                 on_malformed,
             } => {
-                let mut all_fields = vec![gs_op_field()];
-                all_fields.extend(fields.iter().cloned());
+                let mut reserved = vec![gs_op_field()];
                 if *include_metadata {
-                    all_fields.extend(metadata_fields());
-                }
-                let mut reserved = vec![STREAMLING_COLUMN_NAME_OP];
-                if *include_metadata {
-                    reserved.extend([META_STREAM, META_SEQ_NUM, META_TIMESTAMP]);
+                    reserved.extend(metadata_fields());
                 }
                 for field in fields {
-                    if reserved.contains(&field.name().as_str()) {
+                    if reserved.iter().any(|r| r.name() == field.name()) {
                         return Err(PluginError::Internal(format!(
                             "s2_source: schema field '{}' collides with a reserved column",
                             field.name()
                         )));
                     }
                 }
+                let mut all_fields = vec![gs_op_field()];
+                all_fields.extend(fields.iter().cloned());
+                if *include_metadata {
+                    all_fields.extend(metadata_fields());
+                }
                 Ok(Self {
                     schema: Arc::new(Schema::new(all_fields)),
-                    mode: Mode::Typed {
+                    typed: Some(TypedMode {
                         user_schema: Arc::new(Schema::new(fields.clone())),
                         include_metadata: *include_metadata,
                         on_malformed: *on_malformed,
-                    },
+                    }),
                 })
             }
         }
@@ -232,13 +227,13 @@ impl RecordConverter {
         if records.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
-        match &self.mode {
-            Mode::Raw => self.convert_raw(records),
-            Mode::Typed {
+        match &self.typed {
+            None => self.convert_raw(records),
+            Some(TypedMode {
                 user_schema,
                 include_metadata,
                 on_malformed,
-            } => {
+            }) => {
                 let (user_batch, kept) = match decode_strict(user_schema, records) {
                     Ok(batch) => (batch, None),
                     Err(e) => match on_malformed {
@@ -284,7 +279,13 @@ fn metadata_arrays(records: &[&SourceRecord]) -> (ArrayRef, ArrayRef, ArrayRef) 
     let stream = StringArray::from_iter_values(records.iter().map(|r| r.stream.as_ref()));
     let seq_num = UInt64Array::from_iter_values(records.iter().map(|r| r.seq_num));
     let timestamp =
-        TimestampMillisecondArray::from_iter_values(records.iter().map(|r| r.timestamp as i64))
+        // S2 timestamps are u64 epoch-ms and may be client-supplied; clamp
+        // rather than wrap to a negative Arrow timestamp.
+        TimestampMillisecondArray::from_iter_values(
+            records
+                .iter()
+                .map(|r| i64::try_from(r.timestamp).unwrap_or(i64::MAX)),
+        )
             .with_timezone("UTC");
     (Arc::new(stream), Arc::new(seq_num), Arc::new(timestamp))
 }
@@ -321,14 +322,26 @@ fn decode_strict(
         .map_err(PluginError::ArrowError)?;
 
     for record in records {
-        let mut buf = record.body.as_ref();
+        // Trim JSON-insignificant whitespace and reject empty bodies, so
+        // every record contributes at least one row. Combined with the row
+        // budget (= record count) this makes the aggregate count check exact:
+        // a zero-row body cannot mask a multi-value body elsewhere in the
+        // batch, which would misalign rows with record metadata.
+        let mut buf = record.body.as_ref().trim_ascii();
+        if buf.is_empty() {
+            return Err(decode_error(
+                &record.stream,
+                record.seq_num,
+                "record body is empty",
+            ));
+        }
         while !buf.is_empty() {
             let consumed = decoder
                 .decode(buf)
                 .map_err(|e| decode_error(&record.stream, record.seq_num, &e.to_string()))?;
             if consumed == 0 {
-                // The decoder's row budget (= record count) is exhausted, so
-                // some body decoded to more than one row.
+                // The decoder's row budget is exhausted, so some body decoded
+                // to more than one row.
                 return Err(decode_error(
                     &record.stream,
                     record.seq_num,
@@ -608,6 +621,61 @@ mod tests {
                 || err.to_string().contains("decoded"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn empty_and_whitespace_bodies_are_rejected() {
+        let converter = typed("id:int64", false, OnMalformed::Error);
+        for body in ["", "  \n\t"] {
+            let err = converter
+                .convert(&[record("events", 3, body)])
+                .expect_err("empty body should fail");
+            assert!(err.to_string().contains("empty"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn multi_value_body_cannot_hide_behind_an_empty_body() {
+        // A 2-value body plus a 0-row body used to cancel out in the
+        // aggregate row-count check, silently misaligning rows with record
+        // metadata; both must now error.
+        let converter = typed("id:int64", true, OnMalformed::Error);
+        let records = vec![
+            record("events", 0, r#"{"id":1}{"id":2}"#),
+            record("events", 1, " "),
+        ];
+        assert!(converter.convert(&records).is_err());
+
+        // In skip mode both offending records are dropped, and metadata
+        // stays aligned for the survivors.
+        let converter = typed("id:int64", true, OnMalformed::Skip);
+        let mut records = records;
+        records.push(record("events", 2, r#"{"id":3}"#));
+        let batch = converter.convert(&records).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(int64_column(&batch, "id").value(0), 3);
+        let seq_nums: &UInt64Array = batch
+            .column_by_name(META_SEQ_NUM)
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap();
+        assert_eq!(seq_nums.value(0), 2);
+    }
+
+    #[test]
+    fn out_of_range_timestamps_clamp_instead_of_wrapping() {
+        let converter = RecordConverter::new(&OutputMode::Raw).unwrap();
+        let mut huge = record("events", 0, "x");
+        huge.timestamp = u64::MAX;
+        let batch = converter.convert(&[huge]).unwrap();
+        let timestamps: &arrow::array::TimestampMillisecondArray = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap();
+        assert_eq!(timestamps.value(0), i64::MAX);
     }
 
     #[test]

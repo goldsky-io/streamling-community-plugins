@@ -19,8 +19,9 @@
 //!   emits the S2 record envelope: `stream`, `seq_num`, `timestamp`,
 //!   `headers`, `body`. Both modes lead with streamling's `_gs_op` row-kind
 //!   column, restored from a record's Debezium-style `dbz.op` header when
-//!   present (written by the s2_sink; c|r → i, u → u, d → d) and "i"
-//!   otherwise — so CDC streams round-trip through S2 losslessly.
+//!   present (the same convention streamling's Kafka sink uses; c|r → i,
+//!   u → u, d → d) and "i" otherwise — so CDC streams round-trip through S2
+//!   losslessly.
 //! - include_metadata (typed mode; default false) — append `_s2_stream`,
 //!   `_s2_seq_num`, `_s2_timestamp` columns to the configured schema.
 //! - on_malformed (typed mode; default `error`) — `error` fails the batch when
@@ -28,7 +29,9 @@
 //!   it stalls rather than losing data); `skip` drops undecodable records with
 //!   a WARN log.
 //! - start_position (default `earliest`) — where to begin reading a stream
-//!   that has no checkpointed position yet: `earliest` or `latest`.
+//!   that has no checkpointed position yet: `earliest` or `latest`. Applies
+//!   at startup; a stream discovered by a later prefix refresh is entirely
+//!   new and is always read from the beginning.
 //! - batch_size (default 1000) — max records per generated Arrow batch.
 //! - batch_interval_ms (default 100) — max wait for the first record in
 //!   generate_batch before emitting an empty batch.
@@ -48,19 +51,21 @@
 //! ## Architecture
 //!
 //! One background task per stream holds a long-lived S2 read session (the SDK
-//! resumes it transparently on retryable errors; the task reopens it with a
-//! delay otherwise) and pushes record batches into a bounded channel.
+//! resumes it transparently on retryable errors; the task reopens it with
+//! backoff otherwise) and pushes record batches into a bounded channel.
 //! `generate_batch` drains that channel, converts records to Arrow, and
 //! advances an in-memory per-stream position. With `stream_prefix`, a refresh
 //! task periodically lists streams and starts/stops readers to match.
 //!
 //! ## Delivery semantics
 //!
-//! At-least-once. Per-stream next-sequence-numbers are snapshotted at each
-//! checkpoint marker and persisted to the plugin state backend when the
-//! checkpoint is finalized. On restart the source resumes from the persisted
-//! positions, so records emitted after the last finalized checkpoint are read
-//! again.
+//! At-least-once. Per-stream next-sequence-numbers advance only once a batch
+//! has been handed to the host (a checkpoint marker processed while a batch
+//! is still queued for delivery can therefore never record positions past
+//! it), are snapshotted at each checkpoint marker, and persist to the plugin
+//! state backend when the checkpoint is finalized. On restart the source
+//! resumes from the persisted positions, so records emitted after the last
+//! finalized checkpoint are read again.
 //!
 //! ## Example
 //!

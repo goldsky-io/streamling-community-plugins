@@ -93,7 +93,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` envi
 | `schema` | no | — | Typed mode: `name:type` columns decoded from JSON bodies (`bool`, `int8..64`, `uint8..64`, `float32/64`, `string`, `date`, `timestamp[_s/_ms/_us/_ns]`; `?` suffix = nullable) |
 | `include_metadata` | no | `false` | Typed mode: append `_s2_stream`, `_s2_seq_num`, `_s2_timestamp` columns |
 | `on_malformed` | no | `error` | Typed mode: `error` fails (and retries) the batch on an undecodable body; `skip` drops it with a WARN |
-| `start_position` | no | `earliest` | Where to start a stream with no checkpointed position: `earliest` or `latest` |
+| `start_position` | no | `earliest` | Where to start a stream with no checkpointed position: `earliest` or `latest`. Streams discovered after startup always start from the beginning |
 | `batch_size` | no | `1000` | Max records per generated Arrow batch |
 | `batch_interval_ms` | no | `100` | Max wait for the first record before emitting an empty batch (ms) |
 | `max_buffered_batches` | no | `16` | Bounded buffer of S2 read batches shared by all readers (backpressure) |

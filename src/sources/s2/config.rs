@@ -3,7 +3,8 @@
 
 use crate::sources::s2::convert::{OnMalformed, OutputMode, parse_field_specs};
 use crate::utils::plugin_options::PluginOptions;
-use s2_sdk::types::{BasinName, StreamName, StreamNamePrefix};
+use crate::utils::s2::s2_endpoints;
+use s2_sdk::types::{BasinName, S2Endpoints, StreamName, StreamNamePrefix};
 use std::collections::BTreeSet;
 use streamling_plugin::PluginError;
 
@@ -21,7 +22,7 @@ pub struct S2SourceConfig {
     /// Read every stream with this prefix; refreshed periodically.
     pub stream_prefix: Option<StreamNamePrefix>,
     /// S2-compatible endpoint override (e.g. s2-lite).
-    pub endpoint: Option<String>,
+    pub endpoints: Option<S2Endpoints>,
     pub start_position: StartPosition,
     pub output: OutputMode,
     /// Max records per generated Arrow batch.
@@ -51,14 +52,31 @@ where
         .map_err(|e| PluginError::Internal(format!("s2_source: invalid {key} '{value}': {e}")))
 }
 
-fn parse_nonzero(opts: &PluginOptions, key: &str, default: &str) -> Result<usize, PluginError> {
-    let parsed: usize = parse(opts, key, default)?;
-    if parsed == 0 {
+fn parse_nonzero<T: std::str::FromStr + PartialEq + From<u8>>(
+    opts: &PluginOptions,
+    key: &str,
+    default: &str,
+) -> Result<T, PluginError>
+where
+    T::Err: std::fmt::Display,
+{
+    let parsed: T = parse(opts, key, default)?;
+    if parsed == T::from(0) {
         return Err(PluginError::Internal(format!(
             "s2_source: {key} must be greater than 0"
         )));
     }
     Ok(parsed)
+}
+
+/// Parses an SDK name type with a uniform error message.
+fn parse_name<T: std::str::FromStr>(value: &str, what: &str) -> Result<T, PluginError>
+where
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|e| PluginError::Internal(format!("s2_source: invalid {what} '{value}': {e}")))
 }
 
 fn parse_streams(opts: &PluginOptions) -> Result<Vec<StreamName>, PluginError> {
@@ -68,11 +86,7 @@ fn parse_streams(opts: &PluginOptions) -> Result<Vec<StreamName>, PluginError> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter(|s| seen.insert(s.to_string()))
-        .map(|s| {
-            s.parse().map_err(|e| {
-                PluginError::Internal(format!("s2_source: invalid stream name '{s}': {e}"))
-            })
-        })
+        .map(|s| parse_name(s, "stream name"))
         .collect()
 }
 
@@ -132,18 +146,13 @@ fn parse_output(opts: &PluginOptions) -> Result<OutputMode, PluginError> {
 }
 
 pub fn parse_config(opts: &PluginOptions) -> Result<S2SourceConfig, PluginError> {
-    let basin = opts.get("basin")?;
-    let basin: BasinName = basin
-        .parse()
-        .map_err(|e| PluginError::Internal(format!("s2_source: invalid basin '{basin}': {e}")))?;
+    let basin: BasinName = parse_name(&opts.get("basin")?, "basin")?;
 
     let streams = parse_streams(opts)?;
     let prefix = opts.get_or("stream_prefix", "");
     let stream_prefix = match prefix.trim() {
         "" => None,
-        p => Some(p.parse().map_err(|e| {
-            PluginError::Internal(format!("s2_source: invalid stream_prefix '{p}': {e}"))
-        })?),
+        p => Some(parse_name(p, "stream_prefix")?),
     };
     if streams.is_empty() && stream_prefix.is_none() {
         return Err(PluginError::Internal(
@@ -152,18 +161,22 @@ pub fn parse_config(opts: &PluginOptions) -> Result<S2SourceConfig, PluginError>
     }
 
     let endpoint = opts.get_or("endpoint", "");
+    let endpoints = match endpoint.as_str() {
+        "" => None,
+        endpoint => Some(s2_endpoints(endpoint)?),
+    };
 
     Ok(S2SourceConfig {
         basin,
         streams,
         stream_prefix,
-        endpoint: (!endpoint.is_empty()).then_some(endpoint),
+        endpoints,
         start_position: parse_start_position(opts)?,
         output: parse_output(opts)?,
         batch_size: parse_nonzero(opts, "batch_size", "1000")?,
         batch_interval_ms: parse(opts, "batch_interval_ms", "100")?,
         max_buffered_batches: parse_nonzero(opts, "max_buffered_batches", "16")?,
-        update_streams_interval_secs: parse(opts, "update_streams_interval_secs", "60")?,
+        update_streams_interval_secs: parse_nonzero(opts, "update_streams_interval_secs", "60")?,
         request_timeout_ms: parse(opts, "request_timeout_ms", "5000")?,
         ignore_command_records: parse(opts, "ignore_command_records", "true")?,
     })
@@ -191,7 +204,7 @@ mod tests {
         assert_eq!(cfg.basin.to_string(), "my-basin");
         assert_eq!(cfg.streams.len(), 1);
         assert!(cfg.stream_prefix.is_none());
-        assert!(cfg.endpoint.is_none());
+        assert!(cfg.endpoints.is_none());
         assert_eq!(cfg.start_position, StartPosition::Earliest);
         assert!(matches!(cfg.output, OutputMode::Raw));
         assert_eq!(cfg.batch_size, 1000);
@@ -288,6 +301,28 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.to_string().contains("on_malformed"));
+    }
+
+    #[test]
+    fn zero_update_streams_interval_is_an_error() {
+        let err = parse_config(&options(&[
+            ("basin", "my-basin"),
+            ("streams", "events"),
+            ("update_streams_interval_secs", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("update_streams_interval_secs"));
+    }
+
+    #[test]
+    fn invalid_endpoint_is_a_config_error() {
+        let err = parse_config(&options(&[
+            ("basin", "my-basin"),
+            ("streams", "events"),
+            ("endpoint", "not a url"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("endpoint"), "got {err}");
     }
 
     #[test]
