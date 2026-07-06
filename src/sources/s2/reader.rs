@@ -185,7 +185,6 @@ impl StreamReaders {
             .await
             .insert(key.clone(), next_seq_num);
         let task = tokio::spawn(read_stream(
-            self.config.clone(),
             stream,
             Arc::from(key.as_str()),
             next_seq_num,
@@ -224,7 +223,6 @@ impl StreamReaders {
 /// Returns only when the channel is closed (source terminated) or the task
 /// is aborted.
 async fn read_stream(
-    config: Arc<S2SourceConfig>,
     stream: S2Stream,
     stream_name: Arc<str>,
     mut next_seq_num: u64,
@@ -238,7 +236,8 @@ async fn read_stream(
                     .with_from(ReadFrom::SeqNum(next_seq_num))
                     .with_clamp_to_tail(true),
             )
-            .with_ignore_command_records(config.ignore_command_records);
+            // Command records (fence/trim) are S2-internal control records.
+            .with_ignore_command_records(true);
 
         match stream.read_session(input).await {
             Ok(mut session) => {

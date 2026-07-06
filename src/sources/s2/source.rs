@@ -25,6 +25,14 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
+/// Bounded buffer of S2 read batches shared by all stream readers; when full,
+/// readers stop pulling from S2 (backpressure).
+const MAX_BUFFERED_BATCHES: usize = 16;
+
+/// Max wait in generate_batch for the first record before returning an empty
+/// batch.
+const BATCH_WAIT: Duration = Duration::from_millis(100);
+
 struct RecvState {
     rx: tokio::sync::mpsc::Receiver<Vec<SourceRecord>>,
     /// Records buffered ahead of the next generated batch. Records leave the
@@ -155,7 +163,7 @@ impl SourcePlugin for S2Source {
                     PluginError::Internal(format!("failed to construct S2 client: {e}"))
                 })?;
 
-                let (tx, rx) = tokio::sync::mpsc::channel(self.config.max_buffered_batches);
+                let (tx, rx) = tokio::sync::mpsc::channel(MAX_BUFFERED_BATCHES);
                 let readers = Arc::new(StreamReaders::new(
                     s2.basin(self.config.basin.clone()),
                     self.config.clone(),
@@ -210,11 +218,7 @@ impl SourcePlugin for S2Source {
             inner.readers.record_emitted(&delivered).await;
         }
 
-        recv.fill(
-            self.config.batch_size,
-            Duration::from_millis(self.config.batch_interval_ms),
-        )
-        .await;
+        recv.fill(self.config.batch_size, BATCH_WAIT).await;
         let take = recv.carry.len().min(self.config.batch_size);
         if take == 0 {
             return Ok(RecordBatch::new_empty(self.converter.schema()));

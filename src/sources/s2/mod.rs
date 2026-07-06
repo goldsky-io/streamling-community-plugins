@@ -33,15 +33,8 @@
 //!   at startup; a stream discovered by a later prefix refresh is entirely
 //!   new and is always read from the beginning.
 //! - batch_size (default 1000) — max records per generated Arrow batch.
-//! - batch_interval_ms (default 100) — max wait for the first record in
-//!   generate_batch before emitting an empty batch.
-//! - max_buffered_batches (default 16) — bounded buffer of S2 read batches
-//!   shared by all stream readers; when full, readers stop pulling from S2
-//!   (backpressure).
 //! - update_streams_interval_secs (default 60) — how often `stream_prefix`
 //!   re-lists streams.
-//! - ignore_command_records (default true) — filter out S2 command records
-//!   (fence/trim).
 //! - endpoint — optional S2-compatible endpoint, useful for s2-lite.
 //! - request_timeout_ms (default 5000) — per-request HTTP timeout.
 //!

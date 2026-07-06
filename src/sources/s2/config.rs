@@ -27,15 +27,9 @@ pub struct S2SourceConfig {
     pub output: OutputMode,
     /// Max records per generated Arrow batch.
     pub batch_size: usize,
-    /// Max wait for the first record in generate_batch.
-    pub batch_interval_ms: u64,
-    /// Bounded channel capacity, in S2 read batches.
-    pub max_buffered_batches: usize,
     /// How often `stream_prefix` re-lists streams.
     pub update_streams_interval_secs: u64,
     pub request_timeout_ms: u64,
-    /// Filter out S2 command records (fence/trim).
-    pub ignore_command_records: bool,
 }
 
 fn parse<T: std::str::FromStr>(
@@ -174,11 +168,8 @@ pub fn parse_config(opts: &PluginOptions) -> Result<S2SourceConfig, PluginError>
         start_position: parse_start_position(opts)?,
         output: parse_output(opts)?,
         batch_size: parse_nonzero(opts, "batch_size", "1000")?,
-        batch_interval_ms: parse(opts, "batch_interval_ms", "100")?,
-        max_buffered_batches: parse_nonzero(opts, "max_buffered_batches", "16")?,
         update_streams_interval_secs: parse_nonzero(opts, "update_streams_interval_secs", "60")?,
         request_timeout_ms: parse(opts, "request_timeout_ms", "5000")?,
-        ignore_command_records: parse(opts, "ignore_command_records", "true")?,
     })
 }
 
@@ -208,11 +199,8 @@ mod tests {
         assert_eq!(cfg.start_position, StartPosition::Earliest);
         assert!(matches!(cfg.output, OutputMode::Raw));
         assert_eq!(cfg.batch_size, 1000);
-        assert_eq!(cfg.batch_interval_ms, 100);
-        assert_eq!(cfg.max_buffered_batches, 16);
         assert_eq!(cfg.update_streams_interval_secs, 60);
         assert_eq!(cfg.request_timeout_ms, 5000);
-        assert!(cfg.ignore_command_records);
     }
 
     #[test]

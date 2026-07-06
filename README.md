@@ -95,10 +95,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` envi
 | `on_malformed` | no | `error` | Typed mode: `error` fails (and retries) the batch on an undecodable body; `skip` drops it with a WARN |
 | `start_position` | no | `earliest` | Where to start a stream with no checkpointed position: `earliest` or `latest`. Streams discovered after startup always start from the beginning |
 | `batch_size` | no | `1000` | Max records per generated Arrow batch |
-| `batch_interval_ms` | no | `100` | Max wait for the first record before emitting an empty batch (ms) |
-| `max_buffered_batches` | no | `16` | Bounded buffer of S2 read batches shared by all readers (backpressure) |
 | `update_streams_interval_secs` | no | `60` | How often `stream_prefix` re-lists streams |
-| `ignore_command_records` | no | `true` | Filter out S2 command records (fence/trim) |
 | `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 
