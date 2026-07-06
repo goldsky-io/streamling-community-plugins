@@ -7,8 +7,9 @@
 //! - Typed: JSON record bodies decoded into user-configured columns, with
 //!   optional `_s2_stream` / `_s2_seq_num` / `_s2_timestamp` metadata columns.
 //!
-//! Both modes lead with the streamling `_gs_op` row-kind column, always "i":
-//! S2 streams are append-only, so every record is an insert.
+//! Both modes lead with the streamling `_gs_op` row-kind column, restored
+//! from a record's Debezium-style `dbz.op` header when present (written by
+//! the s2_sink; c|r → i, u → u, d → d) and "i" otherwise.
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array};
 use arrow::compute::concat_batches;
@@ -70,9 +71,38 @@ fn gs_op_field() -> Field {
     Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false)
 }
 
-/// The `_gs_op` column: every S2 record is an insert.
-fn gs_op_array(len: usize) -> ArrayRef {
-    Arc::new(StringArray::from_iter_values(std::iter::repeat_n("i", len)))
+/// Header carrying the row kind, Debezium-encoded — written by the s2_sink
+/// and matching streamling's Kafka `dbz.op` message header.
+const OP_HEADER: &[u8] = b"dbz.op";
+
+/// The `_gs_op` column, restored from each record's `dbz.op` header when
+/// present (c|r → i, u → u, d → d); records without one are inserts —
+/// the same defaulting as streamling's Kafka source.
+fn gs_op_array(records: &[&SourceRecord]) -> ArrayRef {
+    Arc::new(StringArray::from_iter_values(
+        records.iter().map(|record| gs_op(record)),
+    ))
+}
+
+fn gs_op(record: &SourceRecord) -> &'static str {
+    let op = record
+        .headers
+        .iter()
+        .find_map(|(name, value)| (name.as_ref() == OP_HEADER).then_some(value.as_ref()));
+    match op {
+        None | Some(b"c") | Some(b"r") => "i",
+        Some(b"u") => "u",
+        Some(b"d") => "d",
+        Some(other) => {
+            warn!(
+                stream = %record.stream,
+                seq_num = record.seq_num,
+                op = %String::from_utf8_lossy(other),
+                "s2_source: unrecognized dbz.op header value; treating as insert"
+            );
+            "i"
+        }
+    }
 }
 
 /// Parses a `name:type` comma-separated schema spec; `?` suffix marks a
@@ -220,13 +250,13 @@ impl RecordConverter {
                     },
                 };
 
-                let mut columns = vec![gs_op_array(user_batch.num_rows())];
+                let kept_records: Vec<&SourceRecord> = match &kept {
+                    None => records.iter().collect(),
+                    Some(kept) => kept.iter().map(|&i| &records[i]).collect(),
+                };
+                let mut columns = vec![gs_op_array(&kept_records)];
                 columns.extend(user_batch.columns().iter().cloned());
                 if *include_metadata {
-                    let kept_records: Vec<&SourceRecord> = match &kept {
-                        None => records.iter().collect(),
-                        Some(kept) => kept.iter().map(|&i| &records[i]).collect(),
-                    };
                     let (stream, seq_num, timestamp) = metadata_arrays(&kept_records);
                     columns.extend([stream, seq_num, timestamp]);
                 }
@@ -244,14 +274,7 @@ impl RecordConverter {
         ));
         RecordBatch::try_new(
             self.schema.clone(),
-            vec![
-                gs_op_array(records.len()),
-                stream,
-                seq_num,
-                timestamp,
-                headers,
-                body,
-            ],
+            vec![gs_op_array(&all), stream, seq_num, timestamp, headers, body],
         )
         .map_err(PluginError::ArrowError)
     }
@@ -456,6 +479,42 @@ mod tests {
             .unwrap();
         assert_eq!(seq_nums.value(0), 7);
         assert_eq!(seq_nums.value(1), 3);
+    }
+
+    fn record_with_op(stream: &str, seq_num: u64, body: &str, op: &str) -> SourceRecord {
+        let mut record = record(stream, seq_num, body);
+        record.headers = vec![(
+            Bytes::from_static(b"dbz.op"),
+            Bytes::copy_from_slice(op.as_bytes()),
+        )];
+        record
+    }
+
+    #[test]
+    fn gs_op_is_restored_from_dbz_op_headers() {
+        let converter = RecordConverter::new(&OutputMode::Raw).unwrap();
+        let records = vec![
+            record("events", 0, r#"{"id":1}"#), // no header → insert
+            record_with_op("events", 1, r#"{"id":2}"#, "c"),
+            record_with_op("events", 2, r#"{"id":1}"#, "u"),
+            record_with_op("events", 3, r#"{"id":2}"#, "d"),
+            record_with_op("events", 4, r#"{"id":3}"#, "r"),
+            record_with_op("events", 5, r#"{"id":4}"#, "bogus"), // tolerated → insert
+        ];
+
+        let batch = converter.convert(&records).unwrap();
+        let ops = string_column(&batch, STREAMLING_COLUMN_NAME_OP);
+        let values: Vec<&str> = (0..batch.num_rows()).map(|i| ops.value(i)).collect();
+        assert_eq!(values, vec!["i", "i", "u", "d", "i", "i"]);
+
+        let converter = typed("id:int64", false, OnMalformed::Error);
+        let batch = converter
+            .convert(&[record_with_op("events", 0, r#"{"id":1}"#, "d")])
+            .unwrap();
+        assert_eq!(
+            string_column(&batch, STREAMLING_COLUMN_NAME_OP).value(0),
+            "d"
+        );
     }
 
     #[test]

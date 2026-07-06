@@ -19,7 +19,9 @@
 //!   `id:int64,value:string?`). Without it the source runs in raw mode and
 //!   emits the S2 record envelope: `stream`, `seq_num`, `timestamp`,
 //!   `headers`, `body`. Both modes lead with streamling's `_gs_op` row-kind
-//!   column, always "i" (S2 streams are append-only).
+//!   column, restored from a record's Debezium-style `dbz.op` header when
+//!   present (written by the s2_sink; c|r → i, u → u, d → d) and "i"
+//!   otherwise — so CDC streams round-trip through S2 losslessly.
 //! - include_metadata (typed mode; default false) — append `_s2_stream`,
 //!   `_s2_seq_num`, `_s2_timestamp` columns to the configured schema.
 //! - on_malformed (typed mode; default `error`) — `error` fails the batch when

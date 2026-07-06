@@ -3,7 +3,7 @@
 use s2_sdk::S2;
 use s2_sdk::types::{
     AppendInput, AppendRecord, AppendRecordBatch, BasinName, EnsureBasinInput, EnsureStreamInput,
-    StreamName,
+    Header, StreamName,
 };
 use s2_testcontainers::S2Lite;
 use std::time::Duration;
@@ -52,9 +52,28 @@ impl S2Fixture {
     }
 
     async fn append(&self, stream: &StreamName, bodies: impl IntoIterator<Item = String>) {
-        let records = bodies
+        self.append_with_ops(stream, bodies.into_iter().map(|body| (body, None)))
+            .await;
+    }
+
+    /// Appends records, optionally tagged with a Debezium-style `dbz.op`
+    /// header (as the s2_sink writes them).
+    async fn append_with_ops(
+        &self,
+        stream: &StreamName,
+        records: impl IntoIterator<Item = (String, Option<&str>)>,
+    ) {
+        let records = records
             .into_iter()
-            .map(|body| AppendRecord::new(body).expect("valid S2 record"))
+            .map(|(body, op)| {
+                let record = AppendRecord::new(body).expect("valid S2 record");
+                match op {
+                    Some(op) => record
+                        .with_headers([Header::new("dbz.op", op.to_string())])
+                        .expect("valid S2 record headers"),
+                    None => record,
+                }
+            })
             .collect::<Vec<_>>();
         self.s2
             .basin(self.basin.clone())
@@ -220,4 +239,81 @@ sinks:
         .await
         .expect("failed to query row");
     assert_eq!(matched, 1);
+}
+
+/// CDC round-trip: records carrying Debezium-style `dbz.op` headers (as the
+/// s2_sink writes them) restore `_gs_op`, so updates and deletes apply in
+/// ClickHouse instead of landing as inserts.
+#[tokio::test]
+async fn test_s2_source_restores_ops_for_cdc_round_trip() {
+    let fixture = setup().await;
+    let clickhouse = fixture.ctx.clickhouse.as_ref().expect("clickhouse");
+
+    let stream_name = format!("cdc-{}", &fixture.ctx.test_id[..8]);
+    let stream = fixture.create_stream(&stream_name).await;
+    let records = [
+        (r#"{"id":1,"value":"one"}"#, None), // no header → insert
+        (r#"{"id":2,"value":"two"}"#, Some("c")),
+        (r#"{"id":1,"value":"one-updated"}"#, Some("u")),
+        (r#"{"id":2,"value":"two"}"#, Some("d")),
+    ];
+    fixture
+        .append_with_ops(
+            &stream,
+            records.iter().map(|(body, op)| (body.to_string(), *op)),
+        )
+        .await;
+
+    let pipeline = r#"
+sources:
+  s2_source:
+    type: s2_source
+    schema: "id:int64,value:string"
+
+transforms: {}
+
+sinks:
+  ch_sink:
+    type: clickhouse
+    from: s2_source
+    table: s2_source_cdc
+    primary_key: id
+"#;
+
+    let status = fixture
+        .ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .record_limit(records.len() as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__PLUGIN__S2_SOURCE__ACCESS_TOKEN", "ignored")
+                .env(
+                    "STREAMLING__PLUGIN__S2_SOURCE__BASIN",
+                    fixture.basin.to_string(),
+                )
+                .env("STREAMLING__PLUGIN__S2_SOURCE__STREAM", &stream_name)
+                .env("STREAMLING__PLUGIN__S2_SOURCE__ENDPOINT", &fixture.endpoint)
+                .timeout(Duration::from_secs(90)),
+        )
+        .await
+        .expect("streamling execution failed");
+    assert!(status.success(), "streamling should exit successfully");
+
+    // The ClickHouse sink's default mode is ReplacingMergeTree with an
+    // is_deleted column computed from _gs_op; FINAL collapses versions.
+    let active = clickhouse
+        .count("SELECT COUNT(*) FROM s2_source_cdc FINAL WHERE is_deleted = 0")
+        .await
+        .expect("failed to count active rows");
+    assert_eq!(active, 1, "id=2 should be deleted, only id=1 active");
+
+    let updated = clickhouse
+        .count(
+            "SELECT COUNT(*) FROM s2_source_cdc FINAL \
+             WHERE id = 1 AND value = 'one-updated' AND is_deleted = 0",
+        )
+        .await
+        .expect("failed to query updated row");
+    assert_eq!(updated, 1, "id=1 should carry the updated value");
 }
