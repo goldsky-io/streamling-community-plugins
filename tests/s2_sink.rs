@@ -142,6 +142,10 @@ sinks:
 
             let value: serde_json::Value =
                 serde_json::from_slice(&record.body).expect("S2 record should be JSON");
+            assert!(
+                value.get("_gs_op").is_none(),
+                "the op travels as a header, not payload; got {value}"
+            );
             value
                 .get("id")
                 .and_then(serde_json::Value::as_i64)
