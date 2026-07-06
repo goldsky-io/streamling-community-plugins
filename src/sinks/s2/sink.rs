@@ -394,8 +394,8 @@ fn drain_ready_record_tickets(
                 // drain, and its oneshot panics if polled again.
                 tickets.pop_front();
                 return Err(PluginError::Internal(format!(
-                    "failed to append pending S2 Producer record: {}",
-                    e
+                    "stream '{}': failed to append pending S2 Producer record: {}",
+                    stream_id, e
                 )));
             }
             Poll::Pending => {
@@ -423,15 +423,27 @@ async fn await_record_tickets(
 ) -> Result<usize, PluginError> {
     let total = tickets.len();
     let mut last_seq_num = None;
+    let mut first_error = None;
 
+    // Await every ticket even after a failure: returning early would drop
+    // the remaining tickets un-awaited, and the next flush — seeing an empty
+    // pending queue — would acknowledge a checkpoint whose records were
+    // never confirmed durable.
     for ticket in tickets {
-        let ack = ticket.await.map_err(|e| {
-            PluginError::Internal(format!(
-                "stream '{}': failed to append pending S2 Producer record: {}",
-                stream_id, e
-            ))
-        })?;
-        last_seq_num = Some(ack.seq_num);
+        match ticket.await {
+            Ok(ack) => last_seq_num = Some(ack.seq_num),
+            Err(e) => {
+                first_error = first_error.or_else(|| {
+                    Some(PluginError::Internal(format!(
+                        "stream '{}': failed to append pending S2 Producer record: {}",
+                        stream_id, e
+                    )))
+                });
+            }
+        }
+    }
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     debug!(
