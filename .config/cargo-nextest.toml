@@ -1,0 +1,15 @@
+# nextest configuration.
+#
+# The postgres_cdc e2e tests share one Postgres database (the reused logical
+# e2e Postgres exposed via E2E_POSTGRES_URL). etl's source migrations
+# (CREATE SCHEMA etl, …) are not safe under concurrent pipeline starts: two
+# parallel starts race on `pg_namespace` and one aborts with a duplicate-key
+# error. Run these test binaries one at a time.
+
+[[profile.default.test-groups]]
+name = "pg-cdc-serial"
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(/^postgres_cdc/)'
+test-group = "pg-cdc-serial"
