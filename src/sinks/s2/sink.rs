@@ -17,6 +17,12 @@
 //!   S2Config::with_request_timeout.
 //! - linger_ms (default 5) - how long the SDK Producer waits for more records
 //!   before flushing a partial batch.
+//! - max_batch_records / max_batch_bytes — caps on records / metered bytes per
+//!   Producer append batch (SDK defaults: 1000 records / 1 MiB, also the S2
+//!   service maximums).
+//! - max_unacked_bytes — bound on unacknowledged submitted bytes before
+//!   Producer::submit blocks, i.e. the producer's memory/pipelining budget
+//!   (SDK default 5 MiB; minimum 1 MiB).
 //!
 //! Each option can be overridden by the matching STREAMLING__PLUGIN__S2_SINK__<KEY>
 //! env var; the env var wins when both are set.
@@ -218,13 +224,7 @@ impl SinkPlugin for S2Sink {
                 PluginError::Internal(format!("request_timeout_ms is not a valid u64: {}", e))
             })?;
         let endpoint = self.opts.get_or("endpoint", "");
-        let linger_ms: u64 =
-            self.opts.get_or("linger_ms", "5").parse().map_err(|e| {
-                PluginError::Internal(format!("linger_ms is not a valid u64: {}", e))
-            })?;
-
-        let batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
-        let producer_config = ProducerConfig::new().with_batching(batching);
+        let producer_config = producer_config_from_options(&self.opts)?;
 
         let basin_name: BasinName = basin
             .parse()
@@ -286,7 +286,6 @@ impl SinkPlugin for S2Sink {
             stream_id = %stream_id,
             ensure_stream,
             request_timeout_ms,
-            linger_ms,
             "S2 sink initialized successfully"
         );
         Ok(())
@@ -354,6 +353,50 @@ impl SinkPlugin for S2Sink {
     ) -> Result<(), PluginError> {
         Ok(())
     }
+}
+
+/// Builds the SDK Producer configuration from plugin options; unset options
+/// keep the SDK defaults.
+pub(crate) fn producer_config_from_options(
+    opts: &PluginOptions,
+) -> Result<ProducerConfig, PluginError> {
+    fn parsed<T: std::str::FromStr>(
+        opts: &PluginOptions,
+        key: &str,
+    ) -> Result<Option<T>, PluginError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        let value = opts.get_or(key, "");
+        if value.is_empty() {
+            return Ok(None);
+        }
+        value
+            .parse()
+            .map(Some)
+            .map_err(|e| PluginError::Internal(format!("invalid {key} '{value}': {e}")))
+    }
+
+    let linger_ms: u64 = parsed(opts, "linger_ms")?.unwrap_or(5);
+    let mut batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
+    if let Some(max_batch_records) = parsed(opts, "max_batch_records")? {
+        batching = batching
+            .with_max_batch_records(max_batch_records)
+            .map_err(|e| PluginError::Internal(format!("invalid max_batch_records: {e}")))?;
+    }
+    if let Some(max_batch_bytes) = parsed(opts, "max_batch_bytes")? {
+        batching = batching
+            .with_max_batch_bytes(max_batch_bytes)
+            .map_err(|e| PluginError::Internal(format!("invalid max_batch_bytes: {e}")))?;
+    }
+
+    let mut config = ProducerConfig::new().with_batching(batching);
+    if let Some(max_unacked_bytes) = parsed(opts, "max_unacked_bytes")? {
+        config = config
+            .with_max_unacked_bytes(max_unacked_bytes)
+            .map_err(|e| PluginError::Internal(format!("invalid max_unacked_bytes: {e}")))?;
+    }
+    Ok(config)
 }
 
 pub(crate) fn append_records_from_json_rows(
@@ -469,5 +512,44 @@ mod tests {
             err.to_string().contains("failed to build S2 AppendRecord"),
             "unexpected error: {err}"
         );
+    }
+
+    fn options(pairs: &[(&str, &str)]) -> PluginOptions {
+        PluginOptions::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            "s2_sink",
+            "STREAMLING__PLUGIN__S2_SINK_KNOBS_TEST",
+        )
+    }
+
+    #[test]
+    fn test_producer_config_accepts_valid_knobs() {
+        producer_config_from_options(&options(&[])).expect("defaults are valid");
+        producer_config_from_options(&options(&[
+            ("linger_ms", "0"),
+            ("max_batch_records", "500"),
+            ("max_batch_bytes", "524288"),
+            ("max_unacked_bytes", "16777216"),
+        ]))
+        .expect("valid knobs");
+    }
+
+    #[test]
+    fn test_producer_config_rejects_invalid_knobs() {
+        // SDK validation: batch caps must not exceed the service maximums,
+        // and the unacked budget has a 1 MiB floor.
+        for (key, value) in [
+            ("max_batch_records", "1001"),
+            ("max_batch_bytes", "1048577"),
+            ("max_unacked_bytes", "1024"),
+            ("max_batch_records", "abc"),
+        ] {
+            let err = producer_config_from_options(&options(&[(key, value)]))
+                .expect_err("invalid knob should fail");
+            assert!(err.to_string().contains(key), "got {err} for {key}");
+        }
     }
 }

@@ -77,6 +77,9 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` enviro
 | `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 | `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
+| `max_batch_records` | no | `1000` | Max records per Producer append batch (service max 1000) |
+| `max_batch_bytes` | no | `1 MiB` | Max metered bytes per Producer append batch (service max 1 MiB) |
+| `max_unacked_bytes` | no | `5 MiB` | Unacknowledged-bytes budget before submission blocks (min 1 MiB) |
 
 ### Quick start
 
