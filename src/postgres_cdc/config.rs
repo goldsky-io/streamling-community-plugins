@@ -477,7 +477,10 @@ mod tests {
         // Thresholds are ignored when disabled: out-of-range values do not error.
         let mut opts = base_options();
         opts.insert("memory_backpressure_enabled".into(), "false".into());
-        opts.insert("memory_backpressure_activate_threshold".into(), "0.1".into());
+        opts.insert(
+            "memory_backpressure_activate_threshold".into(),
+            "0.1".into(),
+        );
         opts.insert("memory_backpressure_resume_threshold".into(), "0.9".into());
         assert!(
             parse_options(&opts)
