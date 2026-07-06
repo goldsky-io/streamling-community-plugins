@@ -21,6 +21,14 @@
 //! Each option can be overridden by the matching STREAMLING__PLUGIN__S2_SINK__<KEY>
 //! env var; the env var wins when both are set.
 //!
+//! ## Metrics
+//!
+//! - `s2_sink.records_submitted` (count) — records handed to the Producer.
+//! - `s2_sink.records_acknowledged` (count) — records durably appended.
+//! - `s2_sink.pending_records` (gauge) — submitted-but-unacknowledged records.
+//! - `s2_sink.checkpoint_flush_latency` (latency) — time spent draining
+//!   pending acks at a checkpoint marker.
+//!
 //! ## Delivery
 //!
 //! Each process_batch converts the incoming RecordBatch's rows into JSON
@@ -33,14 +41,6 @@
 //! returning, so the dispatcher only acknowledges the checkpoint after S2 has
 //! durably appended every record submitted before the marker. Termination drains
 //! pending tickets and then closes the Producer.
-//!
-//! ## Metrics
-//!
-//! - `s2_sink.records_submitted` (count) — records handed to the Producer.
-//! - `s2_sink.records_acknowledged` (count) — records durably appended.
-//! - `s2_sink.pending_records` (gauge) — submitted-but-unacknowledged records.
-//! - `s2_sink.checkpoint_flush_latency` (latency) — time spent draining
-//!   pending acks at a checkpoint marker.
 
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
