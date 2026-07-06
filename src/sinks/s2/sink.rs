@@ -21,6 +21,14 @@
 //! Each option can be overridden by the matching STREAMLING__PLUGIN__S2_SINK__<KEY>
 //! env var; the env var wins when both are set.
 //!
+//! ## Metrics
+//!
+//! - `s2_sink.records_submitted` (count) — records handed to the Producer.
+//! - `s2_sink.records_acknowledged` (count) — records durably appended.
+//! - `s2_sink.pending_records` (gauge) — submitted-but-unacknowledged records.
+//! - `s2_sink.checkpoint_flush_latency` (latency) — time spent draining
+//!   pending acks at a checkpoint marker.
+//!
 //! ## Delivery
 //!
 //! Each process_batch converts the incoming RecordBatch's rows into JSON
@@ -38,14 +46,6 @@
 //! from streamling's `_gs_op` column (i→c, u→u, d→d — the same encoding as
 //! streamling's Kafka sink), so CDC updates and deletes are distinguishable
 //! out-of-band by consumers.
-//!
-//! ## Metrics
-//!
-//! - `s2_sink.records_submitted` (count) — records handed to the Producer.
-//! - `s2_sink.records_acknowledged` (count) — records durably appended.
-//! - `s2_sink.pending_records` (gauge) — submitted-but-unacknowledged records.
-//! - `s2_sink.checkpoint_flush_latency` (latency) — time spent draining
-//!   pending acks at a checkpoint marker.
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
