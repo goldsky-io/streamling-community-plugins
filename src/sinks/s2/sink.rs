@@ -38,6 +38,14 @@
 //! from streamling's `_gs_op` column (i→c, u→u, d→d — the same encoding as
 //! streamling's Kafka sink), so CDC updates and deletes are distinguishable
 //! out-of-band by consumers.
+//!
+//! ## Metrics
+//!
+//! - `s2_sink.records_submitted` (count) — records handed to the Producer.
+//! - `s2_sink.records_acknowledged` (count) — records durably appended.
+//! - `s2_sink.pending_records` (gauge) — submitted-but-unacknowledged records.
+//! - `s2_sink.checkpoint_flush_latency` (latency) — time spent draining
+//!   pending acks at a checkpoint marker.
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
@@ -89,6 +97,7 @@ pub struct S2Sink {
     _schema: SchemaRef,
     producer: Mutex<Option<ProducerState>>,
     stream_id: OnceLock<String>,
+    metrics: PluginMetricsRecorder,
     running: Arc<AtomicBool>,
 }
 
@@ -97,7 +106,7 @@ impl S2Sink {
         schema: SchemaRef,
         _rt: PluginAsyncRuntimeObj,
         _state_backend_factory: PluginStateBackendFactory,
-        _metric_recorder: PluginMetricsRecorder,
+        metric_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Self {
         S2Sink {
@@ -105,6 +114,7 @@ impl S2Sink {
             _schema: schema,
             producer: Mutex::new(None),
             stream_id: OnceLock::new(),
+            metrics: metric_recorder,
             running: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -324,6 +334,13 @@ impl SinkPlugin for S2Sink {
                 other => other,
             })?;
 
+        self.metrics
+            .record_count("s2_sink.records_submitted", total as u64);
+        self.metrics
+            .record_count("s2_sink.records_acknowledged", acknowledged_records as u64);
+        self.metrics
+            .record_gauge("s2_sink.pending_records", pending_records as u64);
+
         debug!(
             stream_id = %stream_id,
             rows = total,
@@ -336,7 +353,15 @@ impl SinkPlugin for S2Sink {
 
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
         let stream_id = self.stream_id_for_logs();
+        let flush_started_at = std::time::Instant::now();
         let flushed_records = self.flush_pending_records().await?;
+        self.metrics.record_latency(
+            "s2_sink.checkpoint_flush_latency",
+            flush_started_at.elapsed(),
+        );
+        self.metrics
+            .record_count("s2_sink.records_acknowledged", flushed_records as u64);
+        self.metrics.record_gauge("s2_sink.pending_records", 0);
         info!(
             stream_id = %stream_id,
             ?epoch,
