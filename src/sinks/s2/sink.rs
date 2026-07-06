@@ -6,12 +6,22 @@
 //! - access_token (secret) — supply via env STREAMLING__PLUGIN__S2_SINK__ACCESS_TOKEN
 //!   when possible; YAML inlining is supported but logs WARN.
 //! - basin — S2 basin name. Must already exist.
-//! - stream — S2 stream name within the basin.
+//! - Exactly one of:
+//!   - stream — a fixed S2 stream name within the basin;
+//!   - stream_template — a per-row stream name with `{column}` placeholders,
+//!     e.g. `events/{tenant}` — records fan out across streams by the row's
+//!     column values, composing with the s2_source's `stream_prefix`
+//!     discovery on the read side. Placeholder columns must be non-null and
+//!     stringify to a valid stream name; per-stream record order follows row
+//!     order. Producers are created (and streams ensured) lazily per distinct
+//!     resolved name and kept for the sink's lifetime, so the resolved set
+//!     should be bounded.
 //!
 //! Optional:
-//! - ensure_stream (default true) — call basin.ensure_stream at init so the
-//!   stream is created if missing (idempotent). Disable if the access token
-//!   only has append scope.
+//! - ensure_stream (default true) — create target streams if missing
+//!   (idempotent): at init for a fixed `stream`, on first use per resolved
+//!   `stream_template` name. Disable if the access token only has append
+//!   scope.
 //! - endpoint — optional S2-compatible endpoint, useful for s2-lite.
 //! - request_timeout_ms (default 5000) — per-request HTTP timeout passed to
 //!   S2Config::with_request_timeout.
@@ -47,7 +57,8 @@
 //! streamling's Kafka sink), so CDC updates and deletes are distinguishable
 //! out-of-band by consumers.
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow::util::display::array_value_to_string;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use s2_sdk::{
@@ -78,6 +89,20 @@ use tracing::{debug, error, info};
 use crate::utils::plugin_options::PluginOptions;
 use crate::utils::record_batch_json;
 
+/// Where records go: one fixed stream, or a per-row stream name resolved
+/// from a template with `{column}` placeholders.
+#[derive(Debug, Clone)]
+pub(crate) enum StreamTarget {
+    Fixed(StreamName),
+    Template(Vec<Segment>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Segment {
+    Literal(String),
+    Column(String),
+}
+
 struct ProducerState {
     producer: Producer,
     pending: VecDeque<RecordSubmitTicket>,
@@ -92,10 +117,53 @@ impl ProducerState {
     }
 }
 
+/// One producer per target stream, created lazily as template streams are
+/// first resolved. A fixed `stream` is pre-populated at initialization.
+struct SinkState {
+    basin: s2_sdk::S2Basin,
+    producer_config: ProducerConfig,
+    ensure_stream: bool,
+    producers: HashMap<String, ProducerState>,
+}
+
+impl SinkState {
+    async fn producer_for(
+        &mut self,
+        stream: &StreamName,
+    ) -> Result<&mut ProducerState, PluginError> {
+        let key = stream.to_string();
+        if !self.producers.contains_key(&key) {
+            if self.ensure_stream {
+                self.basin
+                    .ensure_stream(EnsureStreamInput::new(stream.clone()))
+                    .await
+                    .map_err(|e| {
+                        PluginError::Internal(format!(
+                            "failed to ensure S2 stream '{}': {}",
+                            key, e
+                        ))
+                    })?;
+            }
+            let producer = self
+                .basin
+                .stream(stream.clone())
+                .producer(self.producer_config.clone());
+            self.producers
+                .insert(key.clone(), ProducerState::new(producer));
+            info!(stream = %key, "S2 sink opened producer for stream");
+        }
+        Ok(self
+            .producers
+            .get_mut(&key)
+            .expect("producer inserted above"))
+    }
+}
+
 pub struct S2Sink {
     opts: PluginOptions,
     _schema: SchemaRef,
-    producer: Mutex<Option<ProducerState>>,
+    state: Mutex<Option<SinkState>>,
+    target: OnceLock<StreamTarget>,
     stream_id: OnceLock<String>,
     metrics: PluginMetricsRecorder,
     running: Arc<AtomicBool>,
@@ -112,7 +180,8 @@ impl S2Sink {
         S2Sink {
             opts: PluginOptions::new(options, "s2_sink", "STREAMLING__PLUGIN__S2_SINK"),
             _schema: schema,
-            producer: Mutex::new(None),
+            state: Mutex::new(None),
+            target: OnceLock::new(),
             stream_id: OnceLock::new(),
             metrics: metric_recorder,
             running: Arc::new(AtomicBool::new(true)),
@@ -126,39 +195,78 @@ impl S2Sink {
             .unwrap_or_else(|| "<uninit>".to_string())
     }
 
+    /// Submits records to their target producers; `streams[i]` names record
+    /// i's stream (all records go to the fixed stream when None).
     async fn submit_records(
         &self,
         records: Vec<AppendRecord>,
+        streams: Option<Vec<StreamName>>,
     ) -> Result<(usize, usize), PluginError> {
-        let stream_id = self.stream_id_for_logs();
-        let mut producer_guard = self.producer.lock().await;
-        let state = producer_guard
+        let mut state_guard = self.state.lock().await;
+        let state = state_guard
             .as_mut()
-            .ok_or_else(|| PluginError::Internal("S2 producer is not initialized".to_string()))?;
+            .ok_or_else(|| PluginError::Internal("S2 sink is not initialized".to_string()))?;
 
-        let acknowledged_records = drain_ready_record_tickets(&stream_id, &mut state.pending)?;
-
-        for record in records {
-            let ticket = state.producer.submit(record).await.map_err(|e| {
-                PluginError::Internal(format!("failed to submit record to S2 Producer: {}", e))
-            })?;
-            state.pending.push_back(ticket);
+        let mut acknowledged_records = 0;
+        for (stream, producer_state) in state.producers.iter_mut() {
+            acknowledged_records +=
+                drain_ready_record_tickets(stream, &mut producer_state.pending)?;
         }
 
-        Ok((state.pending.len(), acknowledged_records))
+        let fixed = match (&streams, self.target.get()) {
+            (None, Some(StreamTarget::Fixed(name))) => Some(name.clone()),
+            (None, _) => {
+                return Err(PluginError::Internal(
+                    "S2 sink target is not initialized".to_string(),
+                ));
+            }
+            (Some(_), _) => None,
+        };
+        for (index, record) in records.into_iter().enumerate() {
+            let stream = match (&fixed, &streams) {
+                (Some(name), _) => name,
+                (None, Some(streams)) => &streams[index],
+                (None, None) => unreachable!("fixed target resolved above"),
+            };
+            let producer_state = state.producer_for(stream).await?;
+            let ticket = producer_state.producer.submit(record).await.map_err(|e| {
+                PluginError::Internal(format!(
+                    "failed to submit record to S2 Producer for stream '{}': {}",
+                    stream, e
+                ))
+            })?;
+            producer_state.pending.push_back(ticket);
+        }
+
+        let pending_records = state
+            .producers
+            .values()
+            .map(|p| p.pending.len())
+            .sum::<usize>();
+        Ok((pending_records, acknowledged_records))
     }
 
+    /// Takes every producer's pending tickets and awaits them all.
     async fn flush_pending_records(&self) -> Result<usize, PluginError> {
-        let stream_id = self.stream_id_for_logs();
-        let tickets = {
-            let mut producer_guard = self.producer.lock().await;
-            let state = producer_guard.as_mut().ok_or_else(|| {
-                PluginError::Internal("S2 producer is not initialized".to_string())
-            })?;
-            std::mem::take(&mut state.pending)
+        let pending: Vec<(String, VecDeque<RecordSubmitTicket>)> = {
+            let mut state_guard = self.state.lock().await;
+            let state = state_guard
+                .as_mut()
+                .ok_or_else(|| PluginError::Internal("S2 sink is not initialized".to_string()))?;
+            state
+                .producers
+                .iter_mut()
+                .map(|(stream, producer_state)| {
+                    (stream.clone(), std::mem::take(&mut producer_state.pending))
+                })
+                .collect()
         };
 
-        await_record_tickets(&stream_id, tickets).await
+        let mut flushed = 0;
+        for (stream, tickets) in pending {
+            flushed += await_record_tickets(&stream, tickets).await?;
+        }
+        Ok(flushed)
     }
 }
 
@@ -172,25 +280,34 @@ impl SupportsGracefulShutdown for S2Sink {
         self.running.store(false, Ordering::SeqCst);
 
         let stream_id = self.stream_id_for_logs();
-        let Some(state) = self.producer.lock().await.take() else {
+        let Some(state) = self.state.lock().await.take() else {
             return Ok(());
         };
 
-        let flush_result = await_record_tickets(&stream_id, state.pending).await;
-        let close_result = state.producer.close().await.map_err(|e| {
-            PluginError::Internal(format!(
-                "stream '{}': failed to close S2 Producer: {}",
-                stream_id, e
-            ))
-        });
-
-        let flushed_records = flush_result?;
-        close_result?;
+        let mut flushed_records = 0;
+        let mut first_error = None;
+        for (stream, producer_state) in state.producers {
+            match await_record_tickets(&stream, producer_state.pending).await {
+                Ok(flushed) => flushed_records += flushed,
+                Err(e) => first_error = first_error.or(Some(e)),
+            }
+            if let Err(e) = producer_state.producer.close().await {
+                first_error = first_error.or_else(|| {
+                    Some(PluginError::Internal(format!(
+                        "stream '{}': failed to close S2 Producer: {}",
+                        stream, e
+                    )))
+                });
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
 
         info!(
             stream_id = %stream_id,
             flushed_records,
-            "S2 sink terminated after closing Producer"
+            "S2 sink terminated after closing Producers"
         );
         Ok(())
     }
@@ -199,7 +316,7 @@ impl SupportsGracefulShutdown for S2Sink {
 #[async_trait]
 impl SinkPlugin for S2Sink {
     async fn initialize(&self) -> Result<(), PluginError> {
-        if self.producer.lock().await.is_some() {
+        if self.state.lock().await.is_some() {
             return Ok(());
         }
 
@@ -215,7 +332,7 @@ impl SinkPlugin for S2Sink {
         })?;
 
         let basin = self.opts.get("basin")?;
-        let stream = self.opts.get("stream")?;
+        let target = stream_target_from_options(&self.opts)?;
 
         let ensure_stream: bool =
             self.opts
@@ -244,9 +361,6 @@ impl SinkPlugin for S2Sink {
         let basin_name: BasinName = basin
             .parse()
             .map_err(|e| PluginError::Internal(format!("invalid basin name '{}': {}", basin, e)))?;
-        let stream_name: StreamName = stream.parse().map_err(|e| {
-            PluginError::Internal(format!("invalid stream name '{}': {}", stream, e))
-        })?;
 
         let mut cfg = S2Config::new(access_token)
             .with_request_timeout(Duration::from_millis(request_timeout_ms))
@@ -265,28 +379,39 @@ impl SinkPlugin for S2Sink {
             .map_err(|e| PluginError::Internal(format!("failed to construct S2 client: {}", e)))?;
         let basin_handle = s2.basin(basin_name.clone());
 
-        if ensure_stream {
-            basin_handle
-                .ensure_stream(EnsureStreamInput::new(stream_name.clone()))
+        let stream_id = match &target {
+            StreamTarget::Fixed(stream_name) => format!("{}/{}", basin_name, stream_name),
+            StreamTarget::Template(_) => format!(
+                "{}/{}",
+                basin_name,
+                self.opts.get_or("stream_template", "<template>")
+            ),
+        };
+
+        let mut state = SinkState {
+            basin: basin_handle,
+            producer_config,
+            ensure_stream,
+            producers: HashMap::new(),
+        };
+        // A fixed stream is ensured and its producer opened up front, so
+        // configuration problems fail initialization rather than the first
+        // batch. Template streams are only known per row; they are ensured
+        // and opened lazily on first use.
+        if let StreamTarget::Fixed(stream_name) = &target {
+            state
+                .producer_for(stream_name)
                 .await
-                .map_err(|e| {
-                    PluginError::Internal(format!(
-                        "failed to ensure S2 stream '{}/{}': {}",
-                        basin_name, stream_name, e
-                    ))
-                })?;
+                .map_err(|e| PluginError::Internal(format!("stream_id '{}': {}", stream_id, e)))?;
         }
 
-        let s2_stream = basin_handle.stream(stream_name.clone());
-        let producer = s2_stream.producer(producer_config);
-        let stream_id = format!("{}/{}", basin_name, stream_name);
-
+        let _ = self.target.set(target);
         let _ = self.stream_id.set(stream_id.clone());
-        let mut producer_guard = self.producer.lock().await;
-        if producer_guard.is_some() {
+        let mut state_guard = self.state.lock().await;
+        if state_guard.is_some() {
             return Ok(());
         }
-        *producer_guard = Some(ProducerState::new(producer));
+        *state_guard = Some(state);
 
         info!(
             stream_id = %stream_id,
@@ -311,6 +436,10 @@ impl SinkPlugin for S2Sink {
 
         let stream_id = self.stream_id_for_logs();
         let ops = dbz_ops_from_batch(&batch)?;
+        let streams = match self.target.get() {
+            Some(StreamTarget::Template(segments)) => Some(resolve_streams(segments, &batch)?),
+            _ => None,
+        };
         let json_rows =
             record_batch_json::record_batch_to_line_delimited_json(&batch).map_err(|e| {
                 PluginError::Internal(format!(
@@ -326,13 +455,15 @@ impl SinkPlugin for S2Sink {
                 }
                 other => other,
             })?;
-        let (pending_records, acknowledged_records) =
-            self.submit_records(records).await.map_err(|e| match e {
-                PluginError::Internal(msg) => {
-                    PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
-                }
-                other => other,
-            })?;
+        let (pending_records, acknowledged_records) = self
+            .submit_records(records, streams)
+            .await
+            .map_err(|e| match e {
+            PluginError::Internal(msg) => {
+                PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
+            }
+            other => other,
+        })?;
 
         self.metrics
             .record_count("s2_sink.records_submitted", total as u64);
@@ -413,6 +544,131 @@ pub(crate) fn dbz_ops_from_batch(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+/// Reads the routing target: exactly one of `stream` (fixed) or
+/// `stream_template` (per-row, with `{column}` placeholders).
+pub(crate) fn stream_target_from_options(
+    opts: &PluginOptions,
+) -> Result<StreamTarget, PluginError> {
+    let stream = opts.get_or("stream", "");
+    let template = opts.get_or("stream_template", "");
+    match (stream.is_empty(), template.is_empty()) {
+        (false, true) => Ok(StreamTarget::Fixed(stream.parse().map_err(|e| {
+            PluginError::Internal(format!("invalid stream name '{}': {}", stream, e))
+        })?)),
+        (true, false) => Ok(StreamTarget::Template(parse_stream_template(&template)?)),
+        (false, false) => Err(PluginError::Internal(
+            "s2_sink: 'stream' and 'stream_template' are mutually exclusive".to_string(),
+        )),
+        (true, true) => Err(PluginError::Internal(
+            "s2_sink: one of 'stream' or 'stream_template' is required".to_string(),
+        )),
+    }
+}
+
+/// Parses `events/{tenant}`-style templates into literal and column segments.
+pub(crate) fn parse_stream_template(template: &str) -> Result<Vec<Segment>, PluginError> {
+    let mut segments = Vec::new();
+    let mut literal = String::new();
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                if !literal.is_empty() {
+                    segments.push(Segment::Literal(std::mem::take(&mut literal)));
+                }
+                let mut column = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some('{') | None => {
+                            return Err(PluginError::Internal(format!(
+                                "s2_sink: unclosed '{{' in stream_template '{template}'"
+                            )));
+                        }
+                        Some(c) => column.push(c),
+                    }
+                }
+                if column.is_empty() {
+                    return Err(PluginError::Internal(format!(
+                        "s2_sink: empty column placeholder in stream_template '{template}'"
+                    )));
+                }
+                segments.push(Segment::Column(column));
+            }
+            '}' => {
+                return Err(PluginError::Internal(format!(
+                    "s2_sink: unmatched '}}' in stream_template '{template}'"
+                )));
+            }
+            c => literal.push(c),
+        }
+    }
+    if !literal.is_empty() {
+        segments.push(Segment::Literal(literal));
+    }
+    if segments.is_empty() {
+        return Err(PluginError::Internal(
+            "s2_sink: stream_template cannot be empty".to_string(),
+        ));
+    }
+    Ok(segments)
+}
+
+/// Resolves the target stream name for each row of the batch. Placeholder
+/// columns must exist, be non-null, and yield a valid stream name.
+pub(crate) fn resolve_streams(
+    segments: &[Segment],
+    batch: &RecordBatch,
+) -> Result<Vec<StreamName>, PluginError> {
+    let columns: HashMap<&str, &ArrayRef> = segments
+        .iter()
+        .filter_map(|segment| match segment {
+            Segment::Column(name) => Some(name.as_str()),
+            Segment::Literal(_) => None,
+        })
+        .map(|name| {
+            batch
+                .column_by_name(name)
+                .map(|column| (name, column))
+                .ok_or_else(|| {
+                    PluginError::Internal(format!(
+                        "s2_sink: stream_template column '{name}' not found in batch"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
+    (0..batch.num_rows())
+        .map(|row| {
+            let mut name = String::new();
+            for segment in segments {
+                match segment {
+                    Segment::Literal(literal) => name.push_str(literal),
+                    Segment::Column(column) => {
+                        let array = columns[column.as_str()];
+                        if array.is_null(row) {
+                            return Err(PluginError::Internal(format!(
+                                "s2_sink: stream_template column '{column}' is null at row {row}"
+                            )));
+                        }
+                        name.push_str(&array_value_to_string(array, row).map_err(|e| {
+                            PluginError::Internal(format!(
+                                "s2_sink: failed to render stream_template column \
+                                 '{column}' at row {row}: {e}"
+                            ))
+                        })?);
+                    }
+                }
+            }
+            name.parse().map_err(|e| {
+                PluginError::Internal(format!(
+                    "s2_sink: stream_template resolved to invalid stream name '{name}': {e}"
+                ))
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn append_records_from_json_rows(
@@ -574,6 +830,75 @@ mod tests {
         .expect("valid batch")
     }
 
+    fn options(pairs: &[(&str, &str)]) -> PluginOptions {
+        PluginOptions::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            "s2_sink",
+            "STREAMLING__PLUGIN__S2_SINK_ROUTING_TEST",
+        )
+    }
+
+    #[test]
+    fn test_stream_and_template_options_are_exclusive_and_required() {
+        assert!(matches!(
+            stream_target_from_options(&options(&[("stream", "events")])),
+            Ok(StreamTarget::Fixed(_))
+        ));
+        assert!(matches!(
+            stream_target_from_options(&options(&[("stream_template", "events/{tenant}")])),
+            Ok(StreamTarget::Template(_))
+        ));
+
+        let err = stream_target_from_options(&options(&[
+            ("stream", "events"),
+            ("stream_template", "events/{tenant}"),
+        ]))
+        .expect_err("both set should fail");
+        assert!(err.to_string().contains("mutually exclusive"), "got {err}");
+
+        let err = stream_target_from_options(&options(&[])).expect_err("neither set should fail");
+        assert!(err.to_string().contains("required"), "got {err}");
+    }
+
+    #[test]
+    fn test_parses_stream_templates() {
+        assert_eq!(
+            parse_stream_template("events/{tenant}-{region}").expect("valid template"),
+            vec![
+                Segment::Literal("events/".to_string()),
+                Segment::Column("tenant".to_string()),
+                Segment::Literal("-".to_string()),
+                Segment::Column("region".to_string()),
+            ]
+        );
+
+        for invalid in ["events/{tenant", "events/{}", "events/}", "{a{b}}", ""] {
+            assert!(
+                parse_stream_template(invalid).is_err(),
+                "'{invalid}' should be rejected"
+            );
+        }
+    }
+
+    fn routing_batch() -> RecordBatch {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tenant", DataType::Utf8, true),
+                Field::new("id", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("acme"), Some("globex"), None])),
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            ],
+        )
+        .expect("valid batch")
+    }
+
     #[test]
     fn test_gs_op_maps_to_dbz_ops() {
         let ops = dbz_ops_from_batch(&op_batch(vec!["i", "u", "d"]))
@@ -612,5 +937,42 @@ mod tests {
         let err = append_records_from_json_rows(vec![br#"{"id":1}"#.to_vec()], Some(&["c", "d"]))
             .expect_err("mismatched op count should fail");
         assert!(err.to_string().contains("does not match"), "got {err}");
+    }
+
+    #[test]
+    fn test_resolves_stream_names_per_row() {
+        let segments = parse_stream_template("events/{tenant}/{id}").expect("valid template");
+        let streams =
+            resolve_streams(&segments, &routing_batch().slice(0, 2)).expect("resolvable rows");
+        let names: Vec<String> = streams.iter().map(ToString::to_string).collect();
+        assert_eq!(names, vec!["events/acme/1", "events/globex/2"]);
+    }
+
+    #[test]
+    fn test_resolve_errors_are_specific() {
+        let segments = parse_stream_template("events/{tenant}").expect("valid template");
+
+        let err =
+            resolve_streams(&segments, &routing_batch()).expect_err("null tenant should fail");
+        assert!(err.to_string().contains("null at row 2"), "got {err}");
+
+        let missing = parse_stream_template("events/{nope}").expect("valid template");
+        let err = resolve_streams(&missing, &routing_batch()).expect_err("missing column");
+        assert!(err.to_string().contains("'nope' not found"), "got {err}");
+
+        // "." is not a valid S2 stream name.
+        use arrow::array::StringArray;
+        use arrow_schema::{DataType, Field, Schema};
+        let dot_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "tenant",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["."]))],
+        )
+        .expect("valid batch");
+        let err = resolve_streams(&segments[1..], &dot_batch).expect_err("invalid name");
+        assert!(err.to_string().contains("invalid stream name"), "got {err}");
     }
 }
