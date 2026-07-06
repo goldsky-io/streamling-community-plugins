@@ -12,7 +12,10 @@
 //!     e.g. `events/{tenant}` — records fan out across streams by the row's
 //!     column values, composing with the s2_source's `stream_prefix`
 //!     discovery on the read side. Placeholder columns must be non-null and
-//!     stringify to a valid stream name; per-stream record order follows row
+//!     stringify to a valid stream name that contains no '/' (values must
+//!     not escape the template's namespace); a row that violates this fails
+//!     the batch — and, since the host fails the pipeline on batch errors,
+//!     upstream data must uphold it. Per-stream record order follows row
 //!     order. Producers are created (and streams ensured) lazily per distinct
 //!     resolved name and kept for the sink's lifetime, so the resolved set
 //!     should be bounded.
@@ -75,24 +78,24 @@ use s2_sdk::{
     batching::BatchingConfig,
     producer::{Producer, ProducerConfig, RecordSubmitTicket},
     types::{
-        AppendRecord, AppendRetryPolicy, BasinName, EnsureStreamInput, Header, RetryConfig,
-        S2Config, StreamName,
+        AccountEndpoint, AppendRecord, AppendRetryPolicy, BasinEndpoint, BasinName,
+        EnsureStreamInput, Header, RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use streamling_plugin::r#api::PluginStateBackendFactory;
 use streamling_plugin::api::{STREAMLING_COLUMN_NAME_OP, SupportsGracefulShutdown};
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
-use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
-use tokio::sync::Mutex;
+use streamling_plugin::{CheckpointEpoch, PluginError, PluginInitializationError, SinkPlugin};
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, error, info};
 
 use crate::utils::plugin_options::PluginOptions;
@@ -129,51 +132,54 @@ impl ProducerState {
 /// One producer per target stream, created lazily as template streams are
 /// first resolved. A fixed `stream` is pre-populated at initialization.
 struct SinkState {
-    basin: s2_sdk::S2Basin,
+    /// Control-plane handle with the SDK's default (finite) retries:
+    /// ensure_stream runs on the record-submit path for template streams, and
+    /// unbounded retries there would wedge the sink (and with it checkpoint
+    /// and terminate handling) instead of surfacing an error.
+    ensure_basin: s2_sdk::S2Basin,
+    /// Data-plane handle with unbounded append retries — appends must not be
+    /// dropped; the checkpoint barrier bounds the exposure.
+    producer_basin: s2_sdk::S2Basin,
     producer_config: ProducerConfig,
     ensure_stream: bool,
-    producers: HashMap<String, ProducerState>,
+    producers: Mutex<HashMap<StreamName, ProducerState>>,
 }
 
 impl SinkState {
-    async fn producer_for(
-        &mut self,
+    async fn ensure_producer(
+        &self,
+        producers: &mut HashMap<StreamName, ProducerState>,
         stream: &StreamName,
-    ) -> Result<&mut ProducerState, PluginError> {
-        let key = stream.to_string();
-        if !self.producers.contains_key(&key) {
-            if self.ensure_stream {
-                self.basin
-                    .ensure_stream(EnsureStreamInput::new(stream.clone()))
-                    .await
-                    .map_err(|e| {
-                        PluginError::Internal(format!(
-                            "failed to ensure S2 stream '{}': {}",
-                            key, e
-                        ))
-                    })?;
-            }
-            let producer = self
-                .basin
-                .stream(stream.clone())
-                .producer(self.producer_config.clone());
-            self.producers
-                .insert(key.clone(), ProducerState::new(producer));
-            info!(stream = %key, "S2 sink opened producer for stream");
+    ) -> Result<(), PluginError> {
+        if producers.contains_key(stream) {
+            return Ok(());
         }
-        Ok(self
-            .producers
-            .get_mut(&key)
-            .expect("producer inserted above"))
+        if self.ensure_stream {
+            self.ensure_basin
+                .ensure_stream(EnsureStreamInput::new(stream.clone()))
+                .await
+                .map_err(|e| {
+                    PluginError::Internal(format!("failed to ensure S2 stream '{stream}': {e}"))
+                })?;
+        }
+        let producer = self
+            .producer_basin
+            .stream(stream.clone())
+            .producer(self.producer_config.clone());
+        producers.insert(stream.clone(), ProducerState::new(producer));
+        info!(stream = %stream, "S2 sink opened producer for stream");
+        Ok(())
     }
 }
 
 pub struct S2Sink {
     opts: PluginOptions,
     _schema: SchemaRef,
-    state: Mutex<Option<SinkState>>,
-    target: OnceLock<StreamTarget>,
-    stream_id: OnceLock<String>,
+    basin: BasinName,
+    target: StreamTarget,
+    /// Log/error label: `basin/stream` or `basin/<template>`.
+    stream_id: String,
+    state: OnceCell<SinkState>,
     metrics: PluginMetricsRecorder,
     running: Arc<AtomicBool>,
 }
@@ -185,85 +191,111 @@ impl S2Sink {
         _state_backend_factory: PluginStateBackendFactory,
         metric_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
-    ) -> Self {
-        S2Sink {
-            opts: PluginOptions::new(options, "s2_sink", "STREAMLING__PLUGIN__S2_SINK"),
+    ) -> Result<Self, PluginInitializationError> {
+        let configuration_error =
+            |e: PluginError| PluginInitializationError::Configuration(e.to_string().into());
+
+        let opts = PluginOptions::new(options, "s2_sink", "STREAMLING__PLUGIN__S2_SINK");
+        let basin: BasinName = opts
+            .get("basin")
+            .and_then(|basin| {
+                basin.parse().map_err(|e| {
+                    PluginError::Internal(format!("invalid basin name '{}': {}", basin, e))
+                })
+            })
+            .map_err(configuration_error)?;
+        let target = stream_target_from_options(&opts).map_err(configuration_error)?;
+        let stream_id = match &target {
+            StreamTarget::Fixed(stream) => format!("{basin}/{stream}"),
+            StreamTarget::Template(_) => {
+                format!("{basin}/{}", opts.get_or("stream_template", "<template>"))
+            }
+        };
+
+        Ok(S2Sink {
+            opts,
             _schema: schema,
-            state: Mutex::new(None),
-            target: OnceLock::new(),
-            stream_id: OnceLock::new(),
+            basin,
+            target,
+            stream_id,
+            state: OnceCell::new(),
             metrics: metric_recorder,
             running: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
+    fn state(&self) -> Result<&SinkState, PluginError> {
+        self.state
+            .get()
+            .ok_or_else(|| PluginError::Internal("S2 sink is not initialized".to_string()))
+    }
+
+    fn with_stream_context(&self, e: PluginError) -> PluginError {
+        match e {
+            PluginError::Internal(msg) => {
+                PluginError::Internal(format!("stream '{}': {}", self.stream_id, msg))
+            }
+            other => other,
         }
     }
 
-    fn stream_id_for_logs(&self) -> String {
-        self.stream_id
-            .get()
-            .cloned()
-            .unwrap_or_else(|| "<uninit>".to_string())
-    }
-
-    /// Submits records to their target producers; `streams[i]` names record
-    /// i's stream (all records go to the fixed stream when None).
+    /// Submits records to their target producers; `streams` (parallel to
+    /// `records`) names each record's stream for a template target, and is
+    /// None for the fixed target.
     async fn submit_records(
         &self,
         records: Vec<AppendRecord>,
         streams: Option<Vec<StreamName>>,
     ) -> Result<(usize, usize), PluginError> {
-        let mut state_guard = self.state.lock().await;
-        let state = state_guard
-            .as_mut()
-            .ok_or_else(|| PluginError::Internal("S2 sink is not initialized".to_string()))?;
+        let state = self.state()?;
+        let mut producers = state.producers.lock().await;
 
         let mut acknowledged_records = 0;
-        for (stream, producer_state) in state.producers.iter_mut() {
+        for (stream, producer_state) in producers.iter_mut() {
             acknowledged_records +=
-                drain_ready_record_tickets(stream, &mut producer_state.pending)?;
+                drain_ready_record_tickets(stream.as_ref(), &mut producer_state.pending)?;
         }
 
-        let fixed = match (&streams, self.target.get()) {
-            (None, Some(StreamTarget::Fixed(name))) => Some(name.clone()),
-            (None, _) => {
-                return Err(PluginError::Internal(
-                    "S2 sink target is not initialized".to_string(),
-                ));
+        // Routing determines where data lands: the parallel array must match
+        // exactly, or records would silently go to the wrong streams.
+        let runs = match (&self.target, streams) {
+            (StreamTarget::Fixed(stream), None) => vec![(stream.clone(), records)],
+            (StreamTarget::Template(_), Some(streams)) if streams.len() == records.len() => {
+                group_by_stream(records, streams)
             }
-            (Some(_), _) => None,
+            (_, streams) => {
+                return Err(PluginError::Internal(format!(
+                    "resolved stream count {:?} does not match record count {}",
+                    streams.map(|s| s.len()),
+                    records.len()
+                )));
+            }
         };
-        for (index, record) in records.into_iter().enumerate() {
-            let stream = match (&fixed, &streams) {
-                (Some(name), _) => name,
-                (None, Some(streams)) => &streams[index],
-                (None, None) => unreachable!("fixed target resolved above"),
-            };
-            let producer_state = state.producer_for(stream).await?;
-            let ticket = producer_state.producer.submit(record).await.map_err(|e| {
-                PluginError::Internal(format!(
-                    "failed to submit record to S2 Producer for stream '{}': {}",
-                    stream, e
-                ))
-            })?;
-            producer_state.pending.push_back(ticket);
+
+        for (stream, run) in runs {
+            state.ensure_producer(&mut producers, &stream).await?;
+            let producer_state = producers.get_mut(&stream).expect("producer just ensured");
+            for record in run {
+                let ticket = producer_state.producer.submit(record).await.map_err(|e| {
+                    PluginError::Internal(format!(
+                        "failed to submit record to S2 Producer for stream '{}': {}",
+                        stream, e
+                    ))
+                })?;
+                producer_state.pending.push_back(ticket);
+            }
         }
 
-        let pending_records = state
-            .producers
-            .values()
-            .map(|p| p.pending.len())
-            .sum::<usize>();
+        let pending_records = producers.values().map(|p| p.pending.len()).sum::<usize>();
         Ok((pending_records, acknowledged_records))
     }
 
-    /// Takes every producer's pending tickets and awaits them all.
+    /// Takes every producer's pending tickets and awaits them all,
+    /// concurrently across streams.
     async fn flush_pending_records(&self) -> Result<usize, PluginError> {
-        let pending: Vec<(String, VecDeque<RecordSubmitTicket>)> = {
-            let mut state_guard = self.state.lock().await;
-            let state = state_guard
-                .as_mut()
-                .ok_or_else(|| PluginError::Internal("S2 sink is not initialized".to_string()))?;
-            state
-                .producers
+        let pending: Vec<(StreamName, VecDeque<RecordSubmitTicket>)> = {
+            let mut producers = self.state()?.producers.lock().await;
+            producers
                 .iter_mut()
                 .map(|(stream, producer_state)| {
                     (stream.clone(), std::mem::take(&mut producer_state.pending))
@@ -271,12 +303,28 @@ impl S2Sink {
                 .collect()
         };
 
-        let mut flushed = 0;
-        for (stream, tickets) in pending {
-            flushed += await_record_tickets(&stream, tickets).await?;
-        }
-        Ok(flushed)
+        let flushed_counts = futures::future::try_join_all(pending.into_iter().map(
+            |(stream, tickets)| async move { await_record_tickets(stream.as_ref(), tickets).await },
+        ))
+        .await?;
+        Ok(flushed_counts.into_iter().sum())
     }
+}
+
+/// Groups row-ordered (record, stream) pairs into runs of consecutive
+/// same-stream records, preserving per-stream order.
+fn group_by_stream(
+    records: Vec<AppendRecord>,
+    streams: Vec<StreamName>,
+) -> Vec<(StreamName, Vec<AppendRecord>)> {
+    let mut runs: Vec<(StreamName, Vec<AppendRecord>)> = Vec::new();
+    for (record, stream) in records.into_iter().zip(streams) {
+        match runs.last_mut() {
+            Some((last, run)) if *last == stream => run.push(record),
+            _ => runs.push((stream, vec![record])),
+        }
+    }
+    runs
 }
 
 #[async_trait]
@@ -288,25 +336,35 @@ impl SupportsGracefulShutdown for S2Sink {
     async fn terminate(&self) -> Result<(), PluginError> {
         self.running.store(false, Ordering::SeqCst);
 
-        let stream_id = self.stream_id_for_logs();
-        let Some(state) = self.state.lock().await.take() else {
+        let Some(state) = self.state.get() else {
             return Ok(());
         };
+        let producers: Vec<(StreamName, ProducerState)> =
+            state.producers.lock().await.drain().collect();
+
+        let results = futures::future::join_all(producers.into_iter().map(
+            |(stream, producer_state)| async move {
+                let flushed = await_record_tickets(stream.as_ref(), producer_state.pending).await;
+                let closed = producer_state.producer.close().await.map_err(|e| {
+                    PluginError::Internal(format!(
+                        "stream '{}': failed to close S2 Producer: {}",
+                        stream, e
+                    ))
+                });
+                (flushed, closed)
+            },
+        ))
+        .await;
 
         let mut flushed_records = 0;
         let mut first_error = None;
-        for (stream, producer_state) in state.producers {
-            match await_record_tickets(&stream, producer_state.pending).await {
-                Ok(flushed) => flushed_records += flushed,
+        for (flushed, closed) in results {
+            match flushed {
+                Ok(count) => flushed_records += count,
                 Err(e) => first_error = first_error.or(Some(e)),
             }
-            if let Err(e) = producer_state.producer.close().await {
-                first_error = first_error.or_else(|| {
-                    Some(PluginError::Internal(format!(
-                        "stream '{}': failed to close S2 Producer: {}",
-                        stream, e
-                    )))
-                });
+            if let Err(e) = closed {
+                first_error = first_error.or(Some(e));
             }
         }
         if let Some(e) = first_error {
@@ -314,7 +372,7 @@ impl SupportsGracefulShutdown for S2Sink {
         }
 
         info!(
-            stream_id = %stream_id,
+            stream_id = %self.stream_id,
             flushed_records,
             "S2 sink terminated after closing Producers"
         );
@@ -325,110 +383,113 @@ impl SupportsGracefulShutdown for S2Sink {
 #[async_trait]
 impl SinkPlugin for S2Sink {
     async fn initialize(&self) -> Result<(), PluginError> {
-        if self.state.lock().await.is_some() {
-            return Ok(());
-        }
+        self.state
+            .get_or_try_init(|| async {
+                // s2-sdk talks HTTP/2 over rustls; install the aws-lc-rs
+                // CryptoProvider process-wide if nothing else has
+                // (install_default is idempotent).
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        // s2-sdk talks HTTP/2 over rustls; install the aws-lc-rs CryptoProvider
-        // process-wide if nothing else has. `install_default` is idempotent:
-        // returns Err if already installed.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        let access_token = self.opts.get_secret("access_token").ok_or_else(|| {
-            let err = "s2_sink: access_token is not specified".to_string();
-            error!(error = %err, "S2 sink initialization failed");
-            PluginError::Internal(err)
-        })?;
-
-        let basin = self.opts.get("basin")?;
-        let target = stream_target_from_options(&self.opts)?;
-
-        let ensure_stream: bool =
-            self.opts
-                .get_or("ensure_stream", "true")
-                .parse()
-                .map_err(|e| {
-                    PluginError::Internal(format!("ensure_stream is not a valid bool: {}", e))
+                let access_token = self.opts.get_secret("access_token").ok_or_else(|| {
+                    let err = "s2_sink: access_token is not specified".to_string();
+                    error!(error = %err, "S2 sink initialization failed");
+                    PluginError::Internal(err)
+                })?;
+                let ensure_stream: bool = self
+                    .opts
+                    .get_or("ensure_stream", "true")
+                    .parse()
+                    .map_err(|e| {
+                        PluginError::Internal(format!("ensure_stream is not a valid bool: {}", e))
+                    })?;
+                let request_timeout_ms: u64 = self
+                    .opts
+                    .get_or("request_timeout_ms", "5000")
+                    .parse()
+                    .map_err(|e| {
+                        PluginError::Internal(format!(
+                            "request_timeout_ms is not a valid u64: {}",
+                            e
+                        ))
+                    })?;
+                let linger_ms: u64 = self.opts.get_or("linger_ms", "5").parse().map_err(|e| {
+                    PluginError::Internal(format!("linger_ms is not a valid u64: {}", e))
                 })?;
 
-        let request_timeout_ms: u64 = self
-            .opts
-            .get_or("request_timeout_ms", "5000")
-            .parse()
-            .map_err(|e| {
-                PluginError::Internal(format!("request_timeout_ms is not a valid u64: {}", e))
-            })?;
-        let endpoint = self.opts.get_or("endpoint", "");
-        let linger_ms: u64 =
-            self.opts.get_or("linger_ms", "5").parse().map_err(|e| {
-                PluginError::Internal(format!("linger_ms is not a valid u64: {}", e))
-            })?;
+                let endpoint = self.opts.get_or("endpoint", "");
+                let endpoints = match endpoint.as_str() {
+                    "" => None,
+                    endpoint => Some(
+                        S2Endpoints::new(
+                            AccountEndpoint::new(endpoint).map_err(|e| {
+                                PluginError::Internal(format!("invalid S2 account endpoint: {}", e))
+                            })?,
+                            BasinEndpoint::new(endpoint).map_err(|e| {
+                                PluginError::Internal(format!("invalid S2 basin endpoint: {}", e))
+                            })?,
+                        )
+                        .map_err(|e| {
+                            PluginError::Internal(format!("invalid S2 endpoints: {}", e))
+                        })?,
+                    ),
+                };
+                let new_client = |retry: Option<RetryConfig>| -> Result<S2, PluginError> {
+                    let mut cfg = S2Config::new(access_token.clone())
+                        .with_request_timeout(Duration::from_millis(request_timeout_ms));
+                    if let Some(endpoints) = &endpoints {
+                        cfg = cfg.with_endpoints(endpoints.clone());
+                    }
+                    if let Some(retry) = retry {
+                        cfg = cfg.with_retry(retry);
+                    }
+                    S2::new(cfg).map_err(|e| {
+                        PluginError::Internal(format!("failed to construct S2 client: {}", e))
+                    })
+                };
+                // Appends retry without bound — a record handed to the sink
+                // must not be dropped, and the checkpoint barrier bounds the
+                // exposure. Control-plane calls (ensure_stream) keep the
+                // SDK's finite default so failures surface instead of
+                // wedging the submit path.
+                let data_client = new_client(Some(
+                    RetryConfig::new()
+                        .with_max_attempts(NonZeroU32::new(u32::MAX).expect("u32::MAX is nonzero"))
+                        .with_min_base_delay(Duration::from_millis(250))
+                        .with_max_base_delay(Duration::from_secs(15))
+                        .with_append_retry_policy(AppendRetryPolicy::All),
+                ))?;
+                let control_client = new_client(None)?;
 
-        let batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
-        let producer_config = ProducerConfig::new().with_batching(batching);
+                let batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
+                let state = SinkState {
+                    ensure_basin: control_client.basin(self.basin.clone()),
+                    producer_basin: data_client.basin(self.basin.clone()),
+                    producer_config: ProducerConfig::new().with_batching(batching),
+                    ensure_stream,
+                    producers: Mutex::new(HashMap::new()),
+                };
+                // A fixed stream is ensured and its producer opened up front,
+                // so configuration problems fail initialization rather than
+                // the first batch. Template streams are only known per row;
+                // they are ensured and opened lazily on first use.
+                if let StreamTarget::Fixed(stream) = &self.target {
+                    let mut producers = state.producers.lock().await;
+                    state
+                        .ensure_producer(&mut producers, stream)
+                        .await
+                        .map_err(|e| self.with_stream_context(e))?;
+                }
 
-        let basin_name: BasinName = basin
-            .parse()
-            .map_err(|e| PluginError::Internal(format!("invalid basin name '{}': {}", basin, e)))?;
-
-        let mut cfg = S2Config::new(access_token)
-            .with_request_timeout(Duration::from_millis(request_timeout_ms))
-            .with_retry(
-                RetryConfig::new()
-                    .with_max_attempts(NonZeroU32::new(u32::MAX).expect("u32::MAX is nonzero"))
-                    .with_min_base_delay(Duration::from_millis(250))
-                    .with_max_base_delay(Duration::from_secs(15))
-                    .with_append_retry_policy(AppendRetryPolicy::All),
-            );
-        if !endpoint.is_empty() {
-            cfg = cfg.with_endpoints(crate::utils::s2::s2_endpoints(&endpoint)?);
-        }
-
-        let s2 = S2::new(cfg)
-            .map_err(|e| PluginError::Internal(format!("failed to construct S2 client: {}", e)))?;
-        let basin_handle = s2.basin(basin_name.clone());
-
-        let stream_id = match &target {
-            StreamTarget::Fixed(stream_name) => format!("{}/{}", basin_name, stream_name),
-            StreamTarget::Template(_) => format!(
-                "{}/{}",
-                basin_name,
-                self.opts.get_or("stream_template", "<template>")
-            ),
-        };
-
-        let mut state = SinkState {
-            basin: basin_handle,
-            producer_config,
-            ensure_stream,
-            producers: HashMap::new(),
-        };
-        // A fixed stream is ensured and its producer opened up front, so
-        // configuration problems fail initialization rather than the first
-        // batch. Template streams are only known per row; they are ensured
-        // and opened lazily on first use.
-        if let StreamTarget::Fixed(stream_name) = &target {
-            state
-                .producer_for(stream_name)
-                .await
-                .map_err(|e| PluginError::Internal(format!("stream_id '{}': {}", stream_id, e)))?;
-        }
-
-        let _ = self.target.set(target);
-        let _ = self.stream_id.set(stream_id.clone());
-        let mut state_guard = self.state.lock().await;
-        if state_guard.is_some() {
-            return Ok(());
-        }
-        *state_guard = Some(state);
-
-        info!(
-            stream_id = %stream_id,
-            ensure_stream,
-            request_timeout_ms,
-            linger_ms,
-            "S2 sink initialized successfully"
-        );
+                info!(
+                    stream_id = %self.stream_id,
+                    ensure_stream,
+                    request_timeout_ms,
+                    linger_ms,
+                    "S2 sink initialized successfully"
+                );
+                Ok(state)
+            })
+            .await?;
         Ok(())
     }
 
@@ -443,36 +504,26 @@ impl SinkPlugin for S2Sink {
             return Ok(());
         }
 
-        let stream_id = self.stream_id_for_logs();
-        let ops = dbz_ops_from_batch(&batch)?;
-        let streams = match self.target.get() {
-            Some(StreamTarget::Template(segments)) => Some(resolve_streams(segments, &batch)?),
-            _ => None,
+        let ops = dbz_ops_from_batch(&batch).map_err(|e| self.with_stream_context(e))?;
+        let streams = match &self.target {
+            StreamTarget::Template(segments) => Some(resolve_streams(segments, &batch)?),
+            StreamTarget::Fixed(_) => None,
         };
         let payload = without_op_column(&batch)?;
         let json_rows =
             record_batch_json::record_batch_to_line_delimited_json(&payload).map_err(|e| {
-                PluginError::Internal(format!(
-                    "stream '{}': failed to convert batch to JSON: {}",
-                    stream_id, e
-                ))
+                self.with_stream_context(PluginError::Internal(format!(
+                    "failed to convert batch to JSON: {}",
+                    e
+                )))
             })?;
         let total = json_rows.len();
-        let records = append_records_from_json_rows(json_rows, &ops).map_err(|e| match e {
-            PluginError::Internal(msg) => {
-                PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
-            }
-            other => other,
-        })?;
+        let records = append_records_from_json_rows(json_rows, &ops)
+            .map_err(|e| self.with_stream_context(e))?;
         let (pending_records, acknowledged_records) = self
             .submit_records(records, streams)
             .await
-            .map_err(|e| match e {
-            PluginError::Internal(msg) => {
-                PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
-            }
-            other => other,
-        })?;
+            .map_err(|e| self.with_stream_context(e))?;
 
         self.metrics
             .record_count("s2_sink.records_submitted", total as u64);
@@ -482,7 +533,7 @@ impl SinkPlugin for S2Sink {
             .record_gauge("s2_sink.pending_records", pending_records as u64);
 
         debug!(
-            stream_id = %stream_id,
+            stream_id = %self.stream_id,
             rows = total,
             acknowledged_records,
             pending_records,
@@ -492,7 +543,6 @@ impl SinkPlugin for S2Sink {
     }
 
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
-        let stream_id = self.stream_id_for_logs();
         let flush_started_at = std::time::Instant::now();
         let flushed_records = self.flush_pending_records().await?;
         self.metrics.record_latency(
@@ -503,7 +553,7 @@ impl SinkPlugin for S2Sink {
             .record_count("s2_sink.records_acknowledged", flushed_records as u64);
         self.metrics.record_gauge("s2_sink.pending_records", 0);
         info!(
-            stream_id = %stream_id,
+            stream_id = %self.stream_id,
             ?epoch,
             flushed_records,
             "S2 sink flushed pending records for checkpoint marker"
@@ -675,35 +725,56 @@ pub(crate) fn resolve_streams(
         })
         .collect::<Result<_, _>>()?;
 
-    (0..batch.num_rows())
-        .map(|row| {
-            let mut name = String::new();
-            for segment in segments {
-                match segment {
-                    Segment::Literal(literal) => name.push_str(literal),
-                    Segment::Column(column) => {
-                        let array = columns[column.as_str()];
-                        if array.is_null(row) {
-                            return Err(PluginError::Internal(format!(
-                                "s2_sink: stream_template column '{column}' is null at row {row}"
-                            )));
-                        }
-                        name.push_str(&array_value_to_string(array, row).map_err(|e| {
-                            PluginError::Internal(format!(
-                                "s2_sink: failed to render stream_template column \
-                                 '{column}' at row {row}: {e}"
-                            ))
-                        })?);
+    // Template columns are typically low-cardinality; memoize the rendered
+    // name → parsed StreamName so repeated rows skip validation.
+    let mut parsed: HashMap<String, StreamName> = HashMap::new();
+    let mut resolved = Vec::with_capacity(batch.num_rows());
+    let mut name = String::new();
+    for row in 0..batch.num_rows() {
+        name.clear();
+        for segment in segments {
+            match segment {
+                Segment::Literal(literal) => name.push_str(literal),
+                Segment::Column(column) => {
+                    let array = columns[column.as_str()];
+                    if array.is_null(row) {
+                        return Err(PluginError::Internal(format!(
+                            "s2_sink: stream_template column '{column}' is null at row {row}"
+                        )));
                     }
+                    let value = array_value_to_string(array, row).map_err(|e| {
+                        PluginError::Internal(format!(
+                            "s2_sink: failed to render stream_template column \
+                             '{column}' at row {row}: {e}"
+                        ))
+                    })?;
+                    // '/' delimits the S2 stream namespace; a value containing
+                    // it would escape the template's intended prefix (e.g.
+                    // tenant "a/b" under "events/{tenant}" landing in
+                    // "events/a/b", visible to a reader of "events/a").
+                    if value.contains('/') {
+                        return Err(PluginError::Internal(format!(
+                            "s2_sink: stream_template column '{column}' value '{value}' at \
+                             row {row} contains '/', which would escape the stream namespace"
+                        )));
+                    }
+                    name.push_str(&value);
                 }
             }
-            name.parse().map_err(|e| {
-                PluginError::Internal(format!(
-                    "s2_sink: stream_template resolved to invalid stream name '{name}': {e}"
-                ))
-            })
-        })
-        .collect()
+        }
+        if let Some(stream) = parsed.get(&name) {
+            resolved.push(stream.clone());
+            continue;
+        }
+        let stream: StreamName = name.parse().map_err(|e| {
+            PluginError::Internal(format!(
+                "s2_sink: stream_template resolved to invalid stream name '{name}': {e}"
+            ))
+        })?;
+        parsed.insert(name.clone(), stream.clone());
+        resolved.push(stream);
+    }
+    Ok(resolved)
 }
 
 pub(crate) fn append_records_from_json_rows(
@@ -1014,6 +1085,72 @@ mod tests {
             resolve_streams(&segments, &routing_batch().slice(0, 2)).expect("resolvable rows");
         let names: Vec<String> = streams.iter().map(ToString::to_string).collect();
         assert_eq!(names, vec!["events/acme/1", "events/globex/2"]);
+    }
+
+    #[test]
+    fn test_placeholder_values_must_not_escape_the_namespace() {
+        use arrow::array::StringArray;
+        use arrow_schema::{DataType, Schema};
+        let segments = parse_stream_template("events/{tenant}").expect("valid template");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "tenant",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["acme/evil"]))],
+        )
+        .expect("valid batch");
+        let err = resolve_streams(&segments, &batch).expect_err("'/' in value should fail");
+        assert!(err.to_string().contains("escape"), "got {err}");
+    }
+
+    #[test]
+    fn test_constructor_rejects_bad_config() {
+        use abi_stable::external_types::crossbeam_channel;
+        use streamling_plugin::PluginStateBackendConfig;
+        use streamling_plugin::r#async::DirectTokioProxy;
+
+        let new_sink = |pairs: &[(&str, &str)]| {
+            let (sender, _receiver) = crossbeam_channel::bounded(1);
+            S2Sink::new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                DirectTokioProxy::new().into_async_runtime_obj(),
+                PluginStateBackendFactory::new(PluginStateBackendConfig::new(
+                    "test_app".to_string(),
+                    "test_s2_sink".to_string(),
+                    r#"{"backend_type": "InMemory"}"#.to_string(),
+                )),
+                PluginMetricsRecorder::new(sender),
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+
+        assert!(new_sink(&[("basin", "my-basin"), ("stream", "events")]).is_ok());
+        for bad in [
+            vec![("stream", "events")],                                 // no basin
+            vec![("basin", "my-basin")],                                // no target
+            vec![("basin", "my-basin"), ("stream_template", "e/{ten")], // unclosed
+            vec![
+                ("basin", "my-basin"),
+                ("stream", "a"),
+                ("stream_template", "b/{c}"),
+            ],
+        ] {
+            let err = new_sink(&bad).err().expect("bad config must fail");
+            assert!(matches!(
+                err,
+                PluginInitializationError::Configuration(_)
+                    | PluginInitializationError::Execution(_)
+            ));
+        }
     }
 
     #[test]
