@@ -7,7 +7,6 @@
 //!   when possible; YAML inlining is supported but logs WARN.
 //! - basin — S2 basin name.
 //! - At least one of:
-//!   - stream — a single stream name (or comma-separated list),
 //!   - streams — comma-separated stream names,
 //!   - stream_prefix — read every stream whose name starts with this prefix;
 //!     the stream list is refreshed periodically so newly created streams are

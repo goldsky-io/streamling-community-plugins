@@ -345,7 +345,7 @@ mod tests {
         let err = new_source(&[]).err().expect("must fail without options");
         assert!(format!("{err:?}").contains("basin"));
 
-        let err = new_source(&[("basin", "my-basin"), ("stream", "events")])
+        let err = new_source(&[("basin", "my-basin"), ("streams", "events")])
             .err()
             .expect("must fail without access_token");
         assert!(format!("{err:?}").contains("access_token"));
@@ -355,7 +355,7 @@ mod tests {
     fn constructor_builds_output_schema() {
         let source = new_source(&[
             ("basin", "my-basin"),
-            ("stream", "events"),
+            ("streams", "events"),
             ("access_token", "secret"),
             ("schema", "id:int64,value:string?"),
             ("include_metadata", "true"),

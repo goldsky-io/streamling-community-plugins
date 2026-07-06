@@ -88,7 +88,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` envi
 |---|---|---|---|
 | `access_token` | yes | — | S2 access token (env var preferred) |
 | `basin` | yes | — | S2 basin name |
-| `stream` / `streams` | one of | — | Exact stream name(s), comma-separated |
+| `streams` | one of | — | Exact stream name(s), comma-separated |
 | `stream_prefix` | one of | — | Read every stream whose name starts with this prefix |
 | `schema` | no | — | Typed mode: `name:type` columns decoded from JSON bodies (`bool`, `int8..64`, `uint8..64`, `float32/64`, `string`, `date`, `timestamp[_s/_ms/_us/_ns]`; `?` suffix = nullable) |
 | `include_metadata` | no | `false` | Typed mode: append `_s2_stream`, `_s2_seq_num`, `_s2_timestamp` columns |

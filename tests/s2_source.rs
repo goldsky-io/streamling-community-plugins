@@ -217,7 +217,7 @@ sinks:
                     "STREAMLING__PLUGIN__S2_SOURCE__BASIN",
                     fixture.basin.to_string(),
                 )
-                .env("STREAMLING__PLUGIN__S2_SOURCE__STREAM", &stream_name)
+                .env("STREAMLING__PLUGIN__S2_SOURCE__STREAMS", &stream_name)
                 .env("STREAMLING__PLUGIN__S2_SOURCE__ENDPOINT", &fixture.endpoint)
                 .timeout(Duration::from_secs(90)),
         )
@@ -292,7 +292,7 @@ sinks:
                     "STREAMLING__PLUGIN__S2_SOURCE__BASIN",
                     fixture.basin.to_string(),
                 )
-                .env("STREAMLING__PLUGIN__S2_SOURCE__STREAM", &stream_name)
+                .env("STREAMLING__PLUGIN__S2_SOURCE__STREAMS", &stream_name)
                 .env("STREAMLING__PLUGIN__S2_SOURCE__ENDPOINT", &fixture.endpoint)
                 .timeout(Duration::from_secs(90)),
         )

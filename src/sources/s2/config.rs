@@ -16,7 +16,7 @@ pub enum StartPosition {
 #[derive(Debug, Clone)]
 pub struct S2SourceConfig {
     pub basin: BasinName,
-    /// Exact streams to read (from `stream` / `streams`), deduplicated.
+    /// Exact streams to read (from `streams`), deduplicated.
     pub streams: Vec<StreamName>,
     /// Read every stream with this prefix; refreshed periodically.
     pub stream_prefix: Option<StreamNamePrefix>,
@@ -63,9 +63,8 @@ fn parse_nonzero(opts: &PluginOptions, key: &str, default: &str) -> Result<usize
 
 fn parse_streams(opts: &PluginOptions) -> Result<Vec<StreamName>, PluginError> {
     let mut seen = BTreeSet::new();
-    [opts.get_or("stream", ""), opts.get_or("streams", "")]
-        .iter()
-        .flat_map(|s| s.split(','))
+    opts.get_or("streams", "")
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter(|s| seen.insert(s.to_string()))
@@ -148,7 +147,7 @@ pub fn parse_config(opts: &PluginOptions) -> Result<S2SourceConfig, PluginError>
     };
     if streams.is_empty() && stream_prefix.is_none() {
         return Err(PluginError::Internal(
-            "s2_source: one of 'stream', 'streams', or 'stream_prefix' is required".to_string(),
+            "s2_source: one of 'streams' or 'stream_prefix' is required".to_string(),
         ));
     }
 
@@ -188,7 +187,7 @@ mod tests {
 
     #[test]
     fn parses_minimal_options_with_defaults() {
-        let cfg = parse_config(&options(&[("basin", "my-basin"), ("stream", "events")])).unwrap();
+        let cfg = parse_config(&options(&[("basin", "my-basin"), ("streams", "events")])).unwrap();
         assert_eq!(cfg.basin.to_string(), "my-basin");
         assert_eq!(cfg.streams.len(), 1);
         assert!(cfg.stream_prefix.is_none());
@@ -205,18 +204,17 @@ mod tests {
 
     #[test]
     fn requires_basin_and_a_stream_selector() {
-        assert!(parse_config(&options(&[("stream", "events")])).is_err());
+        assert!(parse_config(&options(&[("streams", "events")])).is_err());
 
         let err = parse_config(&options(&[("basin", "my-basin")])).unwrap_err();
         assert!(err.to_string().contains("stream_prefix"), "got {err}");
     }
 
     #[test]
-    fn merges_and_dedupes_stream_and_streams() {
+    fn dedupes_and_trims_streams() {
         let cfg = parse_config(&options(&[
             ("basin", "my-basin"),
-            ("stream", "events"),
-            ("streams", "events-a, events-b,events"),
+            ("streams", "events, events-a, events-b,events"),
         ]))
         .unwrap();
         let names: Vec<String> = cfg.streams.iter().map(ToString::to_string).collect();
@@ -237,7 +235,7 @@ mod tests {
 
         let err = parse_config(&options(&[
             ("basin", "my-basin"),
-            ("stream", "events"),
+            ("streams", "events"),
             ("start_position", "bogus"),
         ]))
         .unwrap_err();
@@ -248,7 +246,7 @@ mod tests {
     fn parses_typed_output_options() {
         let cfg = parse_config(&options(&[
             ("basin", "my-basin"),
-            ("stream", "events"),
+            ("streams", "events"),
             ("schema", "id:int64,value:string?"),
             ("include_metadata", "true"),
             ("on_malformed", "skip"),
@@ -272,7 +270,7 @@ mod tests {
         for (key, value) in [("include_metadata", "true"), ("on_malformed", "skip")] {
             let err = parse_config(&options(&[
                 ("basin", "my-basin"),
-                ("stream", "events"),
+                ("streams", "events"),
                 (key, value),
             ]))
             .unwrap_err();
@@ -284,7 +282,7 @@ mod tests {
     fn invalid_on_malformed_is_an_error() {
         let err = parse_config(&options(&[
             ("basin", "my-basin"),
-            ("stream", "events"),
+            ("streams", "events"),
             ("schema", "id:int64"),
             ("on_malformed", "ignore"),
         ]))
@@ -296,7 +294,7 @@ mod tests {
     fn zero_batch_size_is_an_error() {
         let err = parse_config(&options(&[
             ("basin", "my-basin"),
-            ("stream", "events"),
+            ("streams", "events"),
             ("batch_size", "0"),
         ]))
         .unwrap_err();
