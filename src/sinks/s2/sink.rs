@@ -33,8 +33,13 @@
 //! returning, so the dispatcher only acknowledges the checkpoint after S2 has
 //! durably appended every record submitted before the marker. Termination drains
 //! pending tickets and then closes the Producer.
+//!
+//! Every record carries a Debezium-style `dbz.op` header with the row kind
+//! from streamling's `_gs_op` column (i→c, u→u, d→d — the same encoding as
+//! streamling's Kafka sink), so CDC updates and deletes are distinguishable
+//! out-of-band by consumers.
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use s2_sdk::{
@@ -43,7 +48,7 @@ use s2_sdk::{
     producer::{Producer, ProducerConfig, RecordSubmitTicket},
     types::{
         AccountEndpoint, AppendRecord, AppendRetryPolicy, BasinEndpoint, BasinName,
-        EnsureStreamInput, RetryConfig, S2Config, S2Endpoints, StreamName,
+        EnsureStreamInput, Header, RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
 use std::collections::{HashMap, VecDeque};
@@ -55,7 +60,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use streamling_plugin::r#api::PluginStateBackendFactory;
-use streamling_plugin::api::SupportsGracefulShutdown;
+use streamling_plugin::api::{STREAMLING_COLUMN_NAME_OP, SupportsGracefulShutdown};
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
@@ -304,6 +309,7 @@ impl SinkPlugin for S2Sink {
         }
 
         let stream_id = self.stream_id_for_logs();
+        let ops = dbz_ops_from_batch(&batch)?;
         let json_rows =
             record_batch_json::record_batch_to_line_delimited_json(&batch).map_err(|e| {
                 PluginError::Internal(format!(
@@ -312,12 +318,13 @@ impl SinkPlugin for S2Sink {
                 ))
             })?;
         let total = json_rows.len();
-        let records = append_records_from_json_rows(json_rows).map_err(|e| match e {
-            PluginError::Internal(msg) => {
-                PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
-            }
-            other => other,
-        })?;
+        let records =
+            append_records_from_json_rows(json_rows, ops.as_deref()).map_err(|e| match e {
+                PluginError::Internal(msg) => {
+                    PluginError::Internal(format!("stream '{}': {}", stream_id, msg))
+                }
+                other => other,
+            })?;
         let (pending_records, acknowledged_records) =
             self.submit_records(records).await.map_err(|e| match e {
                 PluginError::Internal(msg) => {
@@ -356,19 +363,74 @@ impl SinkPlugin for S2Sink {
     }
 }
 
+/// Header carrying the row kind on every record, Debezium-encoded — the same
+/// scheme as streamling's Kafka sink (`dbz.op` message header).
+pub(crate) const OP_HEADER: &str = "dbz.op";
+
+/// Maps the batch's `_gs_op` row kinds to Debezium ops (i→c, u→u, d→d);
+/// None when the batch has no `_gs_op` column.
+pub(crate) fn dbz_ops_from_batch(
+    batch: &RecordBatch,
+) -> Result<Option<Vec<&'static str>>, PluginError> {
+    let Some(column) = batch.column_by_name(STREAMLING_COLUMN_NAME_OP) else {
+        return Ok(None);
+    };
+    let ops = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            PluginError::Internal(format!(
+                "column '{}' must be Utf8, got {}",
+                STREAMLING_COLUMN_NAME_OP,
+                column.data_type()
+            ))
+        })?;
+    ops.iter()
+        .map(|op| match op {
+            Some("i") => Ok("c"),
+            Some("u") => Ok("u"),
+            Some("d") => Ok("d"),
+            other => Err(PluginError::Internal(format!(
+                "invalid '{}' row kind {:?} (expected i/u/d)",
+                STREAMLING_COLUMN_NAME_OP, other
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 pub(crate) fn append_records_from_json_rows(
     json_rows: Vec<Vec<u8>>,
+    ops: Option<&[&'static str]>,
 ) -> Result<Vec<AppendRecord>, PluginError> {
+    if let Some(ops) = ops
+        && ops.len() != json_rows.len()
+    {
+        return Err(PluginError::Internal(format!(
+            "op count {} does not match row count {}",
+            ops.len(),
+            json_rows.len()
+        )));
+    }
     json_rows
         .into_iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let row_len = row.len();
-            AppendRecord::new(row).map_err(|e| {
+            let record = AppendRecord::new(row).map_err(|e| {
                 PluginError::Internal(format!(
                     "failed to build S2 AppendRecord (row {} bytes): {}",
                     row_len, e
                 ))
-            })
+            })?;
+            match ops {
+                Some(ops) => record
+                    .with_headers([Header::new(OP_HEADER, ops[index])])
+                    .map_err(|e| {
+                        PluginError::Internal(format!("failed to set S2 record header: {}", e))
+                    }),
+                None => Ok(record),
+            }
         })
         .collect()
 }
@@ -443,31 +505,93 @@ async fn await_record_tickets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow_schema::{Field, Schema};
 
     #[test]
     fn test_empty_rows_produce_no_append_records() {
-        let records = append_records_from_json_rows(Vec::new()).expect("convert empty");
+        let records = append_records_from_json_rows(Vec::new(), None).expect("convert empty");
         assert!(records.is_empty());
     }
 
     #[test]
     fn test_json_rows_are_converted_to_append_records_in_order() {
         let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
-        let records = append_records_from_json_rows(rows).expect("convert rows");
+        let records = append_records_from_json_rows(rows, None).expect("convert rows");
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].body(), br#"{"id":1}"#);
         assert_eq!(records[1].body(), br#"{"id":2}"#);
+        assert!(records[0].headers().is_empty());
     }
 
     #[test]
     fn test_oversized_json_row_returns_error() {
         let rows = vec![vec![b'y'; 1024 * 1024]];
-        let err = append_records_from_json_rows(rows).expect_err("oversized row should fail");
+        let err = append_records_from_json_rows(rows, None).expect_err("oversized row should fail");
 
         assert!(
             err.to_string().contains("failed to build S2 AppendRecord"),
             "unexpected error: {err}"
         );
+    }
+
+    fn op_batch(ops: Vec<&str>) -> RecordBatch {
+        let rows = ops.len();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    STREAMLING_COLUMN_NAME_OP,
+                    arrow_schema::DataType::Utf8,
+                    false,
+                ),
+                Field::new("id", arrow_schema::DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(ops)) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)) as ArrayRef,
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    #[test]
+    fn test_gs_op_maps_to_dbz_ops() {
+        let ops = dbz_ops_from_batch(&op_batch(vec!["i", "u", "d"]))
+            .expect("map ops")
+            .expect("ops present");
+        assert_eq!(ops, vec!["c", "u", "d"]);
+
+        let err = dbz_ops_from_batch(&op_batch(vec!["x"])).expect_err("invalid op should fail");
+        assert!(err.to_string().contains("row kind"), "got {err}");
+    }
+
+    #[test]
+    fn test_batch_without_op_column_yields_no_ops() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+        )
+        .expect("valid batch");
+        assert!(dbz_ops_from_batch(&batch).expect("map ops").is_none());
+    }
+
+    #[test]
+    fn test_ops_become_dbz_op_headers() {
+        let rows = vec![br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()];
+        let records = append_records_from_json_rows(rows, Some(&["c", "d"])).expect("convert rows");
+
+        let headers = records[1].headers();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name.as_ref(), OP_HEADER.as_bytes());
+        assert_eq!(headers[0].value.as_ref(), b"d");
+
+        let err = append_records_from_json_rows(vec![br#"{"id":1}"#.to_vec()], Some(&["c", "d"]))
+            .expect_err("mismatched op count should fail");
+        assert!(err.to_string().contains("does not match"), "got {err}");
     }
 }

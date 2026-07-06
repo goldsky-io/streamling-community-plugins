@@ -131,6 +131,15 @@ sinks:
     let ids: BTreeSet<i64> = s2_records
         .iter()
         .map(|record| {
+            // Row kind travels as a Debezium-style header; kafka-sourced rows
+            // are inserts.
+            let op = record
+                .headers
+                .iter()
+                .find(|h| h.name.as_ref() == b"dbz.op")
+                .expect("S2 record should carry a dbz.op header");
+            assert_eq!(op.value.as_ref(), b"c");
+
             let value: serde_json::Value =
                 serde_json::from_slice(&record.body).expect("S2 record should be JSON");
             value
