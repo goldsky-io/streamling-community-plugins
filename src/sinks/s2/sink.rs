@@ -17,8 +17,8 @@
 //!     the batch — and, since the host fails the pipeline on batch errors,
 //!     upstream data must uphold it. Per-stream record order follows row
 //!     order. Producers are created (and streams ensured) lazily per distinct
-//!     resolved name and kept for the sink's lifetime, so the resolved set
-//!     should be bounded.
+//!     resolved name; producers idle for five minutes are closed at
+//!     checkpoint markers, so high-cardinality routing stays bounded.
 //!
 //! Optional:
 //! - ensure_stream (default true) — create target streams if missing
@@ -43,6 +43,8 @@
 //! - `s2_sink.pending_records` (gauge) — submitted-but-unacknowledged records.
 //! - `s2_sink.checkpoint_flush_latency` (latency) — time spent draining
 //!   pending acks at a checkpoint marker.
+//! - `s2_sink.open_producers` (gauge) — producers currently open (template
+//!   targets only; idle ones are closed at checkpoint markers).
 //!
 //! ## Delivery
 //!
@@ -96,7 +98,7 @@ use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{CheckpointEpoch, PluginError, PluginInitializationError, SinkPlugin};
 use tokio::sync::{Mutex, OnceCell};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::utils::plugin_options::PluginOptions;
 use crate::utils::record_batch_json;
@@ -115,9 +117,15 @@ pub(crate) enum Segment {
     Column(String),
 }
 
+/// Idle template producers are closed at checkpoint markers after this long
+/// without a submit, so high-cardinality routing does not grow the producer
+/// map (and its append sessions) without bound.
+const PRODUCER_IDLE_TTL: Duration = Duration::from_secs(300);
+
 struct ProducerState {
     producer: Producer,
     pending: VecDeque<RecordSubmitTicket>,
+    last_used: std::time::Instant,
 }
 
 impl ProducerState {
@@ -125,6 +133,7 @@ impl ProducerState {
         Self {
             producer,
             pending: VecDeque::new(),
+            last_used: std::time::Instant::now(),
         }
     }
 }
@@ -146,6 +155,23 @@ struct SinkState {
 }
 
 impl SinkState {
+    /// Removes and returns producers that have no pending tickets and have
+    /// not been submitted to for `PRODUCER_IDLE_TTL`.
+    async fn take_idle_producers(&self) -> Vec<(StreamName, ProducerState)> {
+        let mut producers = self.producers.lock().await;
+        let idle: Vec<StreamName> = producers
+            .iter()
+            .filter(|(_, p)| p.pending.is_empty() && p.last_used.elapsed() >= PRODUCER_IDLE_TTL)
+            .map(|(stream, _)| stream.clone())
+            .collect();
+        idle.into_iter()
+            .filter_map(|stream| {
+                let producer = producers.remove(&stream)?;
+                Some((stream, producer))
+            })
+            .collect()
+    }
+
     async fn ensure_producer(
         &self,
         producers: &mut HashMap<StreamName, ProducerState>,
@@ -275,6 +301,7 @@ impl S2Sink {
         for (stream, run) in runs {
             state.ensure_producer(&mut producers, &stream).await?;
             let producer_state = producers.get_mut(&stream).expect("producer just ensured");
+            producer_state.last_used = std::time::Instant::now();
             for record in run {
                 let ticket = producer_state.producer.submit(record).await.map_err(|e| {
                     PluginError::Internal(format!(
@@ -552,6 +579,24 @@ impl SinkPlugin for S2Sink {
         self.metrics
             .record_count("s2_sink.records_acknowledged", flushed_records as u64);
         self.metrics.record_gauge("s2_sink.pending_records", 0);
+
+        // The flush above emptied every pending queue, so this is a safe
+        // point to close template producers that have gone idle. The fixed
+        // target keeps its single producer for the sink's lifetime.
+        if matches!(self.target, StreamTarget::Template(_)) {
+            let state = self.state()?;
+            for (stream, producer_state) in state.take_idle_producers().await {
+                if let Err(e) = producer_state.producer.close().await {
+                    warn!(stream = %stream, error = %e, "failed to close idle S2 Producer");
+                }
+                info!(stream = %stream, "S2 sink closed idle producer");
+            }
+            self.metrics.record_gauge(
+                "s2_sink.open_producers",
+                state.producers.lock().await.len() as u64,
+            );
+        }
+
         info!(
             stream_id = %self.stream_id,
             ?epoch,
@@ -1085,6 +1130,44 @@ mod tests {
             resolve_streams(&segments, &routing_batch().slice(0, 2)).expect("resolvable rows");
         let names: Vec<String> = streams.iter().map(ToString::to_string).collect();
         assert_eq!(names, vec!["events/acme/1", "events/globex/2"]);
+    }
+
+    #[tokio::test]
+    async fn test_idle_producers_are_evicted_and_active_ones_kept() {
+        let s2 = S2::new(S2Config::new("token")).expect("offline client");
+        let basin: BasinName = "test-basin".parse().expect("valid basin");
+        let state = SinkState {
+            ensure_basin: s2.basin(basin.clone()),
+            producer_basin: s2.basin(basin),
+            producer_config: ProducerConfig::new(),
+            ensure_stream: false,
+            producers: Mutex::new(HashMap::new()),
+        };
+
+        let idle: StreamName = "idle".parse().expect("valid stream");
+        let active: StreamName = "active".parse().expect("valid stream");
+        {
+            let mut producers = state.producers.lock().await;
+            state
+                .ensure_producer(&mut producers, &idle)
+                .await
+                .expect("open idle producer");
+            state
+                .ensure_producer(&mut producers, &active)
+                .await
+                .expect("open active producer");
+            let backdated = std::time::Instant::now()
+                .checked_sub(PRODUCER_IDLE_TTL)
+                .expect("backdate");
+            producers.get_mut(&idle).expect("idle exists").last_used = backdated;
+        }
+
+        let evicted = state.take_idle_producers().await;
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0.as_ref(), "idle");
+        let producers = state.producers.lock().await;
+        assert!(producers.contains_key(&active));
+        assert!(!producers.contains_key(&idle));
     }
 
     #[test]
