@@ -1303,6 +1303,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx 0.8.6",
+ "streamling-common",
  "streamling-e2e",
  "streamling-plugin",
  "tokio",
