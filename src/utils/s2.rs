@@ -1,5 +1,30 @@
-use s2_sdk::types::{AccountEndpoint, BasinEndpoint, S2Endpoints};
+use s2_sdk::S2;
+use s2_sdk::types::{AccountEndpoint, BasinEndpoint, RetryConfig, S2Config, S2Endpoints};
+use std::time::Duration;
 use streamling_plugin::PluginError;
+
+/// Builds an S2 client with the crate-standard bootstrap; `retry` of None
+/// keeps the SDK's default (finite) policy.
+pub fn s2_client(
+    access_token: String,
+    request_timeout: Duration,
+    endpoints: Option<S2Endpoints>,
+    retry: Option<RetryConfig>,
+) -> Result<S2, PluginError> {
+    // s2-sdk talks HTTP/2 over rustls; install the aws-lc-rs CryptoProvider
+    // process-wide if nothing else has (install_default is idempotent).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let mut config = S2Config::new(access_token).with_request_timeout(request_timeout);
+    if let Some(endpoints) = endpoints {
+        config = config.with_endpoints(endpoints);
+    }
+    if let Some(retry) = retry {
+        config = config.with_retry(retry);
+    }
+    S2::new(config)
+        .map_err(|e| PluginError::Internal(format!("failed to construct S2 client: {e}")))
+}
 
 /// Record header carrying the row kind, Debezium-encoded — the same
 /// convention streamling's Kafka sink uses for message headers. One

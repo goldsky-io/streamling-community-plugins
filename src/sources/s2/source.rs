@@ -5,11 +5,10 @@ use crate::sources::s2::config::{S2SourceConfig, parse_config};
 use crate::sources::s2::convert::{RecordConverter, SourceRecord};
 use crate::sources::s2::reader::StreamReaders;
 use crate::utils::plugin_options::PluginOptions;
+use crate::utils::s2::s2_client;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use s2_sdk::S2;
-use s2_sdk::types::S2Config;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,22 +145,15 @@ impl SourcePlugin for S2Source {
     async fn initialize(&self) -> Result<(), PluginError> {
         self.inner
             .get_or_try_init(|| async {
-                // s2-sdk talks HTTP/2 over rustls; install the aws-lc-rs
-                // CryptoProvider process-wide if nothing else has
-                // (install_default is idempotent).
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-                let mut s2_config = S2Config::new(self.access_token.clone())
-                    .with_request_timeout(Duration::from_millis(self.config.request_timeout_ms));
-                if let Some(endpoints) = &self.config.endpoints {
-                    s2_config = s2_config.with_endpoints(endpoints.clone());
-                }
-                // The SDK's default (finite) retry config is deliberate: read
-                // sessions self-heal via the reopen loop in reader.rs, while
-                // initialize-time calls should fail fast instead of hanging.
-                let s2 = S2::new(s2_config).map_err(|e| {
-                    PluginError::Internal(format!("failed to construct S2 client: {e}"))
-                })?;
+                // No retry override: read sessions self-heal via the reopen
+                // loop in reader.rs, while initialize-time calls should fail
+                // fast instead of hanging.
+                let s2 = s2_client(
+                    self.access_token.clone(),
+                    Duration::from_millis(self.config.request_timeout_ms),
+                    self.config.endpoints.clone(),
+                    None,
+                )?;
 
                 let (tx, rx) = tokio::sync::mpsc::channel(MAX_BUFFERED_BATCHES);
                 let readers = Arc::new(StreamReaders::new(
