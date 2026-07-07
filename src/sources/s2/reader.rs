@@ -16,6 +16,7 @@ use s2_sdk::{S2Basin, S2Stream};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{PluginError, PluginStateBackend};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -30,6 +31,7 @@ pub(crate) struct StreamReaders {
     config: Arc<S2SourceConfig>,
     state: Arc<PluginStateBackend<u64>>,
     tx: mpsc::Sender<Vec<SourceRecord>>,
+    metrics: PluginMetricsRecorder,
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Next sequence number to be *emitted* per stream — advanced by the
     /// source as batches are delivered; snapshotted for checkpoints. Contains
@@ -43,12 +45,14 @@ impl StreamReaders {
         config: Arc<S2SourceConfig>,
         state: Arc<PluginStateBackend<u64>>,
         tx: mpsc::Sender<Vec<SourceRecord>>,
+        metrics: PluginMetricsRecorder,
     ) -> Self {
         Self {
             basin,
             config,
             state,
             tx,
+            metrics,
             tasks: Mutex::new(HashMap::new()),
             positions: Mutex::new(BTreeMap::new()),
         }
@@ -127,6 +131,10 @@ impl StreamReaders {
                     task.abort();
                 }
             }
+            if !removed.is_empty() {
+                self.metrics
+                    .record_gauge("s2_source.open_readers", tasks.len() as u64);
+            }
             removed
         };
         if !removed.is_empty() {
@@ -189,8 +197,11 @@ impl StreamReaders {
             Arc::from(key.as_str()),
             next_seq_num,
             self.tx.clone(),
+            self.metrics.clone(),
         ));
         tasks.insert(key.clone(), task);
+        self.metrics
+            .record_gauge("s2_source.open_readers", tasks.len() as u64);
         info!(stream = %key, next_seq_num, "s2_source: started stream reader");
         Ok(())
     }
@@ -227,6 +238,7 @@ async fn read_stream(
     stream_name: Arc<str>,
     mut next_seq_num: u64,
     tx: mpsc::Sender<Vec<SourceRecord>>,
+    metrics: PluginMetricsRecorder,
 ) {
     let mut reopen_delay = REOPEN_DELAY_MIN;
     loop {
@@ -249,6 +261,8 @@ async fn read_stream(
                             };
                             next_seq_num = last.seq_num.saturating_add(1);
                             reopen_delay = REOPEN_DELAY_MIN;
+                            metrics
+                                .record_count("s2_source.records_read", batch.records.len() as u64);
                             let records = batch
                                 .records
                                 .into_iter()
@@ -287,6 +301,7 @@ async fn read_stream(
                 );
             }
         }
+        metrics.record_count("s2_source.read_session_reopens", 1);
         tokio::time::sleep(reopen_delay).await;
         reopen_delay = (reopen_delay * 2).min(REOPEN_DELAY_MAX);
     }
@@ -319,11 +334,13 @@ mod tests {
         ))
         .create();
         let (tx, _rx) = mpsc::channel(1);
+        let (metrics_tx, _metrics_rx) = abi_stable::external_types::crossbeam_channel::bounded(16);
         Arc::new(StreamReaders::new(
             s2.basin(config.basin.clone()),
             config,
             state,
             tx,
+            PluginMetricsRecorder::new(metrics_tx),
         ))
     }
 

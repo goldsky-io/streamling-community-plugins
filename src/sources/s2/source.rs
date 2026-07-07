@@ -80,6 +80,7 @@ pub struct S2Source {
     access_token: String,
     converter: RecordConverter,
     state: Arc<PluginStateBackend<u64>>,
+    metrics: PluginMetricsRecorder,
     inner: OnceCell<RunningState>,
     running: AtomicBool,
 }
@@ -88,7 +89,7 @@ impl S2Source {
     pub fn new(
         _rt: PluginAsyncRuntimeObj,
         state_backend_factory: PluginStateBackendFactory,
-        _metrics_recorder: PluginMetricsRecorder,
+        metrics_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Result<Self, PluginInitializationError> {
         let configuration_error =
@@ -108,6 +109,7 @@ impl S2Source {
             access_token,
             converter,
             state: state_backend_factory.create(),
+            metrics: metrics_recorder,
             inner: OnceCell::new(),
             running: AtomicBool::new(true),
         })
@@ -161,6 +163,7 @@ impl SourcePlugin for S2Source {
                     self.config.clone(),
                     self.state.clone(),
                     tx,
+                    self.metrics.clone(),
                 ));
                 let refresh_task = readers.start().await?;
 
@@ -213,6 +216,7 @@ impl SourcePlugin for S2Source {
         recv.fill(self.config.batch_size, BATCH_WAIT).await;
         let take = recv.carry.len().min(self.config.batch_size);
         if take == 0 {
+            self.metrics.record_gauge("s2_source.carry_records", 0);
             return Ok(RecordBatch::new_empty(self.converter.schema()));
         }
 
@@ -239,6 +243,10 @@ impl SourcePlugin for S2Source {
         );
         recv.carry.drain(..take);
         recv.pending_positions = positions;
+        self.metrics
+            .record_count("s2_source.records_emitted", batch.num_rows() as u64);
+        self.metrics
+            .record_gauge("s2_source.carry_records", recv.carry.len() as u64);
         Ok(batch)
     }
 

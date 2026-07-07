@@ -41,6 +41,17 @@
 //! Each option can be overridden by the matching STREAMLING__PLUGIN__S2_SOURCE__<KEY>
 //! env var; the env var wins when both are set.
 //!
+//! ## Metrics
+//!
+//! - `s2_source.records_read` (count) — records received from S2 read
+//!   sessions.
+//! - `s2_source.records_emitted` (count) — rows emitted in generated batches.
+//! - `s2_source.carry_records` (gauge) — records buffered ahead of the next
+//!   batch.
+//! - `s2_source.open_readers` (gauge) — stream reader tasks running.
+//! - `s2_source.read_session_reopens` (count) — read sessions reopened after
+//!   an error the SDK did not absorb.
+//!
 //! ## Architecture
 //!
 //! One background task per stream holds a long-lived S2 read session (the SDK
