@@ -4,7 +4,7 @@
 use crate::sources::s2::config::{S2SourceConfig, parse_config};
 use crate::sources::s2::convert::{RecordConverter, SourceRecord};
 use crate::sources::s2::reader::StreamReaders;
-use crate::utils::plugin_options::PluginOptions;
+use crate::utils::plugin_options::{PluginOptions, configuration_error};
 use crate::utils::s2::s2_client;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -92,9 +92,6 @@ impl S2Source {
         metrics_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Result<Self, PluginInitializationError> {
-        let configuration_error =
-            |e: PluginError| PluginInitializationError::Configuration(e.to_string().into());
-
         let opts = PluginOptions::new(options, "s2_source", "STREAMLING__PLUGIN__S2_SOURCE");
         let config = parse_config(&opts).map_err(configuration_error)?;
         let access_token = opts.get_secret("access_token").ok_or_else(|| {

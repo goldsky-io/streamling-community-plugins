@@ -303,22 +303,23 @@ fn metadata_arrays(records: &[&SourceRecord]) -> (ArrayRef, ArrayRef, ArrayRef) 
 }
 
 /// Headers as a JSON object with lossy UTF-8 keys/values; None when empty.
-/// Duplicate header names keep the last value.
+/// Name-sorted with duplicate names keeping the last value, matching
+/// `serde_json::Map` semantics.
 fn headers_json(record: &SourceRecord) -> Option<String> {
     if record.headers.is_empty() {
         return None;
     }
-    let map: serde_json::Map<String, serde_json::Value> = record
+    let map: std::collections::BTreeMap<_, _> = record
         .headers
         .iter()
         .map(|(name, value)| {
             (
-                String::from_utf8_lossy(name).into_owned(),
-                serde_json::Value::String(String::from_utf8_lossy(value).into_owned()),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(value),
             )
         })
         .collect();
-    Some(serde_json::Value::Object(map).to_string())
+    Some(serde_json::to_string(&map).expect("a string map serializes"))
 }
 
 /// Decodes every record body as exactly one JSON row; any malformed body
