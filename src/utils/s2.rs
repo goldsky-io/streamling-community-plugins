@@ -1,3 +1,4 @@
+use crate::utils::plugin_options::PluginOptions;
 use s2_sdk::S2;
 use s2_sdk::types::{AccountEndpoint, BasinEndpoint, RetryConfig, S2Config, S2Endpoints};
 use std::time::Duration;
@@ -58,6 +59,15 @@ pub fn row_kind_from_dbz_op(op: &[u8]) -> Option<&'static str> {
         RowKind::Update => "u",
         RowKind::Delete => "d",
     })
+}
+
+/// Reads the shared `endpoint` option: empty/unset means the default S2
+/// endpoints, anything else is an S2-compatible override (e.g. s2-lite).
+pub fn optional_endpoints(opts: &PluginOptions) -> Result<Option<S2Endpoints>, PluginError> {
+    match opts.get_or("endpoint", "").as_str() {
+        "" => Ok(None),
+        endpoint => Ok(Some(s2_endpoints(endpoint)?)),
+    }
 }
 
 /// Builds S2 endpoints from a single endpoint override (e.g. s2-lite).

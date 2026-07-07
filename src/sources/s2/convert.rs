@@ -57,6 +57,20 @@ pub(crate) struct SourceRecord {
     pub body: Bytes,
 }
 
+#[cfg(test)]
+impl SourceRecord {
+    /// Canonical fixture shared by the source-side test modules.
+    pub(crate) fn test(stream: &str, seq_num: u64, body: &str) -> Self {
+        Self {
+            stream: Arc::from(stream),
+            seq_num,
+            timestamp: 1_700_000_000_000 + seq_num,
+            headers: Vec::new(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
+        }
+    }
+}
+
 fn timestamp_type() -> DataType {
     DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
 }
@@ -437,14 +451,8 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array};
 
-    pub(crate) fn record(stream: &str, seq_num: u64, body: &str) -> SourceRecord {
-        SourceRecord {
-            stream: Arc::from(stream),
-            seq_num,
-            timestamp: 1_700_000_000_000 + seq_num,
-            headers: Vec::new(),
-            body: Bytes::copy_from_slice(body.as_bytes()),
-        }
+    fn record(stream: &str, seq_num: u64, body: &str) -> SourceRecord {
+        SourceRecord::test(stream, seq_num, body)
     }
 
     fn typed(schema: &str, include_metadata: bool, on_malformed: OnMalformed) -> RecordConverter {
@@ -466,6 +474,15 @@ mod tests {
     }
 
     fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap()
+    }
+
+    fn uint64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a UInt64Array {
         batch
             .column_by_name(name)
             .unwrap()
@@ -513,12 +530,7 @@ mod tests {
             r#"{"kind":"click"}"#
         );
         assert!(string_column(&batch, "headers").is_null(1));
-        let seq_nums: &UInt64Array = batch
-            .column_by_name("seq_num")
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, "seq_num");
         assert_eq!(seq_nums.value(0), 7);
         assert_eq!(seq_nums.value(1), 3);
     }
@@ -586,12 +598,7 @@ mod tests {
         let batch = converter.convert(&records).unwrap();
         assert_eq!(batch.num_columns(), 5);
         assert_eq!(string_column(&batch, META_STREAM).value(0), "events-a");
-        let seq_nums: &UInt64Array = batch
-            .column_by_name(META_SEQ_NUM)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, META_SEQ_NUM);
         assert_eq!(seq_nums.value(0), 42);
     }
 
@@ -630,12 +637,7 @@ mod tests {
         let ids = int64_column(&batch, "id");
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(1), 3);
-        let seq_nums: &UInt64Array = batch
-            .column_by_name(META_SEQ_NUM)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, META_SEQ_NUM);
         assert_eq!(seq_nums.value(0), 0);
         assert_eq!(seq_nums.value(1), 2);
     }
@@ -700,12 +702,7 @@ mod tests {
         let batch = converter.convert(&records).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(int64_column(&batch, "id").value(0), 3);
-        let seq_nums: &UInt64Array = batch
-            .column_by_name(META_SEQ_NUM)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, META_SEQ_NUM);
         assert_eq!(seq_nums.value(0), 2);
     }
 

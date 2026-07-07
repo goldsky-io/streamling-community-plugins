@@ -229,12 +229,14 @@ impl SourcePlugin for S2Source {
         let batch = self.converter.convert(rows)?;
 
         // Rows are in per-stream order, so reverse iteration sees each
-        // stream's max sequence number first.
+        // stream's max sequence number first. Check before allocating the
+        // key: batches typically span one stream, entry() would allocate a
+        // String per row.
         let mut positions = BTreeMap::new();
         for row in rows.iter().rev() {
-            positions
-                .entry(row.stream.to_string())
-                .or_insert_with(|| row.seq_num.saturating_add(1));
+            if !positions.contains_key(row.stream.as_ref()) {
+                positions.insert(row.stream.to_string(), row.seq_num.saturating_add(1));
+            }
         }
         debug!(
             rows = batch.num_rows(),
@@ -296,29 +298,14 @@ impl SourcePlugin for S2Source {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abi_stable::external_types::crossbeam_channel;
-    use bytes::Bytes;
-    use streamling_plugin::PluginStateBackendConfig;
+    use crate::utils::test_support;
     use streamling_plugin::r#async::DirectTokioProxy;
-
-    fn test_state_backend() -> PluginStateBackendFactory {
-        PluginStateBackendFactory::new(PluginStateBackendConfig::new(
-            "test_app".to_string(),
-            "test_s2_source".to_string(),
-            r#"{"backend_type": "InMemory"}"#.to_string(),
-        ))
-    }
-
-    fn test_metrics() -> PluginMetricsRecorder {
-        let (sender, _receiver) = crossbeam_channel::bounded(1);
-        PluginMetricsRecorder::new(sender)
-    }
 
     fn new_source(options: &[(&str, &str)]) -> Result<S2Source, PluginInitializationError> {
         S2Source::new(
             DirectTokioProxy::new().into_async_runtime_obj(),
-            test_state_backend(),
-            test_metrics(),
+            test_support::state_backend_factory("test_s2_source"),
+            test_support::metrics_recorder(),
             options
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -363,13 +350,7 @@ mod tests {
     }
 
     fn record(stream: &str, seq_num: u64) -> SourceRecord {
-        SourceRecord {
-            stream: Arc::from(stream),
-            seq_num,
-            timestamp: 0,
-            headers: Vec::new(),
-            body: Bytes::from_static(b"{}"),
-        }
+        SourceRecord::test(stream, seq_num, "{}")
     }
 
     fn recv_state(rx: tokio::sync::mpsc::Receiver<Vec<SourceRecord>>) -> RecvState {

@@ -27,8 +27,7 @@ fn is_u256_field(field: &Field) -> bool {
         && field
             .metadata()
             .get(U256_METADATA_KEY)
-            .map(|v| v == U256_EXTENSION_NAME)
-            .unwrap_or(false)
+            .is_some_and(|v| v == U256_EXTENSION_NAME)
 }
 
 fn transform_u256_columns(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
@@ -58,20 +57,10 @@ fn transform_u256_columns(batch: &RecordBatch) -> Result<RecordBatch, ArrowError
                     ))
                 })?;
 
-            let mut string_values: Vec<Option<String>> = Vec::with_capacity(fsb.len());
-            for row_idx in 0..fsb.len() {
-                if fsb.is_null(row_idx) {
-                    string_values.push(None);
-                } else {
-                    let bytes = fsb.value(row_idx);
-                    let mut fixed: [u8; 32] = [0u8; 32];
-                    fixed.copy_from_slice(bytes);
-                    let val = u256_impl::U256::from_big_endian(&fixed);
-                    string_values.push(Some(val.to_string()));
-                }
-            }
-
-            let string_array = StringArray::from(string_values);
+            let string_array: StringArray = fsb
+                .iter()
+                .map(|value| value.map(|bytes| u256_impl::U256::from_big_endian(bytes).to_string()))
+                .collect();
             new_columns.push(Arc::new(string_array) as ArrayRef);
             new_fields.push(Field::new(
                 field_ref.name(),
@@ -101,18 +90,9 @@ pub fn record_batch_to_line_delimited_json(batch: &RecordBatch) -> Result<Vec<By
     writer.finish()?;
     let json_buffer = Bytes::from(json_buffer);
 
-    let mut rows = Vec::with_capacity(batch.num_rows());
-    let mut start = 0;
-    for (index, byte) in json_buffer.iter().enumerate() {
-        if *byte == b'\n' {
-            if index > start {
-                rows.push(json_buffer.slice(start..index));
-            }
-            start = index + 1;
-        }
-    }
-    if start < json_buffer.len() {
-        rows.push(json_buffer.slice(start..));
-    }
-    Ok(rows)
+    Ok(json_buffer
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| json_buffer.slice_ref(line))
+        .collect())
 }

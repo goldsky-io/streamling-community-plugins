@@ -1,6 +1,12 @@
 use std::collections::HashMap;
-use streamling_plugin::PluginError;
+use streamling_plugin::{PluginError, PluginInitializationError};
 use tracing::warn;
+
+/// Maps a config-parse error to the initialization error a plugin
+/// constructor must return.
+pub fn configuration_error(e: PluginError) -> PluginInitializationError {
+    PluginInitializationError::Configuration(e.to_string().into())
+}
 
 pub struct PluginOptions {
     options: HashMap<String, String>,
@@ -15,6 +21,18 @@ impl PluginOptions {
             env_prefix: env_prefix.to_string(),
             plugin_name: plugin_name.to_string(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(plugin_name: &str, env_prefix: &str, pairs: &[(&str, &str)]) -> Self {
+        Self::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            plugin_name,
+            env_prefix,
+        )
     }
 
     pub fn get(&self, key: &str) -> Result<String, PluginError> {
@@ -36,6 +54,38 @@ impl PluginOptions {
             .ok()
             .or_else(|| self.options.get(key).cloned())
             .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Parses a typed option, naming the plugin, key, and offending value in
+    /// the error.
+    pub fn get_parsed<T: std::str::FromStr>(
+        &self,
+        key: &str,
+        default: &str,
+    ) -> Result<T, PluginError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        let value = self.get_or(key, default);
+        self.parse_value(key, &value)
+    }
+
+    /// Parses an already-read value (e.g. an SDK name type), naming the
+    /// plugin, what the value is, and the offending value in the error.
+    pub fn parse_value<T: std::str::FromStr>(
+        &self,
+        what: &str,
+        value: &str,
+    ) -> Result<T, PluginError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        value.parse().map_err(|e| {
+            PluginError::Internal(format!(
+                "{}: invalid {what} '{value}': {e}",
+                self.plugin_name
+            ))
+        })
     }
 
     pub fn get_secret(&self, key: &str) -> Option<String> {

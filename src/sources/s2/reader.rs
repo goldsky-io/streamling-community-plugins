@@ -32,6 +32,8 @@ pub(crate) struct StreamReaders {
     state: Arc<PluginStateBackend<u64>>,
     tx: mpsc::Sender<Vec<SourceRecord>>,
     metrics: PluginMetricsRecorder,
+    /// The configured exact streams; a prefix refresh never stops these.
+    exact_streams: BTreeSet<String>,
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Next sequence number to be *emitted* per stream — advanced by the
     /// source as batches are delivered; snapshotted for checkpoints. Contains
@@ -49,6 +51,7 @@ impl StreamReaders {
     ) -> Self {
         Self {
             basin,
+            exact_streams: config.streams.iter().map(ToString::to_string).collect(),
             config,
             state,
             tx,
@@ -113,17 +116,11 @@ impl StreamReaders {
         }
 
         let listed: BTreeSet<String> = names.iter().map(ToString::to_string).collect();
-        let exact: BTreeSet<String> = self
-            .config
-            .streams
-            .iter()
-            .map(ToString::to_string)
-            .collect();
         let removed: Vec<String> = {
             let mut tasks = self.tasks.lock().await;
             let removed: Vec<String> = tasks
                 .keys()
-                .filter(|name| !listed.contains(*name) && !exact.contains(*name))
+                .filter(|name| !listed.contains(*name) && !self.exact_streams.contains(*name))
                 .cloned()
                 .collect();
             for name in &removed {
@@ -311,36 +308,25 @@ async fn read_stream(
 mod tests {
     use super::*;
     use crate::utils::plugin_options::PluginOptions;
+    use crate::utils::test_support;
     use s2_sdk::S2;
     use s2_sdk::types::S2Config;
-    use streamling_plugin::PluginStateBackendConfig;
-    use streamling_plugin::api::PluginStateBackendFactory;
 
     fn test_readers() -> Arc<StreamReaders> {
-        let opts = PluginOptions::new(
-            [("basin", "test-basin"), ("streams", "events")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+        let opts = PluginOptions::for_test(
             "s2_source",
             "STREAMLING__PLUGIN__S2_SOURCE_READER_TEST",
+            &[("basin", "test-basin"), ("streams", "events")],
         );
         let config = Arc::new(crate::sources::s2::config::parse_config(&opts).unwrap());
         let s2 = S2::new(S2Config::new("token")).unwrap();
-        let state = PluginStateBackendFactory::new(PluginStateBackendConfig::new(
-            "test_app".to_string(),
-            "test_s2_source".to_string(),
-            r#"{"backend_type": "InMemory"}"#.to_string(),
-        ))
-        .create();
         let (tx, _rx) = mpsc::channel(1);
-        let (metrics_tx, _metrics_rx) = abi_stable::external_types::crossbeam_channel::bounded(16);
         Arc::new(StreamReaders::new(
             s2.basin(config.basin.clone()),
             config,
-            state,
+            test_support::state_backend_factory("test_s2_source").create(),
             tx,
-            PluginMetricsRecorder::new(metrics_tx),
+            test_support::metrics_recorder(),
         ))
     }
 
