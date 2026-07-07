@@ -78,6 +78,27 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SINK__<KEY>` enviro
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 | `linger_ms` | no | `5` | How long the Producer waits for more records before flushing a partial batch (ms) |
 
+### S2 Source (`s2_source`)
+
+Reads records from streams on [s2.dev](https://s2.dev) into Arrow batches, tailing each stream over a long-lived read session; with `stream_prefix`, newly created streams are picked up automatically. Emits either the raw record envelope (`stream`, `seq_num`, `timestamp`, `headers`, `body`) or, with `schema`, typed columns decoded from JSON bodies. Delivery is at-least-once with checkpointed per-stream resume — see the module docs in [`src/sources/s2/mod.rs`](src/sources/s2/mod.rs) for details.
+
+All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `access_token` | yes | — | S2 access token (env var preferred) |
+| `basin` | yes | — | S2 basin name |
+| `streams` | one of | — | Exact stream name(s), comma-separated |
+| `stream_prefix` | one of | — | Read every stream whose name starts with this prefix |
+| `schema` | no | — | Typed mode: `name:type` columns decoded from JSON bodies (`bool`, `int8..64`, `uint8..64`, `float32/64`, `string`, `date`, `timestamp[_s/_ms/_us/_ns]`; `?` suffix = nullable) |
+| `include_metadata` | no | `false` | Typed mode: append `_s2_stream`, `_s2_seq_num`, `_s2_timestamp` columns |
+| `on_malformed` | no | `error` | Typed mode: `error` fails (and retries) the batch on an undecodable body; `skip` drops it with a WARN |
+| `start_position` | no | `earliest` | Where to start a stream with no checkpointed position: `earliest` or `latest`. Streams discovered after startup always start from the beginning |
+| `batch_size` | no | `1000` | Max records per generated Arrow batch |
+| `update_streams_interval_secs` | no | `60` | How often `stream_prefix` re-lists streams |
+| `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
+| `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
+
 ### Postgres CDC Source (`postgres_cdc_source`)
 
 Streams Postgres logical-replication changes (an initial table copy followed by
