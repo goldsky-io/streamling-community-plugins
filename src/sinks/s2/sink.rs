@@ -330,11 +330,30 @@ impl S2Sink {
                 .collect()
         };
 
-        let flushed_counts = futures::future::try_join_all(pending.into_iter().map(
-            |(stream, tickets)| async move { await_record_tickets(stream.as_ref(), tickets).await },
-        ))
-        .await?;
-        Ok(flushed_counts.into_iter().sum())
+        // join_all, not try_join_all: the tickets were already taken from the
+        // pending queues, and cancelling a sibling stream's flush on the first
+        // error would drop its tickets un-awaited — the next flush, seeing an
+        // empty queue, would acknowledge a checkpoint whose records were never
+        // confirmed durable (the same invariant await_record_tickets upholds
+        // within one stream).
+        let results =
+            futures::future::join_all(pending.into_iter().map(|(stream, tickets)| async move {
+                await_record_tickets(stream.as_ref(), tickets).await
+            }))
+            .await;
+
+        let mut flushed_records = 0;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(count) => flushed_records += count,
+                Err(e) => first_error = first_error.or(Some(e)),
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(flushed_records)
     }
 }
 
@@ -516,7 +535,9 @@ impl SinkPlugin for S2Sink {
 
         let ops = dbz_ops_from_batch(&batch).map_err(|e| self.with_stream_context(e))?;
         let streams = match &self.target {
-            StreamTarget::Template(segments) => Some(resolve_streams(segments, &batch)?),
+            StreamTarget::Template(segments) => {
+                Some(resolve_streams(segments, &batch).map_err(|e| self.with_stream_context(e))?)
+            }
             StreamTarget::Fixed(_) => None,
         };
         let payload = without_op_column(&batch)?;
