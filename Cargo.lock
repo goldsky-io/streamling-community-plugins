@@ -2497,7 +2497,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3219,7 +3219,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3868,7 +3868,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4643,7 +4643,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4681,7 +4681,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5102,7 +5102,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5161,7 +5161,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5196,9 +5196,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s2-api"
-version = "0.30.6"
+version = "0.30.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59bbef70a0670fbfac0aa48dfea81e9561583c4fc832cf091346cdb25bcb42a9"
+checksum = "10fe6acddb0cc17548fcc90d4c836a9f8c71f2dbe1aa0a95abb1d9e9fd275b0d"
 dependencies = [
  "base64ct",
  "bytes",
@@ -5222,9 +5222,9 @@ dependencies = [
 
 [[package]]
 name = "s2-common"
-version = "0.40.1"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3697abfb70faa77268bbad6a9c00b3b56a4d287e4ab32fbf266bfcaab81cfadf"
+checksum = "9f7e23d63211c1bb5154d040156edfa708097ac22ce21bea93666a34c749813e"
 dependencies = [
  "base64ct",
  "bytes",
@@ -5241,9 +5241,9 @@ dependencies = [
 
 [[package]]
 name = "s2-sdk"
-version = "0.31.8"
+version = "0.31.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8982d1acd933e6c6c08c8c0e0b5906eb03ecde43080ad8f255a1bf5287a4db34"
+checksum = "56e48a5d9eb74732807bc827b5c81622c403c75a7a13b7cd814daa4cd6d93d6a"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -5280,9 +5280,9 @@ dependencies = [
 
 [[package]]
 name = "s2-testcontainers"
-version = "0.39.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b4af227478b9ff4a3b0cb826d6b53d9a0956ac474cd4d524827c0214366cd8"
+checksum = "fdb78f602cc073bb0d68e0c5c4c676f4caccc9c31b15a272a8acc6061aa21161"
 dependencies = [
  "reqwest 0.13.4",
  "s2-sdk",
@@ -5695,7 +5695,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6134,7 +6134,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6450,7 +6450,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7419,7 +7419,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
