@@ -319,7 +319,7 @@ fn decode_strict(
         .build_decoder()
         .map_err(PluginError::ArrowError)?;
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         // Trim JSON-insignificant whitespace and reject empty bodies, so
         // every record contributes at least one row. Combined with the row
         // budget (= record count) this makes the aggregate count check exact:
@@ -338,11 +338,17 @@ fn decode_strict(
                 .decode(buf)
                 .map_err(|e| decode_error(&record.stream, record.seq_num, &e.to_string()))?;
             if consumed == 0 {
-                // The decoder's row budget is exhausted, so some body decoded
-                // to more than one row.
+                // The decoder's shared row budget (one row per record) is
+                // exhausted: this or an earlier record decoded to more than
+                // one row. Re-check each candidate alone so the error blames
+                // the record that actually contained multiple values.
+                let offender = records[..=index]
+                    .iter()
+                    .find(|candidate| !decodes_to_one_row(user_schema, candidate))
+                    .unwrap_or(record);
                 return Err(decode_error(
-                    &record.stream,
-                    record.seq_num,
+                    &offender.stream,
+                    offender.seq_num,
                     "record body contains more than one JSON value",
                 ));
             }
@@ -363,6 +369,31 @@ fn decode_strict(
         )));
     }
     Ok(batch)
+}
+
+/// Whether the record body decodes to exactly one row on its own; used by
+/// `decode_strict` to attribute a shared-budget exhaustion to the record
+/// that actually contained multiple JSON values.
+fn decodes_to_one_row(user_schema: &SchemaRef, record: &SourceRecord) -> bool {
+    let Ok(mut decoder) = ReaderBuilder::new(user_schema.clone())
+        .with_batch_size(2)
+        .with_coerce_primitive(true)
+        .build_decoder()
+    else {
+        return false;
+    };
+    let mut buf = record.body.as_ref().trim_ascii();
+    while !buf.is_empty() {
+        match decoder.decode(buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(consumed) => buf = &buf[consumed..],
+        }
+    }
+    decoder
+        .flush()
+        .ok()
+        .flatten()
+        .is_some_and(|batch| batch.num_rows() == 1)
 }
 
 /// Decodes record bodies one at a time, skipping (with a WARN) any that do
@@ -617,6 +648,23 @@ mod tests {
         assert!(
             err.to_string().contains("more than one JSON value")
                 || err.to_string().contains("decoded"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn multi_value_body_error_blames_the_offending_record() {
+        // The shared row budget exhausts while decoding a *later* record;
+        // the error must still name the record that held multiple values.
+        let converter = typed("id:int64", false, OnMalformed::Error);
+        let records = vec![
+            record("events", 0, r#"{"id":1}{"id":2}"#),
+            record("events", 1, r#"{"id":3}"#),
+        ];
+        let err = converter.convert(&records).unwrap_err();
+        assert!(err.to_string().contains("seq_num 0"), "got {err}");
+        assert!(
+            err.to_string().contains("more than one JSON value"),
             "got {err}"
         );
     }
