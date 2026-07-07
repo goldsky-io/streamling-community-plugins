@@ -76,12 +76,11 @@ use arrow::util::display::array_value_to_string;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use s2_sdk::{
-    S2,
     batching::BatchingConfig,
     producer::{Producer, ProducerConfig, RecordSubmitTicket},
     types::{
-        AccountEndpoint, AppendRecord, AppendRetryPolicy, BasinEndpoint, BasinName,
-        EnsureStreamInput, Header, RetryConfig, S2Config, S2Endpoints, StreamName,
+        AppendRecord, AppendRetryPolicy, BasinName, EnsureStreamInput, Header, RetryConfig,
+        StreamName,
     },
 };
 use std::collections::{HashMap, VecDeque};
@@ -102,6 +101,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::utils::plugin_options::PluginOptions;
 use crate::utils::record_batch_json;
+use crate::utils::s2::{DBZ_OP_HEADER, dbz_op_from_row_kind, s2_client, s2_endpoints};
 
 /// Where records go: one fixed stream, or a per-row stream name resolved
 /// from a template with `{column}` placeholders.
@@ -446,46 +446,29 @@ impl SinkPlugin for S2Sink {
                 let endpoint = self.opts.get_or("endpoint", "");
                 let endpoints = match endpoint.as_str() {
                     "" => None,
-                    endpoint => Some(
-                        S2Endpoints::new(
-                            AccountEndpoint::new(endpoint).map_err(|e| {
-                                PluginError::Internal(format!("invalid S2 account endpoint: {}", e))
-                            })?,
-                            BasinEndpoint::new(endpoint).map_err(|e| {
-                                PluginError::Internal(format!("invalid S2 basin endpoint: {}", e))
-                            })?,
-                        )
-                        .map_err(|e| {
-                            PluginError::Internal(format!("invalid S2 endpoints: {}", e))
-                        })?,
-                    ),
+                    endpoint => Some(s2_endpoints(endpoint)?),
                 };
-                let new_client = |retry: Option<RetryConfig>| -> Result<S2, PluginError> {
-                    let mut cfg = S2Config::new(access_token.clone())
-                        .with_request_timeout(Duration::from_millis(request_timeout_ms));
-                    if let Some(endpoints) = &endpoints {
-                        cfg = cfg.with_endpoints(endpoints.clone());
-                    }
-                    if let Some(retry) = retry {
-                        cfg = cfg.with_retry(retry);
-                    }
-                    S2::new(cfg).map_err(|e| {
-                        PluginError::Internal(format!("failed to construct S2 client: {}", e))
-                    })
-                };
+                let request_timeout = Duration::from_millis(request_timeout_ms);
                 // Appends retry without bound — a record handed to the sink
                 // must not be dropped, and the checkpoint barrier bounds the
                 // exposure. Control-plane calls (ensure_stream) keep the
                 // SDK's finite default so failures surface instead of
                 // wedging the submit path.
-                let data_client = new_client(Some(
-                    RetryConfig::new()
-                        .with_max_attempts(NonZeroU32::new(u32::MAX).expect("u32::MAX is nonzero"))
-                        .with_min_base_delay(Duration::from_millis(250))
-                        .with_max_base_delay(Duration::from_secs(15))
-                        .with_append_retry_policy(AppendRetryPolicy::All),
-                ))?;
-                let control_client = new_client(None)?;
+                let data_client = s2_client(
+                    access_token.clone(),
+                    request_timeout,
+                    endpoints.clone(),
+                    Some(
+                        RetryConfig::new()
+                            .with_max_attempts(
+                                NonZeroU32::new(u32::MAX).expect("u32::MAX is nonzero"),
+                            )
+                            .with_min_base_delay(Duration::from_millis(250))
+                            .with_max_base_delay(Duration::from_secs(15))
+                            .with_append_retry_policy(AppendRetryPolicy::All),
+                    ),
+                )?;
+                let control_client = s2_client(access_token, request_timeout, endpoints, None)?;
 
                 let batching = BatchingConfig::new().with_linger(Duration::from_millis(linger_ms));
                 let state = SinkState {
@@ -614,25 +597,18 @@ impl SinkPlugin for S2Sink {
     }
 }
 
-/// Header carrying the row kind on every record, Debezium-encoded — the same
-/// scheme as streamling's Kafka sink (`dbz.op` message header).
-pub(crate) const OP_HEADER: &str = "dbz.op";
-
 /// Maps the batch's `_gs_op` row kinds to Debezium ops (i→c, u→u, d→d).
 /// The column is required — streamling delivers it with every sink batch,
 /// and silently omitting the header would degrade CDC updates/deletes to
 /// inserts on the read side.
 pub(crate) fn dbz_ops_from_batch(batch: &RecordBatch) -> Result<Vec<&'static str>, PluginError> {
     fn to_op(value: &str) -> Result<&'static str, PluginError> {
-        match value {
-            "i" => Ok("c"),
-            "u" => Ok("u"),
-            "d" => Ok("d"),
-            other => Err(PluginError::Internal(format!(
+        dbz_op_from_row_kind(value).ok_or_else(|| {
+            PluginError::Internal(format!(
                 "invalid '{}' row kind '{}' (expected i/u/d)",
-                STREAMLING_COLUMN_NAME_OP, other
-            ))),
-        }
+                STREAMLING_COLUMN_NAME_OP, value
+            ))
+        })
     }
 
     let column = batch
@@ -845,7 +821,7 @@ pub(crate) fn append_records_from_json_rows(
                         row_len, e
                     ))
                 })?
-                .with_headers([Header::new(OP_HEADER, *op)])
+                .with_headers([Header::new(DBZ_OP_HEADER, *op)])
                 .map_err(|e| {
                     PluginError::Internal(format!("failed to set S2 record header: {}", e))
                 })
@@ -1121,7 +1097,7 @@ mod tests {
 
         let headers = records[1].headers();
         assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].name.as_ref(), OP_HEADER.as_bytes());
+        assert_eq!(headers[0].name.as_ref(), DBZ_OP_HEADER.as_bytes());
         assert_eq!(headers[0].value.as_ref(), b"d");
 
         let err = append_records_from_json_rows(
@@ -1143,6 +1119,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_producers_are_evicted_and_active_ones_kept() {
+        use s2_sdk::S2;
+        use s2_sdk::types::S2Config;
         let s2 = S2::new(S2Config::new("token")).expect("offline client");
         let basin: BasinName = "test-basin".parse().expect("valid basin");
         let state = SinkState {

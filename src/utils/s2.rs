@@ -31,6 +31,27 @@ pub fn s2_client(
 /// definition for both halves of the S2 round-trip contract.
 pub const DBZ_OP_HEADER: &str = "dbz.op";
 
+/// `_gs_op` row kind → Debezium op, as the sink writes it.
+pub fn dbz_op_from_row_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "i" => Some("c"),
+        "u" => Some("u"),
+        "d" => Some("d"),
+        _ => None,
+    }
+}
+
+/// Debezium op → `_gs_op` row kind, as the source restores it; None for
+/// unrecognized values.
+pub fn row_kind_from_dbz_op(op: &[u8]) -> Option<&'static str> {
+    match op {
+        b"c" | b"r" => Some("i"),
+        b"u" => Some("u"),
+        b"d" => Some("d"),
+        _ => None,
+    }
+}
+
 /// Builds S2 endpoints from a single endpoint override (e.g. s2-lite).
 pub fn s2_endpoints(endpoint: &str) -> Result<S2Endpoints, PluginError> {
     S2Endpoints::new(

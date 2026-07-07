@@ -12,7 +12,7 @@
 //! convention streamling's Kafka sink uses; c|r → i, u → u, d → d) and "i"
 //! otherwise.
 
-use crate::utils::s2::DBZ_OP_HEADER;
+use crate::utils::s2::{DBZ_OP_HEADER, row_kind_from_dbz_op};
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow_json::ReaderBuilder;
@@ -87,18 +87,16 @@ fn gs_op(record: &SourceRecord) -> &'static str {
         (name.as_ref() == DBZ_OP_HEADER.as_bytes()).then_some(value.as_ref())
     });
     match op {
-        None | Some(b"c") | Some(b"r") => "i",
-        Some(b"u") => "u",
-        Some(b"d") => "d",
-        Some(other) => {
+        None => "i",
+        Some(value) => row_kind_from_dbz_op(value).unwrap_or_else(|| {
             warn!(
                 stream = %record.stream,
                 seq_num = record.seq_num,
-                op = %String::from_utf8_lossy(other),
+                op = %String::from_utf8_lossy(value),
                 "s2_source: unrecognized dbz.op header value; treating as insert"
             );
             "i"
-        }
+        }),
     }
 }
 
