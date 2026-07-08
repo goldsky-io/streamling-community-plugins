@@ -3,9 +3,10 @@
 
 use crate::sources::s2::convert::{OnMalformed, OutputMode, parse_field_specs};
 use crate::utils::plugin_options::PluginOptions;
-use crate::utils::s2::s2_endpoints;
+use crate::utils::s2::optional_endpoints;
 use s2_sdk::types::{BasinName, S2Endpoints, StreamName, StreamNamePrefix};
 use std::collections::BTreeSet;
+use std::num::{NonZeroU64, NonZeroUsize};
 use streamling_plugin::PluginError;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -32,47 +33,6 @@ pub struct S2SourceConfig {
     pub request_timeout_ms: u64,
 }
 
-fn parse<T: std::str::FromStr>(
-    opts: &PluginOptions,
-    key: &str,
-    default: &str,
-) -> Result<T, PluginError>
-where
-    T::Err: std::fmt::Display,
-{
-    let value = opts.get_or(key, default);
-    value
-        .parse()
-        .map_err(|e| PluginError::Internal(format!("s2_source: invalid {key} '{value}': {e}")))
-}
-
-fn parse_nonzero<T: std::str::FromStr + PartialEq + From<u8>>(
-    opts: &PluginOptions,
-    key: &str,
-    default: &str,
-) -> Result<T, PluginError>
-where
-    T::Err: std::fmt::Display,
-{
-    let parsed: T = parse(opts, key, default)?;
-    if parsed == T::from(0) {
-        return Err(PluginError::Internal(format!(
-            "s2_source: {key} must be greater than 0"
-        )));
-    }
-    Ok(parsed)
-}
-
-/// Parses an SDK name type with a uniform error message.
-fn parse_name<T: std::str::FromStr>(value: &str, what: &str) -> Result<T, PluginError>
-where
-    T::Err: std::fmt::Display,
-{
-    value
-        .parse()
-        .map_err(|e| PluginError::Internal(format!("s2_source: invalid {what} '{value}': {e}")))
-}
-
 fn parse_streams(opts: &PluginOptions) -> Result<Vec<StreamName>, PluginError> {
     let mut seen = BTreeSet::new();
     opts.get_or("streams", "")
@@ -80,7 +40,7 @@ fn parse_streams(opts: &PluginOptions) -> Result<Vec<StreamName>, PluginError> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter(|s| seen.insert(s.to_string()))
-        .map(|s| parse_name(s, "stream name"))
+        .map(|s| opts.parse_value("stream name", s))
         .collect()
 }
 
@@ -140,13 +100,13 @@ fn parse_output(opts: &PluginOptions) -> Result<OutputMode, PluginError> {
 }
 
 pub fn parse_config(opts: &PluginOptions) -> Result<S2SourceConfig, PluginError> {
-    let basin: BasinName = parse_name(&opts.get("basin")?, "basin")?;
+    let basin: BasinName = opts.parse_value("basin", &opts.get("basin")?)?;
 
     let streams = parse_streams(opts)?;
     let prefix = opts.get_or("stream_prefix", "");
     let stream_prefix = match prefix.trim() {
         "" => None,
-        p => Some(parse_name(p, "stream_prefix")?),
+        p => Some(opts.parse_value("stream_prefix", p)?),
     };
     if streams.is_empty() && stream_prefix.is_none() {
         return Err(PluginError::Internal(
@@ -154,38 +114,30 @@ pub fn parse_config(opts: &PluginOptions) -> Result<S2SourceConfig, PluginError>
         ));
     }
 
-    let endpoint = opts.get_or("endpoint", "");
-    let endpoints = match endpoint.as_str() {
-        "" => None,
-        endpoint => Some(s2_endpoints(endpoint)?),
-    };
-
     Ok(S2SourceConfig {
         basin,
         streams,
         stream_prefix,
-        endpoints,
+        endpoints: optional_endpoints(opts)?,
         start_position: parse_start_position(opts)?,
         output: parse_output(opts)?,
-        batch_size: parse_nonzero(opts, "batch_size", "1000")?,
-        update_streams_interval_secs: parse_nonzero(opts, "update_streams_interval_secs", "60")?,
-        request_timeout_ms: parse(opts, "request_timeout_ms", "5000")?,
+        batch_size: opts.get_parsed::<NonZeroUsize>("batch_size", "1000")?.get(),
+        update_streams_interval_secs: opts
+            .get_parsed::<NonZeroU64>("update_streams_interval_secs", "60")?
+            .get(),
+        request_timeout_ms: opts.get_parsed("request_timeout_ms", "5000")?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn options(pairs: &[(&str, &str)]) -> PluginOptions {
-        PluginOptions::new(
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>(),
+        PluginOptions::for_test(
             "s2_source",
             "STREAMLING__PLUGIN__S2_SOURCE_CONFIG_TEST",
+            pairs,
         )
     }
 

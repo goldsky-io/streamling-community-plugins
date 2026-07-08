@@ -131,7 +131,7 @@ impl SinkPlugin for SqsSink {
         let messages: Vec<String> = json_rows
             .into_iter()
             .map(|bytes| {
-                String::from_utf8(bytes).map_err(|e| {
+                String::from_utf8(bytes.into()).map_err(|e| {
                     PluginError::Internal(format!("failed to convert row to UTF-8: {}", e))
                 })
             })

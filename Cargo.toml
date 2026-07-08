@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 streamling-plugin = "0.2.0"
+# RowKind: keys the dbz.op <-> _gs_op mapping on the engine's enum so the
+# round-trip contract tracks upstream by construction.
+streamling-common = "0.1.0"
 
 # Generic RecordBatch-to-JSON conversion (see utils::record_batch_json).
 # U256 columns are serialized as decimal strings; arrow_json emits hex by default.
@@ -69,7 +72,7 @@ aws-credential-types = "1"
 aws-types = "1"
 
 # S2 (s2.dev) sink & source
-s2-sdk = "0.31.6"
+s2-sdk = "0.31.9"
 # rustls is a direct dep so the S2 sink can install the aws-lc-rs CryptoProvider
 # at startup. s2-sdk pulls rustls in via its default feature; we want to be
 # explicit because more than one TLS-using crate is linked (aws-smithy-http-client
@@ -79,7 +82,7 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 regex = "1.11.1"
-s2-testcontainers = "0.36.8"
+s2-testcontainers = "0.39.1"
 serde = "1.0"
 streamling-e2e = "0.1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

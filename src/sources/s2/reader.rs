@@ -16,6 +16,7 @@ use s2_sdk::{S2Basin, S2Stream};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{PluginError, PluginStateBackend};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -30,6 +31,9 @@ pub(crate) struct StreamReaders {
     config: Arc<S2SourceConfig>,
     state: Arc<PluginStateBackend<u64>>,
     tx: mpsc::Sender<Vec<SourceRecord>>,
+    metrics: PluginMetricsRecorder,
+    /// The configured exact streams; a prefix refresh never stops these.
+    exact_streams: BTreeSet<String>,
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Next sequence number to be *emitted* per stream — advanced by the
     /// source as batches are delivered; snapshotted for checkpoints. Contains
@@ -43,12 +47,15 @@ impl StreamReaders {
         config: Arc<S2SourceConfig>,
         state: Arc<PluginStateBackend<u64>>,
         tx: mpsc::Sender<Vec<SourceRecord>>,
+        metrics: PluginMetricsRecorder,
     ) -> Self {
         Self {
             basin,
+            exact_streams: config.streams.iter().map(ToString::to_string).collect(),
             config,
             state,
             tx,
+            metrics,
             tasks: Mutex::new(HashMap::new()),
             positions: Mutex::new(BTreeMap::new()),
         }
@@ -109,23 +116,21 @@ impl StreamReaders {
         }
 
         let listed: BTreeSet<String> = names.iter().map(ToString::to_string).collect();
-        let exact: BTreeSet<String> = self
-            .config
-            .streams
-            .iter()
-            .map(ToString::to_string)
-            .collect();
         let removed: Vec<String> = {
             let mut tasks = self.tasks.lock().await;
             let removed: Vec<String> = tasks
                 .keys()
-                .filter(|name| !listed.contains(*name) && !exact.contains(*name))
+                .filter(|name| !listed.contains(*name) && !self.exact_streams.contains(*name))
                 .cloned()
                 .collect();
             for name in &removed {
                 if let Some(task) = tasks.remove(name) {
                     task.abort();
                 }
+            }
+            if !removed.is_empty() {
+                self.metrics
+                    .record_gauge("s2_source.open_readers", tasks.len() as u64);
             }
             removed
         };
@@ -189,8 +194,11 @@ impl StreamReaders {
             Arc::from(key.as_str()),
             next_seq_num,
             self.tx.clone(),
+            self.metrics.clone(),
         ));
         tasks.insert(key.clone(), task);
+        self.metrics
+            .record_gauge("s2_source.open_readers", tasks.len() as u64);
         info!(stream = %key, next_seq_num, "s2_source: started stream reader");
         Ok(())
     }
@@ -227,6 +235,7 @@ async fn read_stream(
     stream_name: Arc<str>,
     mut next_seq_num: u64,
     tx: mpsc::Sender<Vec<SourceRecord>>,
+    metrics: PluginMetricsRecorder,
 ) {
     let mut reopen_delay = REOPEN_DELAY_MIN;
     loop {
@@ -249,6 +258,8 @@ async fn read_stream(
                             };
                             next_seq_num = last.seq_num.saturating_add(1);
                             reopen_delay = REOPEN_DELAY_MIN;
+                            metrics
+                                .record_count("s2_source.records_read", batch.records.len() as u64);
                             let records = batch
                                 .records
                                 .into_iter()
@@ -287,6 +298,7 @@ async fn read_stream(
                 );
             }
         }
+        metrics.record_count("s2_source.read_session_reopens", 1);
         tokio::time::sleep(reopen_delay).await;
         reopen_delay = (reopen_delay * 2).min(REOPEN_DELAY_MAX);
     }
@@ -296,34 +308,25 @@ async fn read_stream(
 mod tests {
     use super::*;
     use crate::utils::plugin_options::PluginOptions;
+    use crate::utils::test_support;
     use s2_sdk::S2;
     use s2_sdk::types::S2Config;
-    use streamling_plugin::PluginStateBackendConfig;
-    use streamling_plugin::api::PluginStateBackendFactory;
 
     fn test_readers() -> Arc<StreamReaders> {
-        let opts = PluginOptions::new(
-            [("basin", "test-basin"), ("streams", "events")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+        let opts = PluginOptions::for_test(
             "s2_source",
             "STREAMLING__PLUGIN__S2_SOURCE_READER_TEST",
+            &[("basin", "test-basin"), ("streams", "events")],
         );
         let config = Arc::new(crate::sources::s2::config::parse_config(&opts).unwrap());
         let s2 = S2::new(S2Config::new("token")).unwrap();
-        let state = PluginStateBackendFactory::new(PluginStateBackendConfig::new(
-            "test_app".to_string(),
-            "test_s2_source".to_string(),
-            r#"{"backend_type": "InMemory"}"#.to_string(),
-        ))
-        .create();
         let (tx, _rx) = mpsc::channel(1);
         Arc::new(StreamReaders::new(
             s2.basin(config.basin.clone()),
             config,
-            state,
+            test_support::state_backend_factory("test_s2_source").create(),
             tx,
+            test_support::metrics_recorder(),
         ))
     }
 

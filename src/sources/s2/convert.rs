@@ -12,7 +12,7 @@
 //! convention streamling's Kafka sink uses; c|r → i, u → u, d → d) and "i"
 //! otherwise.
 
-use crate::utils::s2::DBZ_OP_HEADER;
+use crate::utils::s2::{DBZ_OP_HEADER, row_kind_from_dbz_op};
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow_json::ReaderBuilder;
@@ -57,6 +57,20 @@ pub(crate) struct SourceRecord {
     pub body: Bytes,
 }
 
+#[cfg(test)]
+impl SourceRecord {
+    /// Canonical fixture shared by the source-side test modules.
+    pub(crate) fn test(stream: &str, seq_num: u64, body: &str) -> Self {
+        Self {
+            stream: Arc::from(stream),
+            seq_num,
+            timestamp: 1_700_000_000_000 + seq_num,
+            headers: Vec::new(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
+        }
+    }
+}
+
 fn timestamp_type() -> DataType {
     DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
 }
@@ -87,18 +101,16 @@ fn gs_op(record: &SourceRecord) -> &'static str {
         (name.as_ref() == DBZ_OP_HEADER.as_bytes()).then_some(value.as_ref())
     });
     match op {
-        None | Some(b"c") | Some(b"r") => "i",
-        Some(b"u") => "u",
-        Some(b"d") => "d",
-        Some(other) => {
+        None => "i",
+        Some(value) => row_kind_from_dbz_op(value).unwrap_or_else(|| {
             warn!(
                 stream = %record.stream,
                 seq_num = record.seq_num,
-                op = %String::from_utf8_lossy(other),
+                op = %String::from_utf8_lossy(value),
                 "s2_source: unrecognized dbz.op header value; treating as insert"
             );
             "i"
-        }
+        }),
     }
 }
 
@@ -291,22 +303,23 @@ fn metadata_arrays(records: &[&SourceRecord]) -> (ArrayRef, ArrayRef, ArrayRef) 
 }
 
 /// Headers as a JSON object with lossy UTF-8 keys/values; None when empty.
-/// Duplicate header names keep the last value.
+/// Name-sorted with duplicate names keeping the last value, matching
+/// `serde_json::Map` semantics.
 fn headers_json(record: &SourceRecord) -> Option<String> {
     if record.headers.is_empty() {
         return None;
     }
-    let map: serde_json::Map<String, serde_json::Value> = record
+    let map: std::collections::BTreeMap<_, _> = record
         .headers
         .iter()
         .map(|(name, value)| {
             (
-                String::from_utf8_lossy(name).into_owned(),
-                serde_json::Value::String(String::from_utf8_lossy(value).into_owned()),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(value),
             )
         })
         .collect();
-    Some(serde_json::Value::Object(map).to_string())
+    Some(serde_json::to_string(&map).expect("a string map serializes"))
 }
 
 /// Decodes every record body as exactly one JSON row; any malformed body
@@ -321,7 +334,7 @@ fn decode_strict(
         .build_decoder()
         .map_err(PluginError::ArrowError)?;
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         // Trim JSON-insignificant whitespace and reject empty bodies, so
         // every record contributes at least one row. Combined with the row
         // budget (= record count) this makes the aggregate count check exact:
@@ -340,11 +353,17 @@ fn decode_strict(
                 .decode(buf)
                 .map_err(|e| decode_error(&record.stream, record.seq_num, &e.to_string()))?;
             if consumed == 0 {
-                // The decoder's row budget is exhausted, so some body decoded
-                // to more than one row.
+                // The decoder's shared row budget (one row per record) is
+                // exhausted: this or an earlier record decoded to more than
+                // one row. Re-check each candidate alone so the error blames
+                // the record that actually contained multiple values.
+                let offender = records[..=index]
+                    .iter()
+                    .find(|candidate| !decodes_to_one_row(user_schema, candidate))
+                    .unwrap_or(record);
                 return Err(decode_error(
-                    &record.stream,
-                    record.seq_num,
+                    &offender.stream,
+                    offender.seq_num,
                     "record body contains more than one JSON value",
                 ));
             }
@@ -365,6 +384,31 @@ fn decode_strict(
         )));
     }
     Ok(batch)
+}
+
+/// Whether the record body decodes to exactly one row on its own; used by
+/// `decode_strict` to attribute a shared-budget exhaustion to the record
+/// that actually contained multiple JSON values.
+fn decodes_to_one_row(user_schema: &SchemaRef, record: &SourceRecord) -> bool {
+    let Ok(mut decoder) = ReaderBuilder::new(user_schema.clone())
+        .with_batch_size(2)
+        .with_coerce_primitive(true)
+        .build_decoder()
+    else {
+        return false;
+    };
+    let mut buf = record.body.as_ref().trim_ascii();
+    while !buf.is_empty() {
+        match decoder.decode(buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(consumed) => buf = &buf[consumed..],
+        }
+    }
+    decoder
+        .flush()
+        .ok()
+        .flatten()
+        .is_some_and(|batch| batch.num_rows() == 1)
 }
 
 /// Decodes record bodies one at a time, skipping (with a WARN) any that do
@@ -408,14 +452,8 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array};
 
-    pub(crate) fn record(stream: &str, seq_num: u64, body: &str) -> SourceRecord {
-        SourceRecord {
-            stream: Arc::from(stream),
-            seq_num,
-            timestamp: 1_700_000_000_000 + seq_num,
-            headers: Vec::new(),
-            body: Bytes::copy_from_slice(body.as_bytes()),
-        }
+    fn record(stream: &str, seq_num: u64, body: &str) -> SourceRecord {
+        SourceRecord::test(stream, seq_num, body)
     }
 
     fn typed(schema: &str, include_metadata: bool, on_malformed: OnMalformed) -> RecordConverter {
@@ -437,6 +475,15 @@ mod tests {
     }
 
     fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap()
+    }
+
+    fn uint64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a UInt64Array {
         batch
             .column_by_name(name)
             .unwrap()
@@ -484,12 +531,7 @@ mod tests {
             r#"{"kind":"click"}"#
         );
         assert!(string_column(&batch, "headers").is_null(1));
-        let seq_nums: &UInt64Array = batch
-            .column_by_name("seq_num")
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, "seq_num");
         assert_eq!(seq_nums.value(0), 7);
         assert_eq!(seq_nums.value(1), 3);
     }
@@ -557,12 +599,7 @@ mod tests {
         let batch = converter.convert(&records).unwrap();
         assert_eq!(batch.num_columns(), 5);
         assert_eq!(string_column(&batch, META_STREAM).value(0), "events-a");
-        let seq_nums: &UInt64Array = batch
-            .column_by_name(META_SEQ_NUM)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, META_SEQ_NUM);
         assert_eq!(seq_nums.value(0), 42);
     }
 
@@ -601,12 +638,7 @@ mod tests {
         let ids = int64_column(&batch, "id");
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(1), 3);
-        let seq_nums: &UInt64Array = batch
-            .column_by_name(META_SEQ_NUM)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, META_SEQ_NUM);
         assert_eq!(seq_nums.value(0), 0);
         assert_eq!(seq_nums.value(1), 2);
     }
@@ -619,6 +651,23 @@ mod tests {
         assert!(
             err.to_string().contains("more than one JSON value")
                 || err.to_string().contains("decoded"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn multi_value_body_error_blames_the_offending_record() {
+        // The shared row budget exhausts while decoding a *later* record;
+        // the error must still name the record that held multiple values.
+        let converter = typed("id:int64", false, OnMalformed::Error);
+        let records = vec![
+            record("events", 0, r#"{"id":1}{"id":2}"#),
+            record("events", 1, r#"{"id":3}"#),
+        ];
+        let err = converter.convert(&records).unwrap_err();
+        assert!(err.to_string().contains("seq_num 0"), "got {err}");
+        assert!(
+            err.to_string().contains("more than one JSON value"),
             "got {err}"
         );
     }
@@ -654,12 +703,7 @@ mod tests {
         let batch = converter.convert(&records).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(int64_column(&batch, "id").value(0), 3);
-        let seq_nums: &UInt64Array = batch
-            .column_by_name(META_SEQ_NUM)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
+        let seq_nums = uint64_column(&batch, META_SEQ_NUM);
         assert_eq!(seq_nums.value(0), 2);
     }
 

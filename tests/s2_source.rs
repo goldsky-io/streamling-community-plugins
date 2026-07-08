@@ -1,89 +1,13 @@
 //! S2 source plugin e2e tests backed by s2-lite, sinking into ClickHouse.
 
-use s2_sdk::S2;
-use s2_sdk::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, BasinName, EnsureBasinInput, EnsureStreamInput,
-    Header, StreamName,
-};
-use s2_testcontainers::S2Lite;
-use std::time::Duration;
-use streamling_e2e::{PipelineOpts, TestContext, TestContextOptions, init_tracing};
+mod s2_common;
 
-struct S2Fixture {
-    ctx: TestContext,
-    s2: S2,
-    basin: BasinName,
-    endpoint: String,
-    _s2_lite: S2Lite,
-}
+use s2_common::S2Fixture;
+use std::time::Duration;
+use streamling_e2e::{PipelineOpts, TestContextOptions};
 
 async fn setup() -> S2Fixture {
-    init_tracing();
-    let s2_lite = S2Lite::start().await.expect("failed to start s2-lite");
-    let ctx = TestContext::with_options(TestContextOptions::new().with_plugin().with_clickhouse())
-        .await
-        .expect("failed to create test context");
-    let s2 = s2_lite.client().expect("failed to construct s2 client");
-    let basin = format!("basin-{}", &ctx.test_id[..8])
-        .parse::<BasinName>()
-        .expect("valid basin name");
-    s2.ensure_basin(EnsureBasinInput::new(basin.clone()))
-        .await
-        .expect("failed to ensure s2-lite basin");
-    let endpoint = s2_lite.endpoint().to_string();
-    S2Fixture {
-        ctx,
-        s2,
-        basin,
-        endpoint,
-        _s2_lite: s2_lite,
-    }
-}
-
-impl S2Fixture {
-    async fn create_stream(&self, name: &str) -> StreamName {
-        let stream = name.parse::<StreamName>().expect("valid stream name");
-        self.s2
-            .basin(self.basin.clone())
-            .ensure_stream(EnsureStreamInput::new(stream.clone()))
-            .await
-            .expect("failed to ensure s2-lite stream");
-        stream
-    }
-
-    async fn append(&self, stream: &StreamName, bodies: impl IntoIterator<Item = String>) {
-        self.append_with_ops(stream, bodies.into_iter().map(|body| (body, None)))
-            .await;
-    }
-
-    /// Appends records, optionally tagged with a Debezium-style `dbz.op`
-    /// header (as the s2_sink writes them).
-    async fn append_with_ops(
-        &self,
-        stream: &StreamName,
-        records: impl IntoIterator<Item = (String, Option<&str>)>,
-    ) {
-        let records = records
-            .into_iter()
-            .map(|(body, op)| {
-                let record = AppendRecord::new(body).expect("valid S2 record");
-                match op {
-                    Some(op) => record
-                        .with_headers([Header::new("dbz.op", op.to_string())])
-                        .expect("valid S2 record headers"),
-                    None => record,
-                }
-            })
-            .collect::<Vec<_>>();
-        self.s2
-            .basin(self.basin.clone())
-            .stream(stream.clone())
-            .append(AppendInput::new(
-                AppendRecordBatch::try_from_iter(records).expect("valid S2 batch"),
-            ))
-            .await
-            .expect("failed to append S2 records");
-    }
+    S2Fixture::setup(TestContextOptions::new().with_plugin().with_clickhouse()).await
 }
 
 /// Typed-schema mode with `stream_prefix` discovery: JSON events across two
