@@ -29,12 +29,12 @@
 //!   it stalls rather than losing data); `skip` drops undecodable records with
 //!   a WARN log.
 //! - start_position (default `earliest`) — where to begin reading a stream
-//!   that has no checkpointed position yet: `earliest` or `latest`. Applies
-//!   at startup; a stream discovered by a later prefix refresh is entirely
-//!   new and is always read from the beginning.
+//!   that has no checkpointed position yet: `earliest` or `latest`. Applies to
+//!   every exact or prefix-discovered stream, regardless of when it is found.
 //! - batch_size (default 1000) — max records per generated Arrow batch.
 //! - update_streams_interval_secs (default 60) — how often `stream_prefix`
-//!   re-lists streams.
+//!   fetches the next page of up to 1,000 streams. Readers start as pages
+//!   arrive; removals are applied only after a complete scan.
 //! - endpoint — optional S2-compatible endpoint, useful for s2-lite.
 //! - request_timeout_ms (default 5000) — per-request HTTP timeout.
 //!
@@ -59,7 +59,8 @@
 //! backoff otherwise) and pushes record batches into a bounded channel.
 //! `generate_batch` drains that channel, converts records to Arrow, and
 //! advances an in-memory per-stream position. With `stream_prefix`, a refresh
-//! task periodically lists streams and starts/stops readers to match.
+//! task fetches one page of up to 1,000 streams per interval. It starts new
+//! readers page by page and stops missing readers after a complete scan.
 //!
 //! ## Delivery semantics
 //!

@@ -5,13 +5,16 @@
 //! retryable errors; the task reopens it with backoff otherwise) and pushes
 //! record batches into a bounded channel — when the channel is full the task
 //! stops pulling from S2, giving natural backpressure. With `stream_prefix`,
-//! a refresh task periodically re-lists streams and starts/stops readers to
-//! match.
+//! a refresh task fetches one listing page per interval, starting readers as
+//! streams are discovered and stopping deleted-stream readers after each
+//! complete scan.
 
 use crate::sources::s2::config::{S2SourceConfig, StartPosition};
 use crate::sources::s2::convert::SourceRecord;
-use futures::{StreamExt, TryStreamExt};
-use s2_sdk::types::{ListAllStreamsInput, ReadFrom, ReadInput, ReadStart, StreamName};
+use futures::StreamExt;
+use s2_sdk::types::{
+    ListStreamsInput, ReadFrom, ReadInput, ReadStart, StreamName, StreamNamePrefix,
+};
 use s2_sdk::{S2Basin, S2Stream};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -25,6 +28,48 @@ use tracing::{info, warn};
 /// Reopen backoff bounds for a read session the SDK gave up on.
 const REOPEN_DELAY_MIN: Duration = Duration::from_secs(1);
 const REOPEN_DELAY_MAX: Duration = Duration::from_secs(30);
+/// S2's maximum stream-listing page size.
+const STREAM_LIST_PAGE_LIMIT: usize = 1_000;
+
+/// Progress through one eventually consistent scan of a stream prefix.
+///
+/// Pages are committed only after all of their readers have been ensured. A
+/// failed list or ensure therefore retries the same page without losing the
+/// names accumulated by earlier pages.
+#[derive(Debug, Default)]
+struct PrefixScan {
+    start_after: Option<StreamName>,
+    seen: BTreeSet<String>,
+}
+
+impl PrefixScan {
+    fn list_input(&self, prefix: StreamNamePrefix) -> ListStreamsInput {
+        let input = ListStreamsInput::new()
+            .with_prefix(prefix)
+            .with_limit(STREAM_LIST_PAGE_LIMIT);
+        match &self.start_after {
+            Some(start_after) => input.with_start_after(start_after.clone().into()),
+            None => input,
+        }
+    }
+
+    /// Records a successfully processed page. Returns the complete set of
+    /// names only at the end of a scan, when it is safe to prune readers.
+    fn record_page(
+        &mut self,
+        names: &[StreamName],
+        next_start_after: Option<StreamName>,
+    ) -> Option<BTreeSet<String>> {
+        self.seen.extend(names.iter().map(ToString::to_string));
+        if let Some(start_after) = next_start_after {
+            self.start_after = Some(start_after);
+            None
+        } else {
+            self.start_after = None;
+            Some(std::mem::take(&mut self.seen))
+        }
+    }
+}
 
 pub(crate) struct StreamReaders {
     basin: S2Basin,
@@ -61,9 +106,9 @@ impl StreamReaders {
         }
     }
 
-    /// Starts readers for the configured streams; with a prefix, also runs an
-    /// initial listing (so errors fail initialization) and returns the
-    /// periodic refresh task.
+    /// Starts readers for the configured streams; with a prefix, also fetches
+    /// the first listing page (so errors fail initialization) and returns the
+    /// periodic scan task.
     pub async fn start(self: &Arc<Self>) -> Result<Option<JoinHandle<()>>, PluginError> {
         for name in self.config.streams.clone() {
             self.ensure_stream(&name, self.config.start_position)
@@ -72,7 +117,8 @@ impl StreamReaders {
         if self.config.stream_prefix.is_none() {
             return Ok(None);
         }
-        self.refresh_streams(self.config.start_position).await?;
+        let mut scan = PrefixScan::default();
+        self.refresh_streams_page(&mut scan).await?;
 
         let readers = self.clone();
         let refresh_interval = Duration::from_secs(self.config.update_streams_interval_secs);
@@ -82,40 +128,72 @@ impl StreamReaders {
             interval.tick().await; // immediate first tick; start() already refreshed
             loop {
                 interval.tick().await;
-                // A stream discovered after startup is entirely new, so it is
-                // read from the beginning regardless of `start_position` —
-                // starting at its tail would skip records appended between
-                // its creation and this refresh tick.
-                if let Err(e) = readers.refresh_streams(StartPosition::Earliest).await {
+                if let Err(e) = readers.refresh_streams_page(&mut scan).await {
                     warn!(error = %e, "s2_source: failed to refresh stream list");
                 }
             }
         })))
     }
 
-    /// Lists streams matching the prefix, starts readers for new ones and
-    /// stops readers for streams that no longer exist.
-    async fn refresh_streams(&self, fallback: StartPosition) -> Result<(), PluginError> {
+    /// Fetches one page of streams matching the prefix and starts readers for
+    /// new ones. Readers missing from S2 are stopped only after the terminal
+    /// page completes the scan.
+    async fn refresh_streams_page(&self, scan: &mut PrefixScan) -> Result<(), PluginError> {
         let prefix = self
             .config
             .stream_prefix
             .clone()
-            .expect("refresh_streams requires a stream_prefix");
-        let names: Vec<StreamName> = self
+            .expect("refresh_streams_page requires a stream_prefix");
+        let page = self
             .basin
-            .list_all_streams(ListAllStreamsInput::new().with_prefix(prefix))
-            .map(|info| info.map(|info| info.name))
-            .try_collect()
+            .list_streams(scan.list_input(prefix))
             .await
             .map_err(|e| {
-                PluginError::Internal(format!("s2_source: failed to list streams: {e}"))
+                PluginError::Internal(format!("s2_source: failed to list streams page: {e}"))
             })?;
 
+        // Advance from the last raw item, including a deleting stream. This
+        // matches s2-sdk's list_all_streams pagination and prevents an all-
+        // deleted page from stalling the scan.
+        let next_start_after = if page.has_more {
+            Some(
+                page.values
+                    .last()
+                    .ok_or_else(|| {
+                        PluginError::Internal(
+                            "s2_source: stream listing returned an empty page with has_more=true"
+                                .to_string(),
+                        )
+                    })?
+                    .name
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        // list_streams includes streams that are being deleted; the previous
+        // list_all_streams call filtered them by default.
+        let names: Vec<StreamName> = page
+            .values
+            .into_iter()
+            .filter(|info| info.deleted_at.is_none())
+            .map(|info| info.name)
+            .collect();
+
         for name in &names {
-            self.ensure_stream(name, fallback).await?;
+            self.ensure_stream(name, self.config.start_position).await?;
         }
 
-        let listed: BTreeSet<String> = names.iter().map(ToString::to_string).collect();
+        let Some(listed) = scan.record_page(&names, next_start_after) else {
+            return Ok(());
+        };
+        self.prune_unlisted_streams(&listed).await;
+        Ok(())
+    }
+
+    /// Stops prefix-discovered readers absent from a completed scan. Exact
+    /// configured streams remain protected even when they share the prefix.
+    async fn prune_unlisted_streams(&self, listed: &BTreeSet<String>) {
         let removed: Vec<String> = {
             let mut tasks = self.tasks.lock().await;
             let removed: Vec<String> = tasks
@@ -150,7 +228,6 @@ impl StreamReaders {
                 info!(stream = %name, "s2_source: stopped reading deleted stream");
             }
         }
-        Ok(())
     }
 
     /// Starts a reader for the stream unless one is already running, resuming
@@ -328,6 +405,61 @@ mod tests {
             tx,
             test_support::metrics_recorder(),
         ))
+    }
+
+    fn stream_name(name: &str) -> StreamName {
+        name.parse().expect("valid stream name")
+    }
+
+    #[test]
+    fn prefix_scan_fetches_one_page_at_a_time_and_prunes_only_when_complete() {
+        let prefix: StreamNamePrefix = "events-".parse().expect("valid stream prefix");
+        let mut scan = PrefixScan::default();
+
+        let first_input = scan.list_input(prefix.clone());
+        assert_eq!(first_input.limit, Some(STREAM_LIST_PAGE_LIMIT));
+        assert_eq!(first_input.start_after, Default::default());
+
+        let first_page = vec![stream_name("events-a"), stream_name("events-b")];
+        let completed = scan.record_page(&first_page, Some(first_page[1].clone()));
+        assert!(
+            completed.is_none(),
+            "a partial scan must not trigger pruning"
+        );
+
+        let second_input = scan.list_input(prefix.clone());
+        assert_eq!(second_input.limit, Some(STREAM_LIST_PAGE_LIMIT));
+        assert_eq!(
+            second_input.start_after,
+            first_page[1].clone().into(),
+            "the next interval must resume after the prior page"
+        );
+
+        let second_page = vec![stream_name("events-c")];
+        let completed = scan
+            .record_page(&second_page, None)
+            .expect("the terminal page completes the scan");
+        assert_eq!(
+            completed,
+            BTreeSet::from([
+                "events-a".to_string(),
+                "events-b".to_string(),
+                "events-c".to_string(),
+            ])
+        );
+
+        let next_scan_input = scan.list_input(prefix);
+        assert_eq!(next_scan_input.limit, Some(STREAM_LIST_PAGE_LIMIT));
+        assert_eq!(next_scan_input.start_after, Default::default());
+        assert!(
+            scan.seen.is_empty(),
+            "completed names must not leak into the next scan"
+        );
+
+        let next_completed = scan
+            .record_page(&[stream_name("events-c")], None)
+            .expect("a one-page scan completes immediately");
+        assert_eq!(next_completed, BTreeSet::from(["events-c".to_string()]));
     }
 
     #[tokio::test(flavor = "multi_thread")]

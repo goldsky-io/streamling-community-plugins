@@ -94,9 +94,9 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` envi
 | `schema` | no | — | Typed mode: `name:type` columns decoded from JSON bodies (`bool`, `int8..64`, `uint8..64`, `float32/64`, `string`, `date`, `timestamp[_s/_ms/_us/_ns]`; `?` suffix = nullable) |
 | `include_metadata` | no | `false` | Typed mode: append `_s2_stream`, `_s2_seq_num`, `_s2_timestamp` columns |
 | `on_malformed` | no | `error` | Typed mode: `error` fails (and retries) the batch on an undecodable body; `skip` drops it with a WARN |
-| `start_position` | no | `earliest` | Where to start a stream with no checkpointed position: `earliest` or `latest`. Streams discovered after startup always start from the beginning |
+| `start_position` | no | `earliest` | Where to start any stream with no checkpointed position: `earliest` or `latest`, regardless of when it is discovered |
 | `batch_size` | no | `1000` | Max records per generated Arrow batch |
-| `update_streams_interval_secs` | no | `60` | How often `stream_prefix` re-lists streams |
+| `update_streams_interval_secs` | no | `60` | How often `stream_prefix` fetches the next page (up to 1,000 streams); removals apply after a complete scan |
 | `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 
