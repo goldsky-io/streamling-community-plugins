@@ -62,6 +62,8 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 | `secret_access_key` | no | AWS secret key (env var preferred) |
 | `session_token` | no | STS session token (env var preferred) |
 
+Example pipeline: [`examples/pipeline-sqs-sink.yaml`](examples/pipeline-sqs-sink.yaml)
+
 ### S2 Sink (`s2_sink`)
 
 Appends each row as a JSON record to a stream on [s2.dev](https://s2.dev) — a durable streaming service — via the `s2-sdk` Producer. Rows are JSON-serialized and submitted to the Producer, which batches them internally; checkpoint markers drain pending record tickets, so the dispatcher only acknowledges a checkpoint after S2 has durably appended every record submitted before it. Each record carries a Debezium-style `dbz.op` header with the row kind, like the built-in Kafka sink; the `_gs_op` column is stripped from record bodies. Delivery is at-least-once — ambiguous append retries and checkpoint replay can duplicate records.
