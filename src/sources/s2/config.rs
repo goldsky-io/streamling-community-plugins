@@ -28,7 +28,7 @@ pub struct S2SourceConfig {
     pub output: OutputMode,
     /// Max records per generated Arrow batch.
     pub batch_size: usize,
-    /// How often `stream_prefix` re-lists streams.
+    /// How often `stream_prefix` fetches the next listing page.
     pub update_streams_interval_secs: u64,
     pub request_timeout_ms: u64,
 }
