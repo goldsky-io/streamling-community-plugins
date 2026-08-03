@@ -1,0 +1,36 @@
+# Example pipeline: Kafka source -> SQS sink (plugin)
+#
+# Requires STREAMLING__PLUGIN__PATH pointing to the compiled plugins library
+# (.so / .dylib / .dll) — see "How to Use" in the README.
+#
+# For local testing without AWS, point `endpoint_url` at ElasticMQ or
+# LocalStack and use test credentials (see the commented options below).
+sources:
+  kafka_source:
+    type: kafka
+    topic: my.topic.v1
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  filtered:
+    from: kafka_source
+    type: sql
+    sql: |
+      select * from kafka_source where id is not null;
+    primary_key: id
+
+sinks:
+  sqs_sink:
+    type: sqs
+    from: filtered
+    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/my-queue
+    region: us-east-1
+    # For ElasticMQ / LocalStack, uncomment:
+    # endpoint_url: http://localhost:9324
+    # access_key_id: test
+    # secret_access_key: test
+    #
+    # Prefer env vars over YAML for real credentials:
+    #   STREAMLING__PLUGIN__SQS_SINK__ACCESS_KEY_ID
+    #   STREAMLING__PLUGIN__SQS_SINK__SECRET_ACCESS_KEY
