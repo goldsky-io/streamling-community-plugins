@@ -43,6 +43,11 @@ pub struct RowConverter {
     /// Output data-column name → position.
     col_idx: HashMap<String, usize>,
     n_cols: usize,
+    /// Precede each update's new image with a `d` row carrying the old image,
+    /// so downstream can retract the prior state. Requires
+    /// `REPLICA IDENTITY FULL`; updates without a full old image are passed
+    /// through as the new image alone.
+    emit_update_before_row: bool,
 }
 
 /// `schema.table` label for an etl table schema.
@@ -52,7 +57,7 @@ fn table_label(schema: &ReplicatedTableSchema) -> String {
 
 impl RowConverter {
     /// `data_columns`: output column names in schema order (without `_gs_op`).
-    pub fn new(table: String, data_columns: &[String]) -> Self {
+    pub fn new(table: String, data_columns: &[String], emit_update_before_row: bool) -> Self {
         Self {
             table,
             col_idx: data_columns
@@ -61,6 +66,7 @@ impl RowConverter {
                 .map(|(i, name)| (name.clone(), i))
                 .collect(),
             n_cols: data_columns.len(),
+            emit_update_before_row,
         }
     }
 
@@ -132,6 +138,25 @@ impl RowConverter {
                 }
                 Event::Update(e) => {
                     if self.matches_table(&e.replicated_table_schema) {
+                        if self.emit_update_before_row {
+                            match &e.old_table_row {
+                                // A key-only image cannot carry the prior
+                                // non-key values, so retracting from it would
+                                // emit a row of nulls rather than the old
+                                // state. Skip it instead of corrupting the
+                                // downstream aggregate.
+                                Some(old @ OldTableRow::Full(_)) => rows.push(CdcRow {
+                                    op: "delete",
+                                    values: self.aligned_old(&e.replicated_table_schema, old),
+                                }),
+                                _ => warn!(
+                                    table = %self.table,
+                                    "postgres_cdc: emit_update_before_row is on but the update \
+                                     carries no full old-row image; set REPLICA IDENTITY FULL \
+                                     on the table. Emitting the new image only"
+                                ),
+                            }
+                        }
                         let values = match &e.updated_table_row {
                             UpdatedTableRow::Full(row) => {
                                 self.aligned(&e.replicated_table_schema, row.values(), &[])
@@ -385,7 +410,22 @@ mod tests {
     }
 
     fn converter() -> RowConverter {
-        RowConverter::new("public.users".into(), &["id".into(), "name".into()])
+        RowConverter::new("public.users".into(), &["id".into(), "name".into()], false)
+    }
+
+    fn update_event(
+        s: &ReplicatedTableSchema,
+        commit_lsn: PgLsn,
+        old_table_row: Option<OldTableRow>,
+    ) -> Event {
+        Event::Update(UpdateEvent {
+            start_lsn: PgLsn::from(992u64),
+            commit_lsn,
+            tx_ordinal: 2,
+            replicated_table_schema: s.clone(),
+            updated_table_row: UpdatedTableRow::Full(row(1, "grace")),
+            old_table_row,
+        })
     }
 
     fn row(id: i64, name: &str) -> TableRow {
@@ -463,6 +503,46 @@ mod tests {
             rows[2].values,
             vec![Some(Cell::I64(1)), Some(Cell::String("grace".into()))]
         );
+    }
+
+    #[test]
+    fn emit_update_before_row_precedes_update_with_a_delete_of_the_old_row() {
+        let s = users_schema();
+        let c = RowConverter::new("public.users".into(), &["id".into(), "name".into()], true);
+        let commit_lsn = PgLsn::from(1000u64);
+
+        let rows = c.convert_events(&[update_event(
+            &s,
+            commit_lsn,
+            Some(OldTableRow::Full(row(1, "ada"))),
+        )]);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].op, "delete");
+        assert_eq!(
+            rows[0].values,
+            vec![Some(Cell::I64(1)), Some(Cell::String("ada".into()))]
+        );
+        assert_eq!(rows[1].op, "update");
+        assert_eq!(
+            rows[1].values,
+            vec![Some(Cell::I64(1)), Some(Cell::String("grace".into()))]
+        );
+    }
+
+    #[test]
+    fn emit_update_before_row_skips_updates_without_a_full_old_image() {
+        let s = users_schema();
+        let c = RowConverter::new("public.users".into(), &["id".into(), "name".into()], true);
+        let commit_lsn = PgLsn::from(1000u64);
+
+        // A key-only image (default replica identity) would retract nulls.
+        let key_only = Some(OldTableRow::Key(TableRow::new(vec![Cell::I64(1)])));
+        for old in [None, key_only] {
+            let rows = c.convert_events(&[update_event(&s, commit_lsn, old)]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].op, "update");
+        }
     }
 
     #[test]
@@ -559,9 +639,10 @@ mod tests {
     #[test]
     fn fan_out_groups_rows_per_subscriber_table() {
         let users = users_schema();
-        let conv_users = RowConverter::new("public.users".into(), &["id".into(), "name".into()]);
+        let conv_users =
+            RowConverter::new("public.users".into(), &["id".into(), "name".into()], false);
         // An orders converter sees the same event stream but matches nothing here.
-        let conv_orders = RowConverter::new("public.orders".into(), &["id".into()]);
+        let conv_orders = RowConverter::new("public.orders".into(), &["id".into()], false);
 
         let events = vec![Event::Insert(InsertEvent {
             start_lsn: PgLsn::from(1u64),

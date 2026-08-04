@@ -122,8 +122,11 @@ impl PostgresCdcSource {
             &parsed.settings.slot_name,
             parsed.pipeline.clone(),
             parsed.group_identity(),
-            table_label,
-            data_columns,
+            pipeline::TableSpec {
+                label: table_label,
+                data_columns,
+                emit_update_before_row: parsed.settings.emit_update_before_row,
+            },
             parsed.settings.max_buffered_units,
             parsed.settings.auto_create_publication,
         )

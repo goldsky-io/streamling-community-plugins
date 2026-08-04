@@ -55,6 +55,7 @@ struct PendingSub {
     source_id: SourceId,
     table_label: String,
     data_columns: Vec<String>,
+    emit_update_before_row: bool,
     tx: mpsc::Sender<WriteUnit>,
 }
 
@@ -79,15 +80,24 @@ struct Inner {
     shutdown: Option<etl::concurrency::ShutdownTx>,
 }
 
-/// Registers `table_label` into the group named `slot_name`, creating the
+/// The table a source contributes to its group, and how its rows are shaped.
+pub struct TableSpec {
+    /// "schema.table" this source replicates.
+    pub label: String,
+    /// Output data-column names in schema order (without `_gs_op`).
+    pub data_columns: Vec<String>,
+    /// Precede each update's new image with a `d` row carrying the old image.
+    pub emit_update_before_row: bool,
+}
+
+/// Registers `table.label` into the group named `slot_name`, creating the
 /// group on first call. Validates that an existing group has matching
 /// `identity`; rejects a duplicate table. Returns the source's subscription.
 pub fn register(
     slot_name: &str,
     pipeline: PipelineConfig,
     identity: GroupIdentity,
-    table_label: String,
-    data_columns: Vec<String>,
+    table: TableSpec,
     capacity: usize,
     auto_create_publication: bool,
 ) -> Result<Subscription, String> {
@@ -125,10 +135,10 @@ pub fn register(
     };
 
     let mut inner = shared.inner.lock().expect("shared inner poisoned");
-    if inner.subs.iter().any(|s| s.table_label == table_label) {
+    if inner.subs.iter().any(|s| s.table_label == table.label) {
         return Err(format!(
-            "postgres_cdc_source: table '{table_label}' is already registered in slot_name \
-             '{slot_name}'"
+            "postgres_cdc_source: table '{}' is already registered in slot_name '{slot_name}'",
+            table.label
         ));
     }
     let source_id = inner.next_source_id;
@@ -137,8 +147,9 @@ pub fn register(
     let (tx, rx) = mpsc::channel(capacity);
     inner.subs.push(PendingSub {
         source_id,
-        table_label,
-        data_columns,
+        table_label: table.label,
+        data_columns: table.data_columns,
+        emit_update_before_row: table.emit_update_before_row,
         tx,
     });
     drop(inner);
@@ -173,6 +184,7 @@ impl SharedPipeline {
                     converter: crate::postgres_cdc::bridge::RowConverter::new(
                         s.table_label.clone(),
                         &s.data_columns,
+                        s.emit_update_before_row,
                     ),
                     tx: s.tx.clone(),
                 })
@@ -414,6 +426,14 @@ mod tests {
         }
     }
 
+    fn table_spec(label: &str) -> TableSpec {
+        TableSpec {
+            label: label.to_string(),
+            data_columns: vec!["id".into()],
+            emit_update_before_row: false,
+        }
+    }
+
     fn identity(publication: &str) -> GroupIdentity {
         GroupIdentity {
             host: "h".into(),
@@ -431,8 +451,7 @@ mod tests {
             g,
             pipeline_config("p"),
             identity("p"),
-            "public.a".into(),
-            vec!["id".into()],
+            table_spec("public.a"),
             4,
             false,
         )
@@ -441,8 +460,7 @@ mod tests {
             g,
             pipeline_config("p"),
             identity("p"),
-            "public.b".into(),
-            vec!["id".into()],
+            table_spec("public.b"),
             4,
             false,
         )
@@ -460,8 +478,7 @@ mod tests {
             g,
             pipeline_config("p"),
             identity("p"),
-            "public.a".into(),
-            vec!["id".into()],
+            table_spec("public.a"),
             4,
             false,
         )
@@ -470,8 +487,7 @@ mod tests {
             g,
             pipeline_config("p"),
             identity("p"),
-            "public.a".into(),
-            vec!["id".into()],
+            table_spec("public.a"),
             4,
             false,
         )
@@ -486,8 +502,7 @@ mod tests {
             g,
             pipeline_config("p"),
             identity("p"),
-            "public.a".into(),
-            vec!["id".into()],
+            table_spec("public.a"),
             4,
             false,
         )
@@ -496,8 +511,7 @@ mod tests {
             g,
             pipeline_config("q"),
             identity("q"),
-            "public.b".into(),
-            vec!["id".into()],
+            table_spec("public.b"),
             4,
             false,
         )
@@ -512,8 +526,7 @@ mod tests {
             g,
             pipeline_config("p"),
             identity("p"),
-            "public.a".into(),
-            vec!["id".into()],
+            table_spec("public.a"),
             4,
             false,
         )
