@@ -35,12 +35,23 @@ impl PluginOptions {
         )
     }
 
+    fn env_key(&self, key: &str) -> String {
+        format!("{}__{}", self.env_prefix, key.to_uppercase())
+    }
+
+    /// The option's value, environment variable first, or `None` when set in
+    /// neither place. Use this over the raw options map so env overrides apply.
+    pub fn lookup(&self, key: &str) -> Option<String> {
+        std::env::var(self.env_key(key))
+            .ok()
+            .or_else(|| self.options.get(key).cloned())
+    }
+
+    /// A required option. An option set to the empty string counts as unset:
+    /// no required option has a meaningful empty value, and reporting it here
+    /// beats the downstream failure it would otherwise cause.
     pub fn get(&self, key: &str) -> Result<String, PluginError> {
-        let env_key = format!("{}__{}", self.env_prefix, key.to_uppercase());
-        if let Ok(val) = std::env::var(&env_key) {
-            return Ok(val);
-        }
-        self.options.get(key).cloned().ok_or_else(|| {
+        self.lookup(key).filter(|v| !v.is_empty()).ok_or_else(|| {
             PluginError::Internal(format!(
                 "{}: required option '{}' is not specified",
                 self.plugin_name, key
@@ -49,11 +60,7 @@ impl PluginOptions {
     }
 
     pub fn get_or(&self, key: &str, default: &str) -> String {
-        let env_key = format!("{}__{}", self.env_prefix, key.to_uppercase());
-        std::env::var(&env_key)
-            .ok()
-            .or_else(|| self.options.get(key).cloned())
-            .unwrap_or_else(|| default.to_string())
+        self.lookup(key).unwrap_or_else(|| default.to_string())
     }
 
     /// Parses a typed option, naming the plugin, key, and offending value in
@@ -68,6 +75,22 @@ impl PluginOptions {
     {
         let value = self.get_or(key, default);
         self.parse_value(key, &value)
+    }
+
+    /// Parses a typed option, falling back to an already-typed default so
+    /// callers don't have to stringify one.
+    pub fn get_parsed_or<T: std::str::FromStr>(
+        &self,
+        key: &str,
+        default: T,
+    ) -> Result<T, PluginError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self.lookup(key) {
+            None => Ok(default),
+            Some(value) => self.parse_value(key, &value),
+        }
     }
 
     /// Parses an already-read value (e.g. an SDK name type), naming the
@@ -89,7 +112,7 @@ impl PluginOptions {
     }
 
     pub fn get_secret(&self, key: &str) -> Option<String> {
-        let env_key = format!("{}__{}", self.env_prefix, key.to_uppercase());
+        let env_key = self.env_key(key);
         std::env::var(&env_key).ok().or_else(|| {
             if let Some(val) = self.options.get(key) {
                 warn!(

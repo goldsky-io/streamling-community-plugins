@@ -23,13 +23,25 @@
 //! `emit_update_before_row` (false: emit an extra `d` row carrying an update's
 //! old image before its new image, for sinks that retract prior state; requires
 //! `REPLICA IDENTITY FULL`).
+//!
+//! Every option can also be set via `STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE__<KEY>`
+//! (uppercase key), which takes precedence over the YAML value.
 
+use crate::utils::plugin_options::PluginOptions;
 use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
     PipelineConfig, TableSyncCopyConfig, TcpKeepaliveConfig, TlsConfig,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use streamling_plugin::PluginError;
+
+pub const PLUGIN_NAME: &str = "postgres_cdc_source";
+pub const ENV_PREFIX: &str = "STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE";
+
+const DEFAULT_PORT: u16 = 5432;
+
+/// Keys of the optional separate metadata-store connection. All or none.
+const STORE_KEYS: [&str; 3] = ["store_host", "store_database", "store_username"];
 
 /// Stable identity of a shared-slot group: every source sharing a `slot_name`
 /// must agree on these. Derived from the parsed config; compared by value.
@@ -99,29 +111,29 @@ impl ParsedConfig {
     }
 }
 
-fn required<'a>(options: &'a HashMap<String, String>, key: &str) -> Result<&'a str, String> {
-    options
-        .get(key)
-        .map(String::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("postgres_cdc_source: missing required option '{key}'"))
-}
-
-fn parse_opt<T: std::str::FromStr>(
-    options: &HashMap<String, String>,
-    key: &str,
-    default: T,
-) -> Result<T, String> {
-    match options.get(key) {
-        None => Ok(default),
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("postgres_cdc_source: invalid {key} '{s}'")),
-    }
+/// Builds a connection from `{prefix}host`-style keys, so the replicated
+/// database and the metadata store are configured the same way.
+fn connection(
+    options: &PluginOptions,
+    prefix: &str,
+    tls: TlsConfig,
+) -> Result<PgConnectionConfig, PluginError> {
+    Ok(PgConnectionConfig {
+        host: options.get(&format!("{prefix}host"))?,
+        hostaddr: None,
+        port: options.get_parsed_or(&format!("{prefix}port"), DEFAULT_PORT)?,
+        name: options.get(&format!("{prefix}database"))?,
+        username: options.get(&format!("{prefix}username"))?,
+        password: options
+            .get_secret(&format!("{prefix}password"))
+            .map(Into::into),
+        tls,
+        keepalive: TcpKeepaliveConfig::default(),
+    })
 }
 
 /// Splits a `table` option into (schema, name); bare names get "public".
-fn parse_table(raw: &str) -> Result<(String, String), String> {
+fn parse_table(raw: &str) -> Result<(String, String), PluginError> {
     let mut parts = raw.splitn(2, '.');
     let first = parts.next().unwrap_or_default();
     match parts.next() {
@@ -129,9 +141,19 @@ fn parse_table(raw: &str) -> Result<(String, String), String> {
             Ok((first.to_string(), name.to_string()))
         }
         None if !first.is_empty() => Ok(("public".to_string(), first.to_string())),
-        _ => Err(format!(
-            "postgres_cdc_source: invalid table '{raw}' (expected 'name' or 'schema.name')"
-        )),
+        _ => Err(PluginError::Internal(format!(
+            "{PLUGIN_NAME}: invalid table '{raw}' (expected 'name' or 'schema.name')"
+        ))),
+    }
+}
+
+/// Rejects an option that must be greater than zero, naming it.
+fn positive(value: usize, key: &str) -> Result<usize, PluginError> {
+    match value {
+        0 => Err(PluginError::Internal(format!(
+            "{PLUGIN_NAME}: {key} must be greater than 0"
+        ))),
+        n => Ok(n),
     }
 }
 
@@ -143,91 +165,68 @@ fn parse_table(raw: &str) -> Result<(String, String), String> {
 /// validated by [`MemoryBackpressureConfig::validate`]. Thresholds are ignored
 /// (unparsed) when disabled.
 fn parse_memory_backpressure(
-    options: &HashMap<String, String>,
-) -> Result<Option<MemoryBackpressureConfig>, String> {
-    if !parse_opt(options, "memory_backpressure_enabled", true)? {
+    options: &PluginOptions,
+) -> Result<Option<MemoryBackpressureConfig>, PluginError> {
+    if !options.get_parsed_or("memory_backpressure_enabled", true)? {
         return Ok(None);
     }
     let config = MemoryBackpressureConfig {
-        activate_threshold: parse_opt(
-            options,
+        activate_threshold: options.get_parsed_or(
             "memory_backpressure_activate_threshold",
             MemoryBackpressureConfig::DEFAULT_ACTIVATE_THRESHOLD,
         )?,
-        resume_threshold: parse_opt(
-            options,
+        resume_threshold: options.get_parsed_or(
             "memory_backpressure_resume_threshold",
             MemoryBackpressureConfig::DEFAULT_RESUME_THRESHOLD,
         )?,
     };
-    config
-        .validate()
-        .map_err(|e| format!("postgres_cdc_source: invalid memory_backpressure config: {e}"))?;
+    config.validate().map_err(|e| {
+        PluginError::Internal(format!(
+            "{PLUGIN_NAME}: invalid memory_backpressure config: {e}"
+        ))
+    })?;
     Ok(Some(config))
 }
 
-pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, String> {
-    let slot_name = required(options, "slot_name")?.to_string();
+pub fn parse_options(options: &PluginOptions) -> Result<ParsedConfig, PluginError> {
+    let slot_name = options.get("slot_name")?;
     let pipeline_id = hash_slot_name(&slot_name);
 
     let tls = TlsConfig {
-        trusted_root_certs: options
-            .get("trusted_root_certs")
-            .cloned()
-            .unwrap_or_default(),
-        enabled: parse_opt(options, "tls_enabled", false)?,
+        trusted_root_certs: options.get_or("trusted_root_certs", ""),
+        enabled: options.get_parsed_or("tls_enabled", false)?,
     };
 
-    let pg_connection = PgConnectionConfig {
-        host: required(options, "host")?.to_string(),
-        hostaddr: None,
-        port: parse_opt(options, "port", 5432u16)?,
-        name: required(options, "database")?.to_string(),
-        username: required(options, "username")?.to_string(),
-        password: options.get("password").cloned().map(Into::into),
-        tls: tls.clone(),
-        keepalive: TcpKeepaliveConfig::default(),
-    };
+    let pg_connection = connection(options, "", tls.clone())?;
 
-    let store_keys = ["store_host", "store_database", "store_username"];
-    let store_present = store_keys
+    let store_present = STORE_KEYS
         .iter()
-        .filter(|k| options.contains_key(**k))
+        .filter(|k| options.lookup(k).is_some())
         .count();
     let store_pg_connection = match store_present {
         0 => None,
-        3 => Some(PgConnectionConfig {
-            host: required(options, "store_host")?.to_string(),
-            hostaddr: None,
-            port: parse_opt(options, "store_port", 5432u16)?,
-            name: required(options, "store_database")?.to_string(),
-            username: required(options, "store_username")?.to_string(),
-            password: options.get("store_password").cloned().map(Into::into),
-            tls,
-            keepalive: TcpKeepaliveConfig::default(),
-        }),
+        n if n == STORE_KEYS.len() => Some(connection(options, "store_", tls)?),
         _ => {
-            return Err(
-                "postgres_cdc_source: store_host, store_database and store_username must be \
-                 set together"
-                    .to_string(),
-            );
+            return Err(PluginError::Internal(format!(
+                "{PLUGIN_NAME}: {} must be set together",
+                STORE_KEYS.join(", ")
+            )));
         }
     };
 
     let pipeline = PipelineConfig {
         id: pipeline_id,
-        publication_name: required(options, "publication_name")?.to_string(),
+        publication_name: options.get("publication_name")?,
         pg_connection,
         store_pg_connection,
         batch: BatchConfig {
-            max_fill_ms: parse_opt(options, "batch_max_fill_ms", 1000u64)?,
+            max_fill_ms: options.get_parsed_or("batch_max_fill_ms", 1000u64)?,
             memory_budget_ratio: 0.2,
-            max_bytes: parse_opt(options, "batch_max_bytes", 8usize * 1024 * 1024)?,
+            max_bytes: options.get_parsed_or("batch_max_bytes", 8usize * 1024 * 1024)?,
         },
         table_error_retry_delay_ms: 10_000,
         table_error_retry_max_attempts: 5,
-        max_table_sync_workers: parse_opt(options, "max_table_sync_workers", 4u16)?,
+        max_table_sync_workers: options.get_parsed_or("max_table_sync_workers", 4u16)?,
         memory_refresh_interval_ms: 100,
         memory_backpressure: parse_memory_backpressure(options)?,
         table_sync_copy: TableSyncCopyConfig::default(),
@@ -235,27 +234,25 @@ pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, 
         max_copy_connections_per_table: PipelineConfig::DEFAULT_MAX_COPY_CONNECTIONS_PER_TABLE,
     };
 
-    let (table_schema, table_name) = parse_table(required(options, "table")?)?;
+    let (table_schema, table_name) = parse_table(&options.get("table")?)?;
 
-    let batch_size = parse_opt(options, "batch_size", 1000usize)?;
-    if batch_size == 0 {
-        return Err("postgres_cdc_source: batch_size must be greater than 0".to_string());
-    }
-    let max_buffered_units = parse_opt(options, "max_buffered_units", 8usize)?;
-    if max_buffered_units == 0 {
-        return Err("postgres_cdc_source: max_buffered_units must be greater than 0".to_string());
-    }
     Ok(ParsedConfig {
         pipeline,
         settings: SourceSettings {
             table_schema,
             table_name,
             slot_name,
-            batch_size,
-            batch_interval_ms: parse_opt(options, "batch_interval_ms", 100u64)?,
-            max_buffered_units,
-            auto_create_publication: parse_opt(options, "auto_create_publication", true)?,
-            emit_update_before_row: parse_opt(options, "emit_update_before_row", false)?,
+            batch_size: positive(
+                options.get_parsed_or("batch_size", 1000usize)?,
+                "batch_size",
+            )?,
+            batch_interval_ms: options.get_parsed_or("batch_interval_ms", 100u64)?,
+            max_buffered_units: positive(
+                options.get_parsed_or("max_buffered_units", 8usize)?,
+                "max_buffered_units",
+            )?,
+            auto_create_publication: options.get_parsed_or("auto_create_publication", true)?,
+            emit_update_before_row: options.get_parsed_or("emit_update_before_row", false)?,
         },
     })
 }
@@ -263,6 +260,18 @@ pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    const TEST_ENV_PREFIX: &str = "STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE_CONFIG_TEST";
+
+    fn parse(options: &HashMap<String, String>) -> Result<ParsedConfig, String> {
+        parse_options(&PluginOptions::new(
+            options.clone(),
+            PLUGIN_NAME,
+            TEST_ENV_PREFIX,
+        ))
+        .map_err(|e| e.to_string())
+    }
 
     fn base_options() -> HashMap<String, String> {
         [
@@ -280,8 +289,27 @@ mod tests {
     }
 
     #[test]
+    fn env_vars_override_yaml_options() {
+        const PREFIX: &str = "STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE_ENV_TEST";
+        let mut opts = base_options();
+        opts.remove("password");
+        unsafe {
+            std::env::set_var(format!("{PREFIX}__PORT"), "6543");
+            std::env::set_var(format!("{PREFIX}__HOST"), "from-env.example.com");
+            std::env::set_var(format!("{PREFIX}__PASSWORD"), "from-env");
+            std::env::set_var(format!("{PREFIX}__EMIT_UPDATE_BEFORE_ROW"), "true");
+        }
+        let cfg = parse_options(&PluginOptions::new(opts, PLUGIN_NAME, PREFIX)).unwrap();
+        // Overrides a YAML value, supplies an absent secret, and flips a flag.
+        assert_eq!(cfg.pipeline.pg_connection.port, 6543);
+        assert_eq!(cfg.pipeline.pg_connection.host, "from-env.example.com");
+        assert!(cfg.pipeline.pg_connection.password.is_some());
+        assert!(cfg.settings.emit_update_before_row);
+    }
+
+    #[test]
     fn parses_minimal_options_with_defaults() {
-        let cfg = parse_options(&base_options()).unwrap();
+        let cfg = parse(&base_options()).unwrap();
         assert_eq!(cfg.pipeline.id, hash_slot_name("demo_slot"));
         assert_eq!(cfg.pipeline.publication_name, "my_pub");
         assert_eq!(cfg.pipeline.pg_connection.host, "db.example.com");
@@ -315,30 +343,30 @@ mod tests {
         ] {
             let mut opts = base_options();
             opts.remove(key);
-            let err = parse_options(&opts).unwrap_err();
+            let err = parse(&opts).unwrap_err();
             assert!(err.contains(key), "error {err:?} should name {key}");
         }
     }
 
     #[test]
     fn table_option_parses_qualified_and_bare_names() {
-        let cfg = parse_options(&base_options()).unwrap();
+        let cfg = parse(&base_options()).unwrap();
         assert_eq!(cfg.settings.table_schema, "public");
         assert_eq!(cfg.settings.table_name, "users");
 
         let mut opts = base_options();
         opts.insert("table".into(), "sales.orders".into());
-        let cfg = parse_options(&opts).unwrap();
+        let cfg = parse(&opts).unwrap();
         assert_eq!(cfg.settings.table_schema, "sales");
         assert_eq!(cfg.settings.table_name, "orders");
 
         opts.insert("table".into(), "orders".into());
-        let cfg = parse_options(&opts).unwrap();
+        let cfg = parse(&opts).unwrap();
         assert_eq!(cfg.settings.table_schema, "public");
         assert_eq!(cfg.settings.table_name, "orders");
 
         opts.insert("table".into(), "a.b.c".into());
-        assert!(parse_options(&opts).unwrap_err().contains("table"));
+        assert!(parse(&opts).unwrap_err().contains("table"));
     }
 
     #[test]
@@ -352,7 +380,7 @@ mod tests {
 
     #[test]
     fn slot_name_derives_pipeline_id_and_is_exposed() {
-        let cfg = parse_options(&base_options()).unwrap();
+        let cfg = parse(&base_options()).unwrap();
         assert_eq!(cfg.settings.slot_name, "demo_slot");
         assert_eq!(cfg.pipeline.id, hash_slot_name("demo_slot"));
     }
@@ -361,17 +389,17 @@ mod tests {
     fn empty_slot_name_is_an_error() {
         let mut opts = base_options();
         opts.insert("slot_name".into(), "".into());
-        assert!(parse_options(&opts).unwrap_err().contains("slot_name"));
+        assert!(parse(&opts).unwrap_err().contains("slot_name"));
     }
 
     #[test]
     fn group_identity_matches_for_same_connection_and_publication() {
-        let a = parse_options(&base_options()).unwrap().group_identity();
-        let b = parse_options(&base_options()).unwrap().group_identity();
+        let a = parse(&base_options()).unwrap().group_identity();
+        let b = parse(&base_options()).unwrap().group_identity();
         assert_eq!(a, b);
         let mut opts = base_options();
         opts.insert("publication_name".into(), "other_pub".into());
-        let c = parse_options(&opts).unwrap().group_identity();
+        let c = parse(&opts).unwrap().group_identity();
         assert_ne!(a, c);
     }
 
@@ -381,7 +409,7 @@ mod tests {
         opts.insert("store_host".into(), "state.example.com".into());
         opts.insert("store_database".into(), "etl_state".into());
         opts.insert("store_username".into(), "etl".into());
-        let cfg = parse_options(&opts).unwrap();
+        let cfg = parse(&opts).unwrap();
         let store = cfg.pipeline.store_pg_connection.unwrap();
         assert_eq!(store.host, "state.example.com");
         assert_eq!(store.name, "etl_state");
@@ -393,14 +421,14 @@ mod tests {
         let mut opts = base_options();
         opts.insert("store_host".into(), "state.example.com".into());
         // store_database / store_username missing
-        assert!(parse_options(&opts).unwrap_err().contains("store_"));
+        assert!(parse(&opts).unwrap_err().contains("store_"));
     }
 
     #[test]
     fn zero_batch_size_is_an_error() {
         let mut opts = base_options();
         opts.insert("batch_size".into(), "0".into());
-        let err = parse_options(&opts).unwrap_err();
+        let err = parse(&opts).unwrap_err();
         assert!(err.contains("batch_size"), "got {err:?}");
     }
 
@@ -408,7 +436,7 @@ mod tests {
     fn zero_max_buffered_units_is_an_error() {
         let mut opts = base_options();
         opts.insert("max_buffered_units".into(), "0".into());
-        let err = parse_options(&opts).unwrap_err();
+        let err = parse(&opts).unwrap_err();
         assert!(err.contains("max_buffered_units"), "got {err:?}");
     }
 
@@ -417,20 +445,20 @@ mod tests {
         let mut opts = base_options();
         opts.insert("tls_enabled".into(), "true".into());
         opts.insert("trusted_root_certs".into(), "PEMPEM".into());
-        let cfg = parse_options(&opts).unwrap();
+        let cfg = parse(&opts).unwrap();
         assert!(cfg.pipeline.pg_connection.tls.enabled);
         assert_eq!(cfg.pipeline.pg_connection.tls.trusted_root_certs, "PEMPEM");
     }
     #[test]
     fn auto_create_publication_defaults_true_and_parses() {
         // Defaults to true when unset.
-        let cfg = parse_options(&base_options()).unwrap();
+        let cfg = parse(&base_options()).unwrap();
         assert!(cfg.settings.auto_create_publication);
 
         // Explicit opt-out.
         let mut opts = base_options();
         opts.insert("auto_create_publication".into(), "false".into());
-        let cfg = parse_options(&opts).unwrap();
+        let cfg = parse(&opts).unwrap();
         assert!(!cfg.settings.auto_create_publication);
     }
 
@@ -439,7 +467,7 @@ mod tests {
         // Disabled -> None (turns off etl's system-memory apply-stream pause).
         let mut opts = base_options();
         opts.insert("memory_backpressure_enabled".into(), "false".into());
-        let cfg = parse_options(&opts).unwrap();
+        let cfg = parse(&opts).unwrap();
         assert!(cfg.pipeline.memory_backpressure.is_none());
 
         // Enabled with custom thresholds.
@@ -449,7 +477,7 @@ mod tests {
             "0.95".into(),
         );
         opts.insert("memory_backpressure_resume_threshold".into(), "0.9".into());
-        let bp = parse_options(&opts)
+        let bp = parse(&opts)
             .unwrap()
             .pipeline
             .memory_backpressure
@@ -467,7 +495,7 @@ mod tests {
             "0.5".into(),
         );
         opts.insert("memory_backpressure_resume_threshold".into(), "0.8".into());
-        let err = parse_options(&opts).unwrap_err();
+        let err = parse(&opts).unwrap_err();
         assert!(err.contains("memory_backpressure"), "got {err:?}");
 
         // Non-numeric threshold.
@@ -476,7 +504,7 @@ mod tests {
             "memory_backpressure_activate_threshold".into(),
             "high".into(),
         );
-        let err = parse_options(&opts).unwrap_err();
+        let err = parse(&opts).unwrap_err();
         assert!(
             err.contains("memory_backpressure_activate_threshold"),
             "got {err:?}"
@@ -490,12 +518,6 @@ mod tests {
             "0.1".into(),
         );
         opts.insert("memory_backpressure_resume_threshold".into(), "0.9".into());
-        assert!(
-            parse_options(&opts)
-                .unwrap()
-                .pipeline
-                .memory_backpressure
-                .is_none()
-        );
+        assert!(parse(&opts).unwrap().pipeline.memory_backpressure.is_none());
     }
 }
