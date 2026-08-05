@@ -114,6 +114,16 @@ delete on `_gs_op = "d"`; delivery is at-least-once, so replays are idempotent.
 Sources that share a `slot_name` share one replication slot and one etl pipeline
 (coordinated fan-out and acks); give each source its own `slot_name` otherwise.
 
+**Before-images.** By default an `UPDATE` emits only its new image, which is all
+an upserting sink needs. Aggregating sinks need more: to keep a running total
+correct they have to subtract what the row used to contribute before adding what
+it contributes now. Setting `emit_update_before_row: true` precedes each update's
+new image with a `d` row carrying the old image, so downstream can retract the
+prior state. It requires `ALTER TABLE ... REPLICA IDENTITY FULL`; updates that arrive
+without a full old image are logged and pass through as the new image alone.
+Leave it off for sinks that upsert by primary key — they would see the extra `d`
+row as a delete.
+
 **Requirements & caveats:**
 
 - **Postgres >= 14** and `wal_level = logical` (Postgres 13 does not work).
@@ -182,6 +192,7 @@ environment variables (uppercase key). Env vars take precedence over YAML.
 | `table` | yes | — | Replicated table, `schema.name` (bare names default to `public`) |
 | `slot_name` | yes | — | Replication-slot group key; sources sharing it share one slot |
 | `auto_create_publication` | no | `true` | Create the publication if missing and add any registered tables not yet in it (needs CREATE on the DB + table ownership) |
+| `emit_update_before_row` | no | `false` | Precede each update's new image with a `d` row carrying the old image, for sinks that retract prior state. Requires `REPLICA IDENTITY FULL` |
 | `tls_enabled` | no | `false` | Require TLS |
 | `trusted_root_certs` | no | — | PEM-encoded CA bundle |
 | `store_host` / `store_port` / `store_database` / `store_username` / `store_password` | no | source connection | Separate metadata-store database (host/database/username required together; password optional) |

@@ -19,7 +19,10 @@
 //! false to disable — useful on dev machines whose system memory sits high, where
 //! the pause otherwise stalls live changes),
 //! `memory_backpressure_activate_threshold` (0.85),
-//! `memory_backpressure_resume_threshold` (0.75).
+//! `memory_backpressure_resume_threshold` (0.75),
+//! `emit_update_before_row` (false: emit an extra `d` row carrying an update's
+//! old image before its new image, for sinks that retract prior state; requires
+//! `REPLICA IDENTITY FULL`).
 
 use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
@@ -71,6 +74,10 @@ pub struct SourceSettings {
     /// managing the publication is usually an operator concern. Requires a
     /// role with `CREATE` on the database / table ownership; see the README.
     pub auto_create_publication: bool,
+    /// Precede each update's new image with a `d` row carrying the old image.
+    /// Off by default: sinks that upsert by primary key would see a spurious
+    /// delete. Requires `REPLICA IDENTITY FULL` on the replicated table.
+    pub emit_update_before_row: bool,
 }
 
 #[derive(Debug)]
@@ -248,6 +255,7 @@ pub fn parse_options(options: &HashMap<String, String>) -> Result<ParsedConfig, 
             batch_interval_ms: parse_opt(options, "batch_interval_ms", 100u64)?,
             max_buffered_units,
             auto_create_publication: parse_opt(options, "auto_create_publication", true)?,
+            emit_update_before_row: parse_opt(options, "emit_update_before_row", false)?,
         },
     })
 }
