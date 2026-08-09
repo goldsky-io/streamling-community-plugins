@@ -36,10 +36,13 @@
 
 use crate::postgres_cdc::arrow::{CdcRow, rows_to_record_batch};
 use crate::postgres_cdc::bridge::WriteUnit;
-use crate::postgres_cdc::config::{ParsedConfig, SourceSettings, parse_options};
+use crate::postgres_cdc::config::{
+    ENV_PREFIX, PLUGIN_NAME, ParsedConfig, SourceSettings, parse_options,
+};
 use crate::postgres_cdc::discovery::{build_output_schema, discover_columns_blocking};
 use crate::postgres_cdc::ledger::{AckLedger, SourceAckHandle};
 use crate::postgres_cdc::pipeline::{self, SharedPipeline, Subscription};
+use crate::utils::plugin_options::{PluginOptions, configuration_error};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -96,8 +99,8 @@ impl PostgresCdcSource {
         _metrics_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Result<Self, PluginInitializationError> {
-        let parsed = parse_options(&options)
-            .map_err(|e| PluginInitializationError::Configuration(e.into()))?;
+        let parsed = parse_options(&PluginOptions::new(options, PLUGIN_NAME, ENV_PREFIX))
+            .map_err(configuration_error)?;
         // The host requires the output schema at construction, so column
         // discovery happens here (blocking, scratch thread + 10s timeout).
         let columns = discover_columns_blocking(
@@ -356,7 +359,7 @@ mod tests {
         )
         .err()
         .expect("must fail without required options");
-        assert!(format!("{err:?}").contains("missing required option"));
+        assert!(format!("{err:?}").contains("required option"));
         assert!(format!("{err:?}").contains("slot_name"));
     }
 
