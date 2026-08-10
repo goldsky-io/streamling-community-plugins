@@ -4,10 +4,10 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-streamling-plugin = "0.2.0"
+streamling-plugin = "0.2.1"
 # RowKind: keys the dbz.op <-> _gs_op mapping on the engine's enum so the
 # round-trip contract tracks upstream by construction.
-streamling-common = "0.1.0"
+streamling-common = "0.3.0"
 
 # Generic RecordBatch-to-JSON conversion (see utils::record_batch_json).
 # U256 columns are serialized as decimal strings; arrow_json emits hex by default.
@@ -24,10 +24,10 @@ async-trait = "0.1.83"
 futures = "0.3"
 
 # Arrow dependencies
-arrow = "55.2.0"
-arrow-schema = "55.2.0"
-arrow-json = "55.2.0"
-parquet = "55.2.0"
+arrow = "58.3.0"
+arrow-schema = "58.3.0"
+arrow-json = "58.3.0"
+parquet = "58.3.0"
 bytes = "1.8.0"
 
 # Object store (for S3)
@@ -84,7 +84,7 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.11.1"
 s2-testcontainers = "0.39.1"
 serde = "1.0"
-streamling-e2e = "0.1.0"
+streamling-e2e = "0.3.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 url = "2.5"
 
