@@ -1,13 +1,13 @@
 [package]
 name = "community_plugins"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 
 [dependencies]
 streamling-plugin = "0.2.1"
 # RowKind: keys the dbz.op <-> _gs_op mapping on the engine's enum so the
 # round-trip contract tracks upstream by construction.
-streamling-common = "0.3.0"
+streamling-common = "0.3.1"
 
 # Generic RecordBatch-to-JSON conversion (see utils::record_batch_json).
 # U256 columns are serialized as decimal strings; arrow_json emits hex by default.
