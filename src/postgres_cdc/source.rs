@@ -95,7 +95,7 @@ pub struct PostgresCdcSource {
 impl PostgresCdcSource {
     pub fn new(
         _rt: PluginAsyncRuntimeObj,
-        _state_backend_factory: PluginStateBackendFactory,
+        state_backend_factory: PluginStateBackendFactory,
         _metrics_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Result<Self, PluginInitializationError> {
@@ -124,6 +124,7 @@ impl PostgresCdcSource {
         let subscription = pipeline::register(
             &parsed.settings.slot_name,
             parsed.pipeline.clone(),
+            state_backend_factory.create(),
             parsed.group_identity(),
             pipeline::TableSpec {
                 label: table_label,

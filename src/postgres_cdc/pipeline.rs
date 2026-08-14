@@ -10,21 +10,21 @@
 //!
 //! ## Metadata store
 //! etl persists its replication state (table schemas, per-table sync progress,
-//! slot state) via its built-in [`PostgresStore`]. By default that store is the
-//! same database as the source (`pg_connection`); override with the `store_*`
-//! options to keep this bookkeeping out of the source database. etl also
-//! installs an `etl` schema (helper functions + a DDL trigger) in the source
-//! database on pipeline start, regardless of the store setting.
+//! slot state) via [`StreamlingStore`], backed by the application's configured
+//! Streamling state backend and keyed by the group's `slot_name`. etl still
+//! installs an `etl` schema (helper functions + a DDL trigger) in the SOURCE
+//! database on pipeline start, regardless of the store.
 
 use crate::postgres_cdc::bridge::{ChannelDestination, Subscriber, WriteUnit};
 use crate::postgres_cdc::config::GroupIdentity;
 use crate::postgres_cdc::ledger::SourceId;
+use crate::postgres_cdc::store::{PersistedEtlState, StreamlingStore};
 use etl::config::PipelineConfig;
 use etl::pipeline::Pipeline;
-use etl::store::PostgresStore;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use streamling_plugin::api::PluginStateBackend;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -64,6 +64,9 @@ pub struct SharedPipeline {
     identity: GroupIdentity,
     /// Config from the first registrant; used to start the one etl pipeline.
     pipeline_config: Mutex<Option<PipelineConfig>>,
+    /// State backend from the first registrant (same policy as
+    /// `pipeline_config`); backs the group's [`StreamlingStore`].
+    state_backend: Arc<PluginStateBackend<PersistedEtlState>>,
     /// Whether to auto-create the publication / add missing tables before
     /// starting. Taken from the first registrant (the publication is shared by
     /// the whole group, so all sources implicitly agree on it).
@@ -96,6 +99,7 @@ pub struct TableSpec {
 pub fn register(
     slot_name: &str,
     pipeline: PipelineConfig,
+    state_backend: Arc<PluginStateBackend<PersistedEtlState>>,
     identity: GroupIdentity,
     table: TableSpec,
     capacity: usize,
@@ -118,6 +122,7 @@ pub fn register(
                     slot_name: slot_name.to_string(),
                     identity,
                     pipeline_config: Mutex::new(Some(pipeline)),
+                    state_backend,
                     auto_create_publication,
                     inner: Mutex::new(Inner {
                         next_source_id: 0,
@@ -211,13 +216,9 @@ impl SharedPipeline {
             )
             .await?;
         }
-        let store_conn = pipeline_config
-            .store_pg_connection
-            .clone()
-            .unwrap_or_else(|| pipeline_config.pg_connection.clone());
-        let store = PostgresStore::new(pipeline_config.id, store_conn)
-            .await
-            .map_err(|e| format!("etl store init: {e}"))?;
+        // Construction is sync and infallible; a backend read failure surfaces
+        // from Pipeline::start()'s load_* calls.
+        let store = StreamlingStore::new(self.state_backend.clone(), &self.slot_name);
         let destination = ChannelDestination::new(subscribers);
 
         info!(
@@ -390,10 +391,15 @@ fn quote_table_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support;
     use etl::config::{
         BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
         TableSyncCopyConfig, TcpKeepaliveConfig, TlsConfig,
     };
+
+    fn backend() -> Arc<PluginStateBackend<PersistedEtlState>> {
+        test_support::state_backend_factory("test_postgres_cdc_source").create()
+    }
 
     fn pipeline_config(publication: &str) -> PipelineConfig {
         PipelineConfig {
@@ -444,12 +450,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn second_table_shares_the_same_pipeline_and_gets_distinct_id() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_table_shares_the_same_pipeline_and_gets_distinct_id() {
         let g = "grp_share";
         let s1 = register(
             g,
             pipeline_config("p"),
+            backend(),
             identity("p"),
             table_spec("public.a"),
             4,
@@ -459,6 +466,7 @@ mod tests {
         let s2 = register(
             g,
             pipeline_config("p"),
+            backend(),
             identity("p"),
             table_spec("public.b"),
             4,
@@ -471,12 +479,13 @@ mod tests {
         s2.shared.deregister(s2.source_id);
     }
 
-    #[test]
-    fn duplicate_table_in_a_group_is_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_table_in_a_group_is_rejected() {
         let g = "grp_dup";
         let _s1 = register(
             g,
             pipeline_config("p"),
+            backend(),
             identity("p"),
             table_spec("public.a"),
             4,
@@ -486,6 +495,7 @@ mod tests {
         let err = register(
             g,
             pipeline_config("p"),
+            backend(),
             identity("p"),
             table_spec("public.a"),
             4,
@@ -495,12 +505,13 @@ mod tests {
         assert!(err.contains("already registered"));
     }
 
-    #[test]
-    fn identity_mismatch_under_same_slot_name_is_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identity_mismatch_under_same_slot_name_is_rejected() {
         let g = "grp_mismatch";
         let _s1 = register(
             g,
             pipeline_config("p"),
+            backend(),
             identity("p"),
             table_spec("public.a"),
             4,
@@ -510,6 +521,7 @@ mod tests {
         let err = register(
             g,
             pipeline_config("q"),
+            backend(),
             identity("q"),
             table_spec("public.b"),
             4,
@@ -519,12 +531,13 @@ mod tests {
         assert!(err.contains("must match"));
     }
 
-    #[test]
-    fn last_deregister_removes_the_group() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn last_deregister_removes_the_group() {
         let g = "grp_refcount";
         let s1 = register(
             g,
             pipeline_config("p"),
+            backend(),
             identity("p"),
             table_spec("public.a"),
             4,

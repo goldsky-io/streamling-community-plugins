@@ -6,9 +6,7 @@
 //! replication-slot group key — sources sharing it share one slot).
 //!
 //! Optional: `port` (5432), `password`, `tls_enabled` (false),
-//! `trusted_root_certs` (PEM), `store_host`/`store_port`/`store_database`/
-//! `store_username`/`store_password` (default: source connection; the store
-//! Postgres gets an `etl` schema created by migrations),
+//! `trusted_root_certs` (PEM),
 //! `batch_max_fill_ms` (1000), `batch_max_bytes` (8 MiB),
 //! `max_table_sync_workers` (4), `batch_size` (1000 envelope rows),
 //! `batch_interval_ms` (100), `max_buffered_units` (8),
@@ -39,9 +37,6 @@ pub const PLUGIN_NAME: &str = "postgres_cdc_source";
 pub const ENV_PREFIX: &str = "STREAMLING__PLUGIN__POSTGRES_CDC_SOURCE";
 
 const DEFAULT_PORT: u16 = 5432;
-
-/// Keys of the optional separate metadata-store connection. All or none.
-const STORE_KEYS: [&str; 3] = ["store_host", "store_database", "store_username"];
 
 /// Stable identity of a shared-slot group: every source sharing a `slot_name`
 /// must agree on these. Derived from the parsed config; compared by value.
@@ -111,22 +106,15 @@ impl ParsedConfig {
     }
 }
 
-/// Builds a connection from `{prefix}host`-style keys, so the replicated
-/// database and the metadata store are configured the same way.
-fn connection(
-    options: &PluginOptions,
-    prefix: &str,
-    tls: TlsConfig,
-) -> Result<PgConnectionConfig, PluginError> {
+/// Builds the replicated-database connection from the `host`-style keys.
+fn connection(options: &PluginOptions, tls: TlsConfig) -> Result<PgConnectionConfig, PluginError> {
     Ok(PgConnectionConfig {
-        host: options.get(&format!("{prefix}host"))?,
+        host: options.get("host")?,
         hostaddr: None,
-        port: options.get_parsed_or(&format!("{prefix}port"), DEFAULT_PORT)?,
-        name: options.get(&format!("{prefix}database"))?,
-        username: options.get(&format!("{prefix}username"))?,
-        password: options
-            .get_secret(&format!("{prefix}password"))
-            .map(Into::into),
+        port: options.get_parsed_or("port", DEFAULT_PORT)?,
+        name: options.get("database")?,
+        username: options.get("username")?,
+        password: options.get_secret("password").map(Into::into),
         tls,
         keepalive: TcpKeepaliveConfig::default(),
     })
@@ -197,28 +185,15 @@ pub fn parse_options(options: &PluginOptions) -> Result<ParsedConfig, PluginErro
         enabled: options.get_parsed_or("tls_enabled", false)?,
     };
 
-    let pg_connection = connection(options, "", tls.clone())?;
-
-    let store_present = STORE_KEYS
-        .iter()
-        .filter(|k| options.lookup(k).is_some())
-        .count();
-    let store_pg_connection = match store_present {
-        0 => None,
-        n if n == STORE_KEYS.len() => Some(connection(options, "store_", tls)?),
-        _ => {
-            return Err(PluginError::Internal(format!(
-                "{PLUGIN_NAME}: {} must be set together",
-                STORE_KEYS.join(", ")
-            )));
-        }
-    };
+    let pg_connection = connection(options, tls)?;
 
     let pipeline = PipelineConfig {
         id: pipeline_id,
         publication_name: options.get("publication_name")?,
         pg_connection,
-        store_pg_connection,
+        // etl state lives in the Streamling state backend (see store.rs); the
+        // built-in Postgres store is never configured.
+        store_pg_connection: None,
         batch: BatchConfig {
             max_fill_ms: options.get_parsed_or("batch_max_fill_ms", 1000u64)?,
             memory_budget_ratio: 0.2,
@@ -401,27 +376,6 @@ mod tests {
         opts.insert("publication_name".into(), "other_pub".into());
         let c = parse(&opts).unwrap().group_identity();
         assert_ne!(a, c);
-    }
-
-    #[test]
-    fn store_options_build_separate_store_connection() {
-        let mut opts = base_options();
-        opts.insert("store_host".into(), "state.example.com".into());
-        opts.insert("store_database".into(), "etl_state".into());
-        opts.insert("store_username".into(), "etl".into());
-        let cfg = parse(&opts).unwrap();
-        let store = cfg.pipeline.store_pg_connection.unwrap();
-        assert_eq!(store.host, "state.example.com");
-        assert_eq!(store.name, "etl_state");
-        assert_eq!(store.port, 5432);
-    }
-
-    #[test]
-    fn partial_store_options_are_an_error() {
-        let mut opts = base_options();
-        opts.insert("store_host".into(), "state.example.com".into());
-        // store_database / store_username missing
-        assert!(parse(&opts).unwrap_err().contains("store_"));
     }
 
     #[test]

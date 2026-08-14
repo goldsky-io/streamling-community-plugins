@@ -135,11 +135,12 @@ row as a delete.
 - `UPDATE`/`DELETE` carry a full old-row image only with
   `ALTER TABLE ... REPLICA IDENTITY FULL`; the default emits key-only images for
   deletes (and unchanged-TOAST columns are null on updates).
-- **Metadata storage:** etl persists replication state (table schemas, sync
-  progress, slot state) in a `PostgresStore`, and installs an `etl` schema
-  (helper functions + a DDL trigger) in the source database on start. By default
-  the store is the source database; set the `store_*` options to keep this
-  bookkeeping elsewhere. (A future version may use Streamling's own state store.)
+- **Metadata storage:** etl's replication state (table schemas, sync progress,
+  slot state) is persisted via Streamling's configured state backend, keyed by
+  `slot_name`. Durability follows that backend: an in-memory backend loses etl
+  state on restart, which re-runs the initial table copy (at-least-once; the
+  replication slot itself persists in Postgres). etl also installs an `etl`
+  schema (helper functions + a DDL trigger) in the source database on start.
 - **Memory backpressure can stall live changes.** etl pauses its replication
   apply stream while *system-wide* memory use exceeds
   `memory_backpressure_activate_threshold` (default 85%), resuming only once it
@@ -195,7 +196,6 @@ environment variables (uppercase key). Env vars take precedence over YAML.
 | `emit_update_before_row` | no | `false` | Precede each update's new image with a `d` row carrying the old image, for sinks that retract prior state. Requires `REPLICA IDENTITY FULL` |
 | `tls_enabled` | no | `false` | Require TLS |
 | `trusted_root_certs` | no | — | PEM-encoded CA bundle |
-| `store_host` / `store_port` / `store_database` / `store_username` / `store_password` | no | source connection | Separate metadata-store database (host/database/username required together; password optional) |
 | `batch_max_fill_ms` | no | `1000` | etl batch fill window |
 | `batch_max_bytes` | no | `8388608` | etl batch byte budget |
 | `max_table_sync_workers` | no | `4` | Parallel initial-copy workers |
