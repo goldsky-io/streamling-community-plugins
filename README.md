@@ -102,6 +102,45 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S2_SOURCE__<KEY>` envi
 | `endpoint` | no | — | Custom S2-compatible endpoint URL (e.g. for s2-lite) |
 | `request_timeout_ms` | no | `5000` | Per-request HTTP timeout (ms) |
 
+### CloudTrail Source (`cloudtrail_source`)
+
+Polls the AWS CloudTrail [LookupEvents API](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_LookupEvents.html)
+and emits management events with an Athena-style typed schema: scalar columns
+(`event_id`, `event_time`, `event_name`, `event_source`, ...) plus raw-JSON
+string columns for nested fields (`user_identity`, `request_parameters`, ...).
+No trail, S3 bucket, or SQS queue to set up — the only requirement is the
+`cloudtrail:LookupEvents` IAM permission. Delivery is at-least-once with a
+checkpointed time watermark; a restart re-emits the `lookback_secs` window —
+see the module docs in [`src/sources/cloudtrail/mod.rs`](src/sources/cloudtrail/mod.rs)
+for details.
+
+LookupEvents limits apply: management events only, 90-day retention, events
+appear with a delivery lag (typically up to 15 minutes), and the 2 req/s
+API budget (shared with the console Event history) caps throughput at roughly
+50 events/s — high-volume accounts need a trail-based integration instead. One
+source covers one region; run one source per region for multi-region coverage.
+
+All YAML options can also be set via `STREAMLING__PLUGIN__CLOUDTRAIL_SOURCE__<KEY>`
+environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `region` | no | SDK chain | AWS region |
+| `endpoint_url` | no | — | Custom endpoint (e.g. LocalStack) |
+| `access_key_id` / `secret_access_key` | no | SDK chain | Static credentials, both-or-neither (env vars preferred); omit to use the default chain |
+| `session_token` | no | — | Session token for temporary static credentials |
+| `start_time` | no | `now` | Where a source with no checkpoint starts: `now`, `earliest` (full 90-day retention), or an RFC 3339 timestamp |
+| `poll_interval_secs` | no | `60` | Delay between poll cycles once caught up |
+| `lookback_secs` | no | `1800` | How far each cycle re-scans behind its watermark to catch late-delivered events; events delivered later than this are lost |
+| `max_window_secs` | no | `3600` | Max span of one poll window (bounds backfill memory); must be > `lookback_secs` |
+| `batch_size` | no | `1024` | Max records per generated Arrow batch |
+| `lookup_attribute_key` / `lookup_attribute_value` | no | — | Server-side filter, both-or-neither; key is one of `EventId`, `EventName`, `ReadOnly`, `Username`, `ResourceType`, `ResourceName`, `EventSource`, `AccessKeyId` (case-insensitive) |
+| `on_malformed` | no | `error` | `error` fails (and retries) the poll cycle on an unparsable event; `skip` drops it with a WARN |
+
+Tip: management events are dominated by reads. Set `lookup_attribute_key: ReadOnly`
+with `lookup_attribute_value: "false"` to keep only mutating API calls and cut
+most of the noise server-side.
+
 ### Postgres CDC Source (`postgres_cdc_source`)
 
 Streams Postgres logical-replication changes (an initial table copy followed by
