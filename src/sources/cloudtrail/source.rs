@@ -83,7 +83,6 @@ struct RunningState {
 }
 
 pub struct CloudTrailSource {
-    /// Kept past construction: initialize() reads the credential secrets.
     opts: PluginOptions,
     config: Arc<CloudTrailSourceConfig>,
     converter: RecordConverter,

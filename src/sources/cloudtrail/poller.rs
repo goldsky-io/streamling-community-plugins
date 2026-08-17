@@ -1,4 +1,4 @@
-//! Background LookupEvents poll task and its pure windowing/dedupe logic.
+//! Background LookupEvents poll task and its pure windowing/dedup logic.
 //!
 //! The poller tails CloudTrail with sliding time windows: each cycle scans
 //! `[watermark − lookback, min(start + max_window, now))`, filters events it
@@ -121,11 +121,11 @@ pub(crate) fn advance_watermark(
 /// ~(lookback + delivery lag) × 100 entries. Not persisted — a restart
 /// re-emits the lookback window (documented at-least-once behavior).
 #[derive(Debug, Default)]
-pub(crate) struct Dedupe {
+pub(crate) struct DedupedEventIds {
     seen: HashMap<String, i64>,
 }
 
-impl Dedupe {
+impl DedupedEventIds {
     pub fn contains(&self, event_id: &str) -> bool {
         self.seen.contains_key(event_id)
     }
@@ -142,10 +142,10 @@ impl Dedupe {
 }
 
 /// Sorts ascending by event time and splits into `batch_size` chunks.
-/// Load-bearing: LookupEvents returns newest-first, and the FIFO
-/// channel + carry means "max delivered event time" is only a true
-/// low-watermark for in-flight events if delivery order is ascending —
-/// checkpoint restart-safety depends on it.
+/// LookupEvents returns newest-first, and the FIFO channel + carry
+/// means "max delivered event time" is only a true low-watermark for
+/// in-flight events if delivery order is ascending - checkpoint
+/// restart-safety depends on it.
 pub(crate) fn sort_into_batches(
     mut records: Vec<CloudTrailRecord>,
     batch_size: usize,
@@ -173,7 +173,7 @@ pub(crate) struct Poller {
 }
 
 /// New records and (for `on_malformed=skip`) the skipped ids from one fully
-/// paginated window. Nothing is committed to the dedupe set until the whole
+/// paginated window. Nothing is committed to the dedup set until the whole
 /// window succeeds: a partial fetch is dropped and re-planned, and marking
 /// its events as seen would turn that retry into data loss.
 struct FetchedWindow {
@@ -187,7 +187,7 @@ impl Poller {
         let max_window_ms = secs_to_ms(self.config.max_window_secs);
         let poll_interval = Duration::from_secs(self.config.poll_interval_secs);
         let mut watermark_ms = self.watermark_ms;
-        let mut dedupe = Dedupe::default();
+        let mut deduped = DedupedEventIds::default();
         let mut error_backoff = ERROR_BACKOFF_MIN;
 
         loop {
@@ -198,16 +198,16 @@ impl Poller {
                 max_window_ms,
                 now_ms(),
             );
-            dedupe.evict_before(window.start_ms);
+            deduped.evict_before(window.start_ms);
 
-            match self.fetch_window(&window, &dedupe).await {
+            match self.fetch_window(&window, &deduped).await {
                 Ok(fetched) => {
                     error_backoff = ERROR_BACKOFF_MIN;
                     for record in &fetched.records {
-                        dedupe.insert(record.event_id.clone(), record.event_time_ms);
+                        deduped.insert(record.event_id.clone(), record.event_time_ms);
                     }
                     for (event_id, event_time_ms) in fetched.skipped {
-                        dedupe.insert(event_id, event_time_ms);
+                        deduped.insert(event_id, event_time_ms);
                     }
                     let max_fetched_ms = fetched.records.iter().map(|r| r.event_time_ms).max();
                     for chunk in sort_into_batches(fetched.records, self.config.batch_size) {
@@ -241,7 +241,7 @@ impl Poller {
     async fn fetch_window(
         &self,
         window: &Window,
-        dedupe: &Dedupe,
+        deduped: &DedupedEventIds,
     ) -> Result<FetchedWindow, String> {
         let mut fetched = FetchedWindow {
             records: Vec::new(),
@@ -281,7 +281,7 @@ impl Poller {
             for event in page.events() {
                 match CloudTrailRecord::from_sdk_event(event) {
                     Ok(record) => {
-                        if dedupe.contains(&record.event_id)
+                        if deduped.contains(&record.event_id)
                             || !window_seen.insert(record.event_id.clone())
                         {
                             self.metrics
@@ -300,7 +300,7 @@ impl Poller {
                         }
                         OnMalformed::Skip => {
                             let already_skipped =
-                                event.event_id().is_some_and(|id| dedupe.contains(id));
+                                event.event_id().is_some_and(|id| deduped.contains(id));
                             if !already_skipped {
                                 warn!(
                                     event_id = ?event.event_id(),
@@ -416,26 +416,26 @@ mod tests {
 
     #[test]
     fn dedupe_filters_repeats_and_evicts_before_cutoff() {
-        let mut dedupe = Dedupe::default();
-        assert!(!dedupe.contains("a"));
-        dedupe.insert("a".to_string(), 100);
-        dedupe.insert("b".to_string(), 200);
-        assert!(dedupe.contains("a"));
-        assert!(dedupe.contains("b"));
+        let mut deduped = DedupedEventIds::default();
+        assert!(!deduped.contains("a"));
+        deduped.insert("a".to_string(), 100);
+        deduped.insert("b".to_string(), 200);
+        assert!(deduped.contains("a"));
+        assert!(deduped.contains("b"));
 
-        dedupe.evict_before(150);
-        assert!(!dedupe.contains("a"));
-        assert!(dedupe.contains("b"), "entries at/after the cutoff survive");
+        deduped.evict_before(150);
+        assert!(!deduped.contains("a"));
+        assert!(deduped.contains("b"), "entries at/after the cutoff survive");
     }
 
     #[test]
     fn evicted_ids_count_as_new_again() {
-        let mut dedupe = Dedupe::default();
-        dedupe.insert("a".to_string(), 100);
-        dedupe.evict_before(200);
-        assert!(!dedupe.contains("a"));
-        dedupe.insert("a".to_string(), 300);
-        assert!(dedupe.contains("a"));
+        let mut deduped = DedupedEventIds::default();
+        deduped.insert("a".to_string(), 100);
+        deduped.evict_before(200);
+        assert!(!deduped.contains("a"));
+        deduped.insert("a".to_string(), 300);
+        assert!(deduped.contains("a"));
     }
 
     fn record(event_id: &str, event_time_ms: i64) -> CloudTrailRecord {
