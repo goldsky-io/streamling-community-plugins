@@ -63,6 +63,7 @@ sha2 = "0.10"
 # pull rustls 0.21 + rustls-webpki 0.101 via `aws-smithy-runtime/tls-rustls`).
 # `default-https-client` keeps modern TLS via `aws-smithy-http-client/rustls-aws-lc`.
 aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cloudtrail = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
