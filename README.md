@@ -49,18 +49,37 @@ All YAML options can also be set via `STREAMLING__PLUGIN__MYSQL_SINK__<KEY>` env
 
 ### SQS Sink (`sqs`)
 
-Sends each row as a JSON message to an AWS SQS queue. Handles SQS 10-message batch limits and retries partial failures.
+Sends rows as JSON messages to an AWS SQS queue. Handles SQS 10-message batch limits, keeps every request within the 256 KiB SQS payload limit, and retries partial failures.
 
 All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
 
-| YAML option | Required | Description |
-|---|---|---|
-| `queue_url` | yes | SQS queue URL |
-| `region` | no | AWS region override |
-| `endpoint_url` | no | Custom SQS endpoint (e.g. LocalStack) |
-| `access_key_id` | no | AWS access key (env var preferred) |
-| `secret_access_key` | no | AWS secret key (env var preferred) |
-| `session_token` | no | STS session token (env var preferred) |
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `queue_url` | yes | — | SQS queue URL |
+| `region` | no | — | AWS region override |
+| `endpoint_url` | no | — | Custom SQS endpoint (e.g. LocalStack) |
+| `access_key_id` | no | — | AWS access key (env var preferred) |
+| `secret_access_key` | no | — | AWS secret key (env var preferred) |
+| `session_token` | no | — | STS session token (env var preferred) |
+| `one_row_per_request` | no | `true` | `true` sends one message per row (`{...}`). `false` packs several rows into one message as a JSON array (`[{...},{...}]`) |
+
+#### Batching rows into one message
+
+With `one_row_per_request: false`, each message body is a JSON array of row objects. Array size follows the batches the sink receives, so pair the flag with the node-level `batch_size` / `batch_flush_interval` — with neither set, the engine skips the rebatch step entirely and arrays are whatever size the upstream batches happen to be.
+
+```yaml
+sinks:
+  sqs_sink:
+    type: sqs
+    from: filtered
+    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/my-queue
+    region: us-east-1
+    one_row_per_request: false
+    batch_size: 100
+    batch_flush_interval: 5s
+```
+
+Arrays are additionally capped by the 256 KiB SQS payload limit, so a large `batch_size` can still be split across several messages. A single row that exceeds that limit on its own fails the batch rather than being dropped or truncated.
 
 Example pipeline: [`examples/pipeline-sqs-sink.yaml`](examples/pipeline-sqs-sink.yaml)
 

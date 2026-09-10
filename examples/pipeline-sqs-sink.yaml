@@ -34,3 +34,10 @@ sinks:
     # Prefer env vars over YAML for real credentials:
     #   STREAMLING__PLUGIN__SQS_SINK__ACCESS_KEY_ID
     #   STREAMLING__PLUGIN__SQS_SINK__SECRET_ACCESS_KEY
+    #
+    # Send a JSON array of rows per message instead of one message per row.
+    # Array size follows the node-level batch settings; without them the arrays
+    # are whatever size the upstream batches happen to be.
+    # one_row_per_request: false
+    # batch_size: 100
+    # batch_flush_interval: 5s
