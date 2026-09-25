@@ -80,7 +80,7 @@ struct Inner {
     refcount: usize,
     subs: Vec<PendingSub>,
     started: bool,
-    shutdown: Option<etl::concurrency::ShutdownTx>,
+    pipeline: Option<Arc<Pipeline<StreamlingStore, ChannelDestination>>>,
 }
 
 /// The table a source contributes to its group, and how its rows are shaped.
@@ -129,7 +129,7 @@ pub fn register(
                         refcount: 0,
                         subs: Vec::new(),
                         started: false,
-                        shutdown: None,
+                        pipeline: None,
                     }),
                     running: Arc::new(AtomicBool::new(true)),
                 });
@@ -233,9 +233,10 @@ impl SharedPipeline {
             .start()
             .await
             .map_err(|e| format!("etl pipeline start: {e}"))?;
+        let pipeline = Arc::new(pipeline);
         {
             let mut inner = self.inner.lock().expect("shared inner poisoned");
-            inner.shutdown = Some(pipeline.shutdown_tx());
+            inner.pipeline = Some(pipeline.clone());
         }
 
         let running = self.running.clone();
@@ -259,8 +260,8 @@ impl SharedPipeline {
         };
         if last {
             let mut inner = self.inner.lock().expect("shared inner poisoned");
-            if let Some(shutdown) = inner.shutdown.take() {
-                let _ = shutdown.shutdown();
+            if let Some(pipeline) = inner.pipeline.take() {
+                pipeline.shutdown();
             }
             registry()
                 .lock()
@@ -429,6 +430,10 @@ mod tests {
             table_sync_copy: TableSyncCopyConfig::default(),
             invalidated_slot_behavior: InvalidatedSlotBehavior::default(),
             max_copy_connections_per_table: PipelineConfig::DEFAULT_MAX_COPY_CONNECTIONS_PER_TABLE,
+            table_sync_monitor_refresh_interval_ms:
+                PipelineConfig::DEFAULT_TABLE_SYNC_MONITOR_REFRESH_INTERVAL_MS,
+            replication_slot: Default::default(),
+            run_source_migrations: true,
         }
     }
 

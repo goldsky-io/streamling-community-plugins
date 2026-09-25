@@ -30,6 +30,7 @@ use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
     PipelineConfig, TableSyncCopyConfig, TcpKeepaliveConfig, TlsConfig,
 };
+use etl_config::shared::{ReplicationSlotConfig, Validate};
 use sha2::{Digest, Sha256};
 use streamling_plugin::PluginError;
 
@@ -205,8 +206,14 @@ pub fn parse_options(options: &PluginOptions) -> Result<ParsedConfig, PluginErro
         memory_refresh_interval_ms: 100,
         memory_backpressure: parse_memory_backpressure(options)?,
         table_sync_copy: TableSyncCopyConfig::default(),
+        table_sync_monitor_refresh_interval_ms:
+            PipelineConfig::DEFAULT_TABLE_SYNC_MONITOR_REFRESH_INTERVAL_MS,
         invalidated_slot_behavior: InvalidatedSlotBehavior::default(),
-        max_copy_connections_per_table: PipelineConfig::DEFAULT_MAX_COPY_CONNECTIONS_PER_TABLE,
+        // Pinned at etl's former default; its new default (4) doubles copy
+        // load on the source database.
+        max_copy_connections_per_table: 2,
+        replication_slot: ReplicationSlotConfig::default(),
+        run_source_migrations: true,
     };
 
     let (table_schema, table_name) = parse_table(&options.get("table")?)?;

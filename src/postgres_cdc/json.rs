@@ -2,12 +2,45 @@
 //!
 //! Mapping: ints/floats/bools native JSON; `Numeric` as decimal string
 //! (exactness over convenience); `Bytes` as base64; timestamps RFC3339;
-//! `Date`/`Time` ISO-8601 strings; `Uuid` string; `Json` passthrough;
-//! arrays as JSON arrays with null elements preserved.
+//! `Date`/`Time` ISO-8601 strings (`infinity`/`-infinity` and `24:00:00`
+//! as Postgres spells them); `Uuid` string; `Json` passthrough; arrays as
+//! JSON arrays with null elements preserved.
 
 use base64::Engine;
-use etl::types::{ArrayCell, Cell};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use etl::data::{ArrayCell, Cell, Date, PgTime, Timestamp};
 use serde_json::{Value, json};
+
+fn date_json(d: &Date<NaiveDate>) -> Value {
+    match d {
+        Date::Value(d) => json!(d.format("%Y-%m-%d").to_string()),
+        Date::PosInfinity => json!("infinity"),
+        Date::NegInfinity => json!("-infinity"),
+    }
+}
+
+fn time_json(t: &PgTime) -> Value {
+    match t {
+        PgTime::Value(t) => json!(t.format("%H:%M:%S%.6f").to_string()),
+        PgTime::EndOfDay => json!("24:00:00.000000"),
+    }
+}
+
+fn timestamp_json(ts: &Timestamp<NaiveDateTime>) -> Value {
+    match ts {
+        Timestamp::Value(ts) => json!(ts.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()),
+        Timestamp::PosInfinity => json!("infinity"),
+        Timestamp::NegInfinity => json!("-infinity"),
+    }
+}
+
+fn timestamptz_json(ts: &Timestamp<DateTime<Utc>>) -> Value {
+    match ts {
+        Timestamp::Value(ts) => json!(ts.to_rfc3339()),
+        Timestamp::PosInfinity => json!("infinity"),
+        Timestamp::NegInfinity => json!("-infinity"),
+    }
+}
 
 pub fn cell_to_json(cell: &Cell) -> Value {
     match cell {
@@ -21,10 +54,11 @@ pub fn cell_to_json(cell: &Cell) -> Value {
         Cell::F32(v) => json!(v),
         Cell::F64(v) => json!(v),
         Cell::Numeric(n) => json!(n.to_string()),
-        Cell::Date(d) => json!(d.format("%Y-%m-%d").to_string()),
-        Cell::Time(t) => json!(t.format("%H:%M:%S%.6f").to_string()),
-        Cell::Timestamp(ts) => json!(ts.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()),
-        Cell::TimestampTz(ts) => json!(ts.to_rfc3339()),
+        Cell::Date(d) => date_json(d),
+        Cell::Time(t) => time_json(t),
+        Cell::TimeTz(t) => json!(t.to_string()),
+        Cell::Timestamp(ts) => timestamp_json(ts),
+        Cell::TimestampTz(ts) => timestamptz_json(ts),
         Cell::Uuid(u) => json!(u.to_string()),
         Cell::Json(v) => v.clone(),
         Cell::Bytes(b) => json!(base64::engine::general_purpose::STANDARD.encode(b)),
@@ -52,12 +86,11 @@ fn array_to_json(arr: &ArrayCell) -> Value {
         ArrayCell::F32(v) => map(v, |x| json!(x)),
         ArrayCell::F64(v) => map(v, |x| json!(x)),
         ArrayCell::Numeric(v) => map(v, |n| json!(n.to_string())),
-        ArrayCell::Date(v) => map(v, |d| json!(d.format("%Y-%m-%d").to_string())),
-        ArrayCell::Time(v) => map(v, |t| json!(t.format("%H:%M:%S%.6f").to_string())),
-        ArrayCell::Timestamp(v) => map(v, |ts| {
-            json!(ts.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
-        }),
-        ArrayCell::TimestampTz(v) => map(v, |ts| json!(ts.to_rfc3339())),
+        ArrayCell::Date(v) => map(v, date_json),
+        ArrayCell::Time(v) => map(v, time_json),
+        ArrayCell::TimeTz(v) => map(v, |t| json!(t.to_string())),
+        ArrayCell::Timestamp(v) => map(v, timestamp_json),
+        ArrayCell::TimestampTz(v) => map(v, timestamptz_json),
         ArrayCell::Uuid(v) => map(v, |u| json!(u.to_string())),
         ArrayCell::Json(v) => map(v, |j| j.clone()),
         ArrayCell::Bytes(v) => map(v, |b| {
@@ -92,21 +125,47 @@ mod tests {
     #[test]
     fn temporal_types_map_to_iso_strings() {
         let d = NaiveDate::from_ymd_opt(2026, 6, 11).unwrap();
-        assert_eq!(cell_to_json(&Cell::Date(d)), json!("2026-06-11"));
+        assert_eq!(
+            cell_to_json(&Cell::Date(Date::Value(d))),
+            json!("2026-06-11")
+        );
 
         let t = NaiveTime::from_hms_micro_opt(1, 2, 3, 500).unwrap();
-        assert_eq!(cell_to_json(&Cell::Time(t)), json!("01:02:03.000500"));
+        assert_eq!(
+            cell_to_json(&Cell::Time(PgTime::Value(t))),
+            json!("01:02:03.000500")
+        );
 
         let ndt = d.and_time(t);
         assert_eq!(
-            cell_to_json(&Cell::Timestamp(ndt)),
+            cell_to_json(&Cell::Timestamp(Timestamp::Value(ndt))),
             json!("2026-06-11T01:02:03.000500")
         );
 
         let tz = Utc.with_ymd_and_hms(2026, 6, 11, 1, 2, 3).unwrap();
         assert_eq!(
-            cell_to_json(&Cell::TimestampTz(tz)),
+            cell_to_json(&Cell::TimestampTz(Timestamp::Value(tz))),
             json!("2026-06-11T01:02:03+00:00")
+        );
+    }
+
+    #[test]
+    fn special_temporal_values_use_postgres_literals() {
+        assert_eq!(
+            cell_to_json(&Cell::Date(Date::PosInfinity)),
+            json!("infinity")
+        );
+        assert_eq!(
+            cell_to_json(&Cell::Timestamp(Timestamp::NegInfinity)),
+            json!("-infinity")
+        );
+        assert_eq!(
+            cell_to_json(&Cell::TimestampTz(Timestamp::PosInfinity)),
+            json!("infinity")
+        );
+        assert_eq!(
+            cell_to_json(&Cell::Time(PgTime::EndOfDay)),
+            json!("24:00:00.000000")
         );
     }
 

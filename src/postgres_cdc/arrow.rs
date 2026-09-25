@@ -20,7 +20,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
-use etl::types::Cell;
+use etl::data::{Cell, Date, PgTime, Timestamp};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -73,6 +73,18 @@ fn cell_to_utf8(cell: &Cell) -> String {
 }
 
 const UNIX_EPOCH_DAYS: i32 = 719_163; // days from CE to 1970-01-01
+
+/// Postgres `±infinity` dates/timestamps have no Arrow encoding.
+fn append_infinite_null<T: arrow::datatypes::ArrowPrimitiveType>(
+    b: &mut arrow::array::PrimitiveBuilder<T>,
+    name: &str,
+) {
+    warn!(
+        column = name,
+        "postgres_cdc: infinite date/timestamp has no Arrow representation; appending null"
+    );
+    b.append_null();
+}
 
 impl ColBuilder {
     fn new(dt: &DataType) -> Result<Self, ArrowError> {
@@ -127,15 +139,25 @@ impl ColBuilder {
             (Self::F64(b), Cell::F32(v)) => b.append_value(f64::from(*v)),
             (Self::Utf8(b), cell) => b.append_value(cell_to_utf8(cell)),
             (Self::Bin(b), Cell::Bytes(v)) => b.append_value(v),
-            (Self::Date(b), Cell::Date(d)) => {
-                b.append_value(d.num_days_from_ce() - UNIX_EPOCH_DAYS)
-            }
-            (Self::Time(b), Cell::Time(t)) => b.append_value(
-                i64::from(t.num_seconds_from_midnight()) * 1_000_000
-                    + i64::from(t.nanosecond() / 1_000),
-            ),
-            (Self::Ts(b), Cell::Timestamp(ts)) => b.append_value(ts.and_utc().timestamp_micros()),
-            (Self::TsTz(b), Cell::TimestampTz(ts)) => b.append_value(ts.timestamp_micros()),
+            (Self::Date(b), Cell::Date(d)) => match d {
+                Date::Value(d) => b.append_value(d.num_days_from_ce() - UNIX_EPOCH_DAYS),
+                _ => append_infinite_null(b, name),
+            },
+            (Self::Time(b), Cell::Time(t)) => b.append_value(match t {
+                PgTime::Value(t) => {
+                    i64::from(t.num_seconds_from_midnight()) * 1_000_000
+                        + i64::from(t.nanosecond() / 1_000)
+                }
+                PgTime::EndOfDay => 86_400 * 1_000_000,
+            }),
+            (Self::Ts(b), Cell::Timestamp(ts)) => match ts {
+                Timestamp::Value(ts) => b.append_value(ts.and_utc().timestamp_micros()),
+                _ => append_infinite_null(b, name),
+            },
+            (Self::TsTz(b), Cell::TimestampTz(ts)) => match ts {
+                Timestamp::Value(ts) => b.append_value(ts.timestamp_micros()),
+                _ => append_infinite_null(b, name),
+            },
             (builder, cell) => {
                 warn!(
                     column = name,
@@ -226,7 +248,7 @@ mod tests {
         Array, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
-    use etl::types::Type;
+    use etl::schema::Type;
 
     fn schema() -> SchemaRef {
         Arc::new(
@@ -271,8 +293,8 @@ mod tests {
                     Some(Cell::I64(1)),
                     Some(Cell::String("ada".into())),
                     Some(Cell::Bool(true)),
-                    Some(Cell::Date(born)),
-                    Some(Cell::TimestampTz(seen)),
+                    Some(Cell::Date(Date::Value(born))),
+                    Some(Cell::TimestampTz(Timestamp::Value(seen))),
                     Some(Cell::String("12.50".into())),
                 ],
             },

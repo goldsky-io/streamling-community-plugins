@@ -12,7 +12,7 @@
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use etl::config::PgConnectionConfig;
-use etl::types::Type;
+use etl::schema::Type;
 use secrecy::ExposeSecret;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use std::time::Duration;
