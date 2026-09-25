@@ -8,7 +8,7 @@
 //! Units never released before a covering checkpoint finalizes ⇒ etl never
 //! advances `confirmed_flush_lsn` past streamling's durable checkpoint.
 
-use etl::destination::async_result::AsyncResult;
+use etl::destination::{DestinationWriteStatus, WriteEventsResult};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -71,14 +71,14 @@ impl<A> AckLedger<A> {
 pub type SourceId = u64;
 
 /// The terminal etl ack, abstracted so [`SharedAck`] is unit-testable without
-/// an `AsyncResult` (which has no public constructor).
+/// an etl async result (which has no public constructor).
 pub trait FinalAck: Send {
     fn send_ok(self);
 }
 
-impl FinalAck for AsyncResult<()> {
+impl FinalAck for WriteEventsResult {
     fn send_ok(self) {
-        self.send(Ok(()));
+        self.send(Ok(DestinationWriteStatus::Durable));
     }
 }
 
@@ -87,7 +87,7 @@ impl FinalAck for AsyncResult<()> {
 /// (i.e. durably checkpointed past it), so a shared slot's confirmed_flush_lsn
 /// never advances past the slowest subscriber. Constructed with an empty
 /// subscriber set, it fires immediately.
-pub struct SharedAck<A: FinalAck = AsyncResult<()>> {
+pub struct SharedAck<A: FinalAck = WriteEventsResult> {
     inner: Mutex<SharedAckInner<A>>,
 }
 
