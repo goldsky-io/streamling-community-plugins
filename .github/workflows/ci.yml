@@ -14,7 +14,7 @@ on:
 # Streamling release whose prebuilt binary + k3s setup scripts the e2e tests run
 # against. Bump in lockstep with the streamling-e2e dependency in Cargo.toml.
 env:
-  STREAMLING_VERSION: v0.1.0
+  STREAMLING_VERSION: v0.4.0
 
 jobs:
   validate-and-test:
