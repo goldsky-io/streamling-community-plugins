@@ -8,7 +8,7 @@
 //! One aggregate value per slot-sharing group, stored under a fixed prefix so
 //! every source in the group resolves the same physical key regardless of its
 //! own reference name. Writes serialize the whole snapshot — metadata is KBs,
-//! and the hot write (`upsert_replication_progress`) fires per flush cycle,
+//! and the hot write (`upsert_replication_checkpoint`) fires per flush cycle,
 //! not per row.
 //!
 //! etl's `Pipeline::start()` calls the `load_*` methods once before workers
@@ -19,21 +19,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use etl::destination::{DestinationTableMetadata, DestinationTableSchema};
 use etl::error::{ErrorKind, EtlError, EtlResult};
 use etl::etl_error;
-use etl::replication::WorkerType;
-use etl::state::{
-    AppliedDestinationTableMetadata, DestinationTableMetadata, DestinationTableSchemaStatus,
-    TableState,
+use etl::schema::{
+    ColumnSchema, PgLsn, ReplicationMask, SnapshotId, TableId, TableName, TableSchema, Type,
 };
-use etl::store::lifecycle::{TableStateLifecycleStore, TableStateOperation};
-use etl::store::schema::{SchemaStore, TableSchemaRetention};
-use etl::store::state::{StateStore, TableStates};
-use etl::types::{
-    ColumnSchema, PgLsn, ReplicationMask, SnapshotId, TableId, TableName, TableSchema,
-    convert_type_oid_to_type,
+use etl::store::{
+    SchemaStore, StateStore, TableState, TableStateLifecycleStore, TableStateOperation,
+    TableStates, WorkerType,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use streamling_plugin::api::PluginStateBackend;
 use tokio::sync::Mutex;
 
@@ -67,7 +63,8 @@ struct PersistedTableSchema {
     table_id: u32,
     schema: String,
     name: String,
-    snapshot_id: u64,
+    #[serde(with = "snapshot_id_serde")]
+    snapshot_id: SnapshotId,
     columns: Vec<PersistedColumn>,
 }
 
@@ -79,16 +76,73 @@ struct PersistedColumn {
     ordinal_position: i32,
     primary_key_ordinal_position: Option<i32>,
     nullable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_expression: Option<String>,
 }
 
+/// `applied = false` with no previous endpoint is `Creating`; with one it is
+/// `Applying`, which needs the previous mask (absent in rows written before
+/// etl tracked it — those cannot be recovered and fail the load, as in etl's
+/// `PostgresStore`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PersistedDestinationMetadata {
     table_id: u32,
     destination_table_id: String,
-    snapshot_id: u64,
-    previous_snapshot_id: Option<u64>,
+    #[serde(with = "snapshot_id_serde")]
+    snapshot_id: SnapshotId,
+    #[serde(with = "snapshot_id_serde::option")]
+    previous_snapshot_id: Option<SnapshotId>,
     applied: bool,
     replication_mask: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_replication_mask: Option<Vec<u8>>,
+}
+
+/// Snapshot ids persist as etl's `commit_lsn:message_lsn` string. A bare
+/// integer is the pre-composite message-LSN-only format and loads as `M:M`,
+/// the same migration etl applies to its own store, preserving every ordering
+/// against WAL checkpoints.
+mod snapshot_id_serde {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Composite(String),
+        Legacy(u64),
+    }
+
+    fn from_repr<E: serde::de::Error>(repr: Repr) -> Result<SnapshotId, E> {
+        match repr {
+            Repr::Composite(s) => s.parse().map_err(E::custom),
+            Repr::Legacy(lsn) => Ok(SnapshotId::new(PgLsn::from(lsn), PgLsn::from(lsn))),
+        }
+    }
+
+    pub fn serialize<S: Serializer>(id: &SnapshotId, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(id)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SnapshotId, D::Error> {
+        from_repr(Repr::deserialize(d)?)
+    }
+
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(id: &Option<SnapshotId>, s: S) -> Result<S::Ok, S::Error> {
+            match id {
+                Some(id) => s.collect_str(id),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            d: D,
+        ) -> Result<Option<SnapshotId>, D::Error> {
+            Option::<Repr>::deserialize(d)?.map(from_repr).transpose()
+        }
+    }
 }
 
 /// Live cache, shaped like etl's `MemoryStore`.
@@ -99,7 +153,7 @@ struct Inner {
     /// Schema versions keyed first by table and then by snapshot.
     table_schemas: BTreeMap<TableId, BTreeMap<SnapshotId, Arc<TableSchema>>>,
     destination_tables_metadata: BTreeMap<TableId, DestinationTableMetadata>,
-    replication_progress: HashMap<WorkerType, PgLsn>,
+    replication_checkpoints: HashMap<WorkerType, PgLsn>,
 }
 
 /// etl `PipelineStore` implementation persisting via a Streamling state
@@ -139,7 +193,7 @@ impl StreamlingStore {
 
     /// Replaces the whole cache from the backend (missing value = empty
     /// state). Called by each `load_*`; idempotent, and also restores
-    /// `replication_progress`, which has no `load_*` of its own.
+    /// replication checkpoints, which has no `load_*` of its own.
     async fn hydrate(&self) -> EtlResult<()> {
         let persisted = self
             .backend
@@ -147,7 +201,7 @@ impl StreamlingStore {
             .await
             .map_err(backend_error)?
             .unwrap_or_default();
-        *self.inner.lock().await = from_persisted(persisted);
+        *self.inner.lock().await = from_persisted(persisted)?;
         Ok(())
     }
 }
@@ -196,7 +250,7 @@ fn to_persisted(inner: &Inner) -> PersistedEtlState {
             table_id: schema.id.into_inner(),
             schema: schema.name.schema.clone(),
             name: schema.name.name.clone(),
-            snapshot_id: schema.snapshot_id.as_u64(),
+            snapshot_id: schema.snapshot_id,
             columns: schema
                 .column_schemas
                 .iter()
@@ -207,6 +261,7 @@ fn to_persisted(inner: &Inner) -> PersistedEtlState {
                     ordinal_position: column.ordinal_position,
                     primary_key_ordinal_position: column.primary_key_ordinal_position,
                     nullable: column.nullable,
+                    default_expression: column.default_expression.clone(),
                 })
                 .collect(),
         })
@@ -215,18 +270,33 @@ fn to_persisted(inner: &Inner) -> PersistedEtlState {
     let destination_tables_metadata = inner
         .destination_tables_metadata
         .iter()
-        .map(|(table_id, metadata)| PersistedDestinationMetadata {
-            table_id: table_id.into_inner(),
-            destination_table_id: metadata.destination_table_id.clone(),
-            snapshot_id: metadata.snapshot_id.as_u64(),
-            previous_snapshot_id: metadata.previous_snapshot_id.map(SnapshotId::as_u64),
-            applied: metadata.is_applied(),
-            replication_mask: metadata.replication_mask.to_bytes(),
+        .map(|(table_id, metadata)| {
+            let (previous_snapshot_id, previous_replication_mask) = match metadata.table_schema() {
+                DestinationTableSchema::Applying {
+                    previous_snapshot_id,
+                    previous_replication_mask,
+                    ..
+                } => (
+                    Some(*previous_snapshot_id),
+                    Some(previous_replication_mask.to_bytes()),
+                ),
+                DestinationTableSchema::Creating { .. }
+                | DestinationTableSchema::Applied { .. } => (None, None),
+            };
+            PersistedDestinationMetadata {
+                table_id: table_id.into_inner(),
+                destination_table_id: metadata.table_id().to_string(),
+                snapshot_id: metadata.snapshot_id(),
+                previous_snapshot_id,
+                applied: metadata.is_applied(),
+                replication_mask: metadata.replication_mask().to_bytes(),
+                previous_replication_mask,
+            }
         })
         .collect();
 
     let replication_progress = inner
-        .replication_progress
+        .replication_checkpoints
         .iter()
         .map(|(worker, lsn)| {
             let table_oid = match worker {
@@ -245,7 +315,7 @@ fn to_persisted(inner: &Inner) -> PersistedEtlState {
     }
 }
 
-fn from_persisted(persisted: PersistedEtlState) -> Inner {
+fn from_persisted(persisted: PersistedEtlState) -> EtlResult<Inner> {
     let mut inner = Inner::default();
 
     for entry in persisted.table_states {
@@ -258,19 +328,21 @@ fn from_persisted(persisted: PersistedEtlState) -> Inner {
 
     for schema in persisted.table_schemas {
         let table_id = TableId::new(schema.table_id);
-        let snapshot_id = SnapshotId::from(schema.snapshot_id);
+        let snapshot_id = schema.snapshot_id;
         let columns = schema
             .columns
             .into_iter()
             .map(|column| {
                 ColumnSchema::new(
                     column.name,
-                    convert_type_oid_to_type(column.type_oid),
+                    // Same unknown-OID fallback etl uses when decoding relations.
+                    Type::from_oid(column.type_oid).unwrap_or(Type::TEXT),
                     column.modifier,
                     column.ordinal_position,
-                    column.primary_key_ordinal_position,
                     column.nullable,
                 )
+                .with_primary_key_ordinal_position(column.primary_key_ordinal_position)
+                .with_default_expression_option(column.default_expression)
             })
             .collect();
         let table_schema = TableSchema::with_snapshot_id(
@@ -288,20 +360,39 @@ fn from_persisted(persisted: PersistedEtlState) -> Inner {
 
     for metadata in persisted.destination_tables_metadata {
         let table_id = TableId::new(metadata.table_id);
-        inner.destination_tables_metadata.insert(
-            table_id,
-            DestinationTableMetadata {
-                destination_table_id: metadata.destination_table_id,
-                snapshot_id: SnapshotId::from(metadata.snapshot_id),
-                previous_snapshot_id: metadata.previous_snapshot_id.map(SnapshotId::from),
-                schema_status: if metadata.applied {
-                    DestinationTableSchemaStatus::Applied
-                } else {
-                    DestinationTableSchemaStatus::Applying
-                },
-                replication_mask: ReplicationMask::from_bytes(metadata.replication_mask),
-            },
-        );
+        let mask = ReplicationMask::from_bytes(metadata.replication_mask);
+        let id = metadata.destination_table_id;
+        let destination_metadata = match (
+            metadata.applied,
+            metadata.previous_snapshot_id,
+            metadata.previous_replication_mask,
+        ) {
+            (true, _, _) => DestinationTableMetadata::new_applied(id, metadata.snapshot_id, mask),
+            (false, None, _) => {
+                DestinationTableMetadata::new_creating(id, metadata.snapshot_id, mask)
+            }
+            (false, Some(previous_snapshot_id), Some(previous_mask)) => {
+                DestinationTableMetadata::new_applied(
+                    id,
+                    previous_snapshot_id,
+                    ReplicationMask::from_bytes(previous_mask),
+                )
+                .with_schema_change(metadata.snapshot_id, mask)?
+            }
+            (false, Some(_), None) => {
+                return Err(etl_error!(
+                    ErrorKind::InvalidState,
+                    "Destination table metadata has an invalid schema endpoint",
+                    format!(
+                        "table '{id}' is mid schema change without a previous replication \
+                         mask; resynchronize the table"
+                    )
+                ));
+            }
+        };
+        inner
+            .destination_tables_metadata
+            .insert(table_id, destination_metadata);
     }
 
     for (table_oid, lsn) in persisted.replication_progress {
@@ -311,10 +402,12 @@ fn from_persisted(persisted: PersistedEtlState) -> Inner {
                 table_id: TableId::new(oid),
             },
         };
-        inner.replication_progress.insert(worker, PgLsn::from(lsn));
+        inner
+            .replication_checkpoints
+            .insert(worker, PgLsn::from(lsn));
     }
 
-    inner
+    Ok(inner)
 }
 
 impl StateStore for StreamlingStore {
@@ -370,19 +463,22 @@ impl StateStore for StreamlingStore {
         .await
     }
 
-    async fn get_replication_progress(&self, worker_type: WorkerType) -> EtlResult<Option<PgLsn>> {
+    async fn get_replication_checkpoint(
+        &self,
+        worker_type: WorkerType,
+    ) -> EtlResult<Option<PgLsn>> {
         let inner = self.inner.lock().await;
-        Ok(inner.replication_progress.get(&worker_type).copied())
+        Ok(inner.replication_checkpoints.get(&worker_type).copied())
     }
 
-    async fn upsert_replication_progress(
+    async fn upsert_replication_checkpoint(
         &self,
         worker_type: WorkerType,
         flush_lsn: PgLsn,
     ) -> EtlResult<PgLsn> {
         self.mutate(move |inner| {
             let stored_lsn = inner
-                .replication_progress
+                .replication_checkpoints
                 .entry(worker_type)
                 .and_modify(|stored_lsn| {
                     if flush_lsn > *stored_lsn {
@@ -395,9 +491,9 @@ impl StateStore for StreamlingStore {
         .await
     }
 
-    async fn delete_replication_progress(&self, worker_type: WorkerType) -> EtlResult<()> {
+    async fn delete_replication_checkpoint(&self, worker_type: WorkerType) -> EtlResult<()> {
         self.mutate(move |inner| {
-            inner.replication_progress.remove(&worker_type);
+            inner.replication_checkpoints.remove(&worker_type);
             Ok(())
         })
         .await
@@ -409,19 +505,6 @@ impl StateStore for StreamlingStore {
     ) -> EtlResult<Option<DestinationTableMetadata>> {
         let inner = self.inner.lock().await;
         Ok(inner.destination_tables_metadata.get(&table_id).cloned())
-    }
-
-    async fn get_applied_destination_table_metadata(
-        &self,
-        table_id: TableId,
-    ) -> EtlResult<Option<AppliedDestinationTableMetadata>> {
-        let inner = self.inner.lock().await;
-        inner
-            .destination_tables_metadata
-            .get(&table_id)
-            .cloned()
-            .map(DestinationTableMetadata::into_applied)
-            .transpose()
     }
 
     async fn load_destination_tables_metadata(&self) -> EtlResult<usize> {
@@ -491,18 +574,17 @@ impl SchemaStore for StreamlingStore {
 
     async fn prune_table_schemas(
         &self,
-        table_schema_retentions: HashMap<TableId, TableSchemaRetention>,
+        retention_snapshot_ids: BTreeMap<TableId, SnapshotId>,
     ) -> EtlResult<u64> {
         self.mutate(move |inner| {
             let mut removed_count = 0u64;
             for (table_id, snapshots) in &mut inner.table_schemas {
-                let Some(retention) = table_schema_retentions.get(table_id) else {
+                let Some(&retention_snapshot_id) = retention_snapshot_ids.get(table_id) else {
                     continue;
                 };
-                // Keep the newest snapshot <= the retention LSN and everything
+                // Keep the newest snapshot <= the retention point and everything
                 // newer; skip the table if none qualifies (Postgres may replay
                 // versions newer than the retention point).
-                let retention_snapshot_id = SnapshotId::from(retention.to_lsn());
                 let Some(retained_snapshot_id) = snapshots
                     .keys()
                     .rfind(|snapshot_id| **snapshot_id <= retention_snapshot_id)
@@ -530,7 +612,7 @@ impl TableStateLifecycleStore for StreamlingStore {
                 inner.table_schemas.remove(&table_id);
                 inner.destination_tables_metadata.remove(&table_id);
                 inner
-                    .replication_progress
+                    .replication_checkpoints
                     .remove(&WorkerType::TableSync { table_id });
                 Ok(0)
             }
@@ -547,7 +629,7 @@ impl TableStateLifecycleStore for StreamlingStore {
                     }
                     inner.table_states.insert(table_id, TableState::Init);
                 }
-                inner.replication_progress.remove(&WorkerType::Apply);
+                inner.replication_checkpoints.remove(&WorkerType::Apply);
                 Ok(reset_count)
             }
             TableStateOperation::Delete { table_id } => {
@@ -557,7 +639,7 @@ impl TableStateLifecycleStore for StreamlingStore {
                 inner.table_schemas.remove(&table_id);
                 inner.destination_tables_metadata.remove(&table_id);
                 inner
-                    .replication_progress
+                    .replication_checkpoints
                     .remove(&WorkerType::TableSync { table_id });
                 Ok(affected_table_count)
             }
@@ -570,12 +652,16 @@ impl TableStateLifecycleStore for StreamlingStore {
 mod tests {
     use super::*;
     use crate::utils::test_support;
-    use etl::types::Type;
 
     fn backend() -> Arc<PluginStateBackend<PersistedEtlState>> {
         // The InMemory backend returns a fresh map per create(), so restart
         // tests must reuse ONE handle across two store instances.
         test_support::state_backend_factory("test_postgres_cdc_store").create()
+    }
+
+    /// Snapshot id as the pre-composite format migrates it (`M:M`).
+    fn snap(lsn: u64) -> SnapshotId {
+        SnapshotId::new(PgLsn::from(lsn), PgLsn::from(lsn))
     }
 
     fn test_schema(table_id: TableId, snapshot_id: u64) -> TableSchema {
@@ -586,10 +672,10 @@ mod tests {
                 format!("table_{}", table_id.into_inner()),
             ),
             vec![
-                ColumnSchema::new("id".to_string(), Type::INT8, -1, 1, Some(1), false),
-                ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, None, true),
+                ColumnSchema::new("id".to_string(), Type::INT8, -1, 1, false).with_primary_key(1),
+                ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, true),
             ],
-            SnapshotId::from(snapshot_id),
+            snap(snapshot_id),
         )
     }
 
@@ -612,6 +698,7 @@ mod tests {
                 table,
                 TableState::SyncDone {
                     lsn: PgLsn::from(42),
+                    table_decoding_state: None,
                 },
             )
             .await
@@ -620,23 +707,27 @@ mod tests {
             .store_table_schema(test_schema(table, 7))
             .await
             .unwrap();
-        let metadata = DestinationTableMetadata {
-            destination_table_id: "dest.users".to_string(),
-            snapshot_id: SnapshotId::from(7),
-            previous_snapshot_id: Some(SnapshotId::from(3)),
-            schema_status: DestinationTableSchemaStatus::Applying,
-            replication_mask: ReplicationMask::from_bytes(vec![1, 0]),
-        };
+        // Mid schema change: both endpoints must survive the restart.
+        let metadata = DestinationTableMetadata::new_applied(
+            "dest.users".to_string(),
+            snap(3),
+            ReplicationMask::from_bytes(vec![1, 1]),
+        )
+        .with_schema_change(snap(7), ReplicationMask::from_bytes(vec![1, 0]))
+        .unwrap();
         store
             .store_destination_table_metadata(table, metadata.clone())
             .await
             .unwrap();
         store
-            .upsert_replication_progress(WorkerType::Apply, PgLsn::from(100))
+            .upsert_replication_checkpoint(WorkerType::Apply, PgLsn::from(100))
             .await
             .unwrap();
         store
-            .upsert_replication_progress(WorkerType::TableSync { table_id: table }, PgLsn::from(50))
+            .upsert_replication_checkpoint(
+                WorkerType::TableSync { table_id: table },
+                PgLsn::from(50),
+            )
             .await
             .unwrap();
 
@@ -652,11 +743,12 @@ mod tests {
         assert_eq!(
             restarted.get_table_state(table).await.unwrap(),
             Some(TableState::SyncDone {
-                lsn: PgLsn::from(42)
+                lsn: PgLsn::from(42),
+                table_decoding_state: None,
             })
         );
         let schema = restarted
-            .get_table_schema(&table, SnapshotId::from(7))
+            .get_table_schema(&table, snap(7))
             .await
             .unwrap()
             .expect("schema restored");
@@ -676,24 +768,16 @@ mod tests {
                 .unwrap(),
             Some(metadata.clone())
         );
-        // Applying status must be restored as-is (recovery reads it), so the
-        // applied-only accessor must reject it.
-        assert!(
-            restarted
-                .get_applied_destination_table_metadata(table)
-                .await
-                .is_err()
-        );
         assert_eq!(
             restarted
-                .get_replication_progress(WorkerType::Apply)
+                .get_replication_checkpoint(WorkerType::Apply)
                 .await
                 .unwrap(),
             Some(PgLsn::from(100))
         );
         assert_eq!(
             restarted
-                .get_replication_progress(WorkerType::TableSync { table_id: table })
+                .get_replication_checkpoint(WorkerType::TableSync { table_id: table })
                 .await
                 .unwrap(),
             Some(PgLsn::from(50))
@@ -701,32 +785,108 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn replication_progress_is_monotonic() {
+    async fn pre_composite_snapshot_state_loads_after_upgrade() {
+        let backend = backend();
+        let store = StreamlingStore::new(backend.clone(), "slot_legacy");
+        let table = TableId::new(7);
+        // Shape written before etl's composite snapshot ids: bare message-LSN
+        // integers, and a first-time table create recorded as not-applied with
+        // no previous endpoint.
+        let legacy: PersistedEtlState = serde_json::from_value(serde_json::json!({
+            "table_states": [{
+                "table_id": 7,
+                "current": serde_json::to_value(TableState::Ready).unwrap(),
+                "history": [],
+            }],
+            "table_schemas": [{
+                "table_id": 7,
+                "schema": "public",
+                "name": "t",
+                "snapshot_id": 500,
+                "columns": [{
+                    "name": "id",
+                    "type_oid": Type::INT8.oid(),
+                    "modifier": -1,
+                    "ordinal_position": 1,
+                    "primary_key_ordinal_position": 1,
+                    "nullable": false,
+                }],
+            }],
+            "destination_tables_metadata": [{
+                "table_id": 7,
+                "destination_table_id": "dest.t",
+                "snapshot_id": 500,
+                "previous_snapshot_id": null,
+                "applied": false,
+                "replication_mask": [1],
+            }],
+            "replication_progress": [[null, 900]],
+        }))
+        .unwrap();
+        backend.put_kv("slot_legacy", legacy).await.unwrap();
+
+        assert_eq!(store.load_table_schemas().await.unwrap(), 1);
+        let at = |lsn: u64| SnapshotId::at_lsn(PgLsn::from(lsn));
+        assert!(
+            store
+                .get_table_schema(&table, at(499))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_table_schema(&table, at(500))
+                .await
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            snap(500)
+        );
+        assert_eq!(
+            store.get_destination_table_metadata(table).await.unwrap(),
+            Some(DestinationTableMetadata::new_creating(
+                "dest.t".to_string(),
+                snap(500),
+                ReplicationMask::from_bytes(vec![1]),
+            ))
+        );
+        assert_eq!(
+            store
+                .get_replication_checkpoint(WorkerType::Apply)
+                .await
+                .unwrap(),
+            Some(PgLsn::from(900))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replication_checkpoint_is_monotonic() {
         let store = StreamlingStore::new(backend(), "slot_monotonic");
         let worker = WorkerType::Apply;
         assert_eq!(
             store
-                .upsert_replication_progress(worker, PgLsn::from(100))
+                .upsert_replication_checkpoint(worker, PgLsn::from(100))
                 .await
                 .unwrap(),
             PgLsn::from(100)
         );
         assert_eq!(
             store
-                .upsert_replication_progress(worker, PgLsn::from(50))
+                .upsert_replication_checkpoint(worker, PgLsn::from(50))
                 .await
                 .unwrap(),
             PgLsn::from(100)
         );
         assert_eq!(
             store
-                .upsert_replication_progress(worker, PgLsn::from(200))
+                .upsert_replication_checkpoint(worker, PgLsn::from(200))
                 .await
                 .unwrap(),
             PgLsn::from(200)
         );
         assert_eq!(
-            store.get_replication_progress(worker).await.unwrap(),
+            store.get_replication_checkpoint(worker).await.unwrap(),
             Some(PgLsn::from(200))
         );
     }
@@ -778,19 +938,19 @@ mod tests {
 
         assert!(
             store
-                .get_table_schema(&table, SnapshotId::from(50))
+                .get_table_schema(&table, snap(50))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             store
-                .get_table_schema(&table, SnapshotId::from(250))
+                .get_table_schema(&table, snap(250))
                 .await
                 .unwrap()
                 .unwrap()
                 .snapshot_id,
-            SnapshotId::from(100)
+            snap(100)
         );
 
         store
@@ -800,16 +960,16 @@ mod tests {
         // Retention at 250 keeps the newest snapshot <= 250 (200) and
         // everything newer (300); only 100 is removed.
         let removed = store
-            .prune_table_schemas(HashMap::from([(
+            .prune_table_schemas(BTreeMap::from([(
                 table,
-                TableSchemaRetention::SnapshotId(SnapshotId::from(250)),
+                SnapshotId::at_lsn(PgLsn::from(250)),
             )]))
             .await
             .unwrap();
         assert_eq!(removed, 1);
         assert!(
             store
-                .get_table_schema(&table, SnapshotId::from(100))
+                .get_table_schema(&table, snap(100))
                 .await
                 .unwrap()
                 .is_none()
@@ -821,14 +981,14 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .snapshot_id,
-            SnapshotId::from(300)
+            snap(300)
         );
 
         // No snapshot at or before the retention point: table left untouched.
         let removed = store
-            .prune_table_schemas(HashMap::from([(
+            .prune_table_schemas(BTreeMap::from([(
                 table,
-                TableSchemaRetention::SnapshotId(SnapshotId::from(10)),
+                SnapshotId::at_lsn(PgLsn::from(10)),
             )]))
             .await
             .unwrap();
@@ -861,11 +1021,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .upsert_replication_progress(WorkerType::Apply, PgLsn::from(10))
+            .upsert_replication_checkpoint(WorkerType::Apply, PgLsn::from(10))
             .await
             .unwrap();
         store
-            .upsert_replication_progress(WorkerType::TableSync { table_id: table }, PgLsn::from(5))
+            .upsert_replication_checkpoint(
+                WorkerType::TableSync { table_id: table },
+                PgLsn::from(5),
+            )
             .await
             .unwrap();
 
@@ -900,14 +1063,14 @@ mod tests {
         );
         assert!(
             store
-                .get_replication_progress(WorkerType::TableSync { table_id: table })
+                .get_replication_checkpoint(WorkerType::TableSync { table_id: table })
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
-                .get_replication_progress(WorkerType::Apply)
+                .get_replication_checkpoint(WorkerType::Apply)
                 .await
                 .unwrap()
                 .is_some()
@@ -928,7 +1091,7 @@ mod tests {
         );
         assert!(
             store
-                .get_replication_progress(WorkerType::Apply)
+                .get_replication_checkpoint(WorkerType::Apply)
                 .await
                 .unwrap()
                 .is_none()
