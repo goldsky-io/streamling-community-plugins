@@ -202,6 +202,9 @@ sinks:
     from: s2_source
     table: s2_source_cdc
     primary_key: id
+    # One row per INSERT: a larger batch gets deduplicated by primary key, so
+    # fewer rows than the record limit reach the sink and the pipeline never stops.
+    batch_size: 1
 "#;
 
     let status = fixture
