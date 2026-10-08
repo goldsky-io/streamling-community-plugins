@@ -245,6 +245,36 @@ environment variables (uppercase key). Env vars take precedence over YAML.
 | `memory_backpressure_activate_threshold` | no | `0.85` | System-memory ratio above which backpressure activates (ignored when disabled) |
 | `memory_backpressure_resume_threshold` | no | `0.75` | System-memory ratio below which backpressure releases; must be `<` the activate threshold (ignored when disabled) |
 
+### Zama Decrypt Transform (`zama_decrypt`)
+
+Decodes ERC-7984 `ConfidentialTransfer` logs and decrypts their amounts through the Zama SDK daemon, on behalf of wallets that delegated decryption rights on-chain to the plugin's own signing key. Each input row is read as a raw EVM log (`address`, `topic0` to `topic3`); matching rows get seven nullable text columns appended (`zama_token`, `zama_from`, `zama_to`, `zama_handle`, `zama_amount`, `zama_delegator`, `zama_error`), other rows pass through with them null. See the module docs in [`src/transforms/zama_decrypt/mod.rs`](src/transforms/zama_decrypt/mod.rs) for the row flow, failure semantics, output columns, metrics and deployment requirements.
+
+All YAML options can also be set via `STREAMLING__PLUGIN__ZAMA_DECRYPT__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `chain_id` | yes | — | EVM chain id |
+| `rpc_url` | yes | — | JSON-RPC endpoint the daemon uses for public reads |
+| `daemon_socket` | yes | — | Absolute path of the daemon Unix socket |
+| `delegate_private_key` | yes | — | Key of the address wallets delegate to (env var preferred) |
+| `relayer_api_key` | no | — | Zama relayer credential (env var preferred) |
+| `derivation_secret` | no | — | At-rest wrapping of the transport key pair, 64+ characters (env var preferred) |
+| `tokens` | no | all | Comma-separated token contracts to decode |
+| `address_column` | no | `address` | Log address column, hex string |
+| `topic0_column` to `topic3_column` | no | `topic0` to `topic3` | Log topic columns, hex strings |
+| `max_concurrency` | no | SDK default | Relayer concurrency for batch decryption |
+| `relayer_debug` | no | `false` | Daemon prints relayer requests to stdout (diagnostic only) |
+| `credential_storage` | no | `memory` | `memory` or `persistent` |
+| `credential_store_name` | no | `zama_decrypt` | Daemon store name when persistent |
+
+Requirements and caveats:
+
+- Needs a running Zama SDK daemon (`packages/sdk-daemon` in [zama-ai/sdk](https://github.com/zama-ai/sdk), built from the commit pinned in `Cargo.toml`) reachable over a Unix socket. Streamling must run as the same UID as the daemon; the socket grants the same access as the credential store.
+- The delegate key signs decryption permits only and needs no funds; use one key per tenant, since every wallet delegating to the same address is decryptable by the same pipeline.
+- Rows the relayer or ACL refuses carry the reason in `zama_error` and are not retried. A daemon that cannot be reached fails the batch and the session is rebuilt.
+- Streamling logs plugin options at startup, so prefer env vars for the credentials.
+- The SDK client is a git dependency on a pinned, unreleased commit; it is bumped together with the daemon image.
+
 ### Quick start
 
 ```bash
