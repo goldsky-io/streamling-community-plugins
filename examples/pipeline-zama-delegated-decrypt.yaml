@@ -1,56 +1,32 @@
-# Example pipeline: Sepolia logs -> ConfidentialTransfer -> zama_decrypt -> print
+# Example pipeline: ConfidentialTransfer logs -> zama_decrypt -> print
 #
-# Decrypts transfer amounts for wallets that delegated decryption on-chain
-# (ACL.delegateForUserDecryption) to the address of the delegate key. Without a
-# delegation every row prints zama_error = "no active delegation from either party".
+# Decrypts ERC-7984 transfer amounts for wallets that delegated decryption on-chain
+# (ACL.delegateForUserDecryption) to the address of the delegate key. The fixture
+# holds 2 Sepolia cUSDCMock transfers (block 11915267); without a delegation from
+# either party every row prints zama_error = "no active delegation from either party".
+# To decrypt real amounts, replace the fixture with logs of a delegating wallet.
 #
-# Requires the same plugin directory and daemon as pipeline-zama-public-decrypt.yaml,
-# plus the delegate key in the environment, never in this file:
+# Run from the repository root with the same plugin library and daemon as
+# pipeline-zama-public-decrypt.yaml, plus the delegate key in the environment,
+# never in this file (Streamling logs YAML options at INFO):
 #   STREAMLING__PLUGIN__ZAMA_DECRYPT__DELEGATE_PRIVATE_KEY=0x...
-# Set the block range to cover transfers of the delegating wallet.
 name: zama-delegated-decrypt-sepolia
 sources:
-  blocks:
-    type: ethereum_source
-    rpc_url: https://ethereum-sepolia-rpc.publicnode.com
-    start_block: "11915260"
-    end_block: "11915270"
+  logs:
+    type: file
+    path: examples/fixtures/sepolia-confidential-transfers.csv
+    format: csv
+    mode:
+      type: bounded
+    primary_key: id
 
 transforms:
-  logs_flat:
-    type: sql
-    primary_key: id
-    sql: |
-      WITH r AS (
-        SELECT unnest(array_enumerate(receipts)) AS receipt, block_hash, block_number, _gs_op
-        FROM blocks
-      ),
-      l AS (
-        SELECT unnest(array_enumerate(receipt.value.logs)) AS log, receipt, block_hash, block_number, _gs_op
-        FROM r
-      )
-      SELECT
-        CONCAT(block_hash, '_', CAST(receipt.index AS VARCHAR), '_', CAST(log.index AS VARCHAR)) AS id,
-        block_number,
-        log.value.transaction_hash AS transaction_hash,
-        log.value.log_index AS log_index,
-        log.value.address AS address,
-        log.value.topics[1] AS topic0,
-        log.value.topics[2] AS topic1,
-        log.value.topics[3] AS topic2,
-        log.value.topics[4] AS topic3,
-        _gs_op
-      FROM l
-      WHERE lower(log.value.address) = '0x7c5bf43b851c1dff1a4fee8db225b87f2c223639'
-
   decrypted:
     type: zama_decrypt
-    from: logs_flat
+    from: logs
     chain_id: "11155111"
     rpc_url: https://ethereum-sepolia-rpc.publicnode.com
     daemon_socket: /tmp/zama-sdk/zama.sock  # or STREAMLING__PLUGIN__ZAMA_DECRYPT__DAEMON_SOCKET
-    tokens: "0x7c5BF43B851c1dff1a4feE8dB225b87f2C223639"
-    # delegate_private_key: never here, Streamling logs YAML options at INFO
 
 sinks:
   out:
