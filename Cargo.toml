@@ -5,6 +5,14 @@ edition = "2024"
 
 [dependencies]
 streamling-plugin = "0.2.3"
+# Rust client for the Zama SDK daemon, not yet published to crates.io: pinned
+# to a commit of zama-ai/sdk (package clients/rust). The daemon speaks a beta
+# protocol, so bump this rev together with the daemon image.
+zama-sdk = { git = "https://github.com/zama-ai/sdk", rev = "3858a8add72bd014db99e056757ddb897495feb7" }
+alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
+# EIP-712 hashing and secp256k1 signing of decryption permits.
+alloy-dyn-abi = { version = "1.7", default-features = false, features = ["std", "eip712"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 # RowKind: keys the dbz.op <-> _gs_op mapping on the engine's enum so the
 # round-trip contract tracks upstream by construction.
 streamling-common = "0.4.0"
