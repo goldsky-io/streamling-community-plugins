@@ -10,6 +10,7 @@
 #   - STREAMLING__PLUGIN__PATH pointing to this repo's compiled plugin library.
 #   - The Zama SDK daemon (@zama-fhe/sdk-daemon, built from the zama-ai/sdk commit
 #     pinned in Cargo.toml) listening on `daemon_socket`; its directory must be 0700.
+# A finished run is checkpointed in ./state.db; delete it to run again.
 name: zama-public-decrypt-sepolia
 sources:
   logs:
