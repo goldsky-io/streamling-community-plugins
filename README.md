@@ -346,6 +346,24 @@ Requirements and caveats:
 - Rows the relayer or ACL refuses for good carry the reason in `zama_error` and are not retried. A failure that may clear on a retry (daemon unreachable, relayer timeout, rate limit, delegation not yet propagated) fails the batch; Streamling then restarts the pipeline and replays it.
 - The SDK client is a crates.io pre-release pinned to an exact version; it is bumped together with the daemon image. After a bump, check it against a running daemon and Sepolia: `ZAMA_SDK_DAEMON_SOCKET=/tmp/zama-sdk/zama.sock cargo test --lib live_ -- --ignored` (optional `ZAMA_LIVE_RPC_URL`).
 
+Example pipeline: [`examples/pipeline-zama-delegated-decrypt.yaml`](examples/pipeline-zama-delegated-decrypt.yaml)
+
+### Zama Public Decrypt Transform (`zama_public_decrypt`)
+
+Decrypts Zama FHE handles that were made publicly decryptable on-chain (for example ERC-7984 unwrap amounts) through the same Zama SDK daemon. No signer or delegation is needed. Reads a `0x` hex handle column and appends nullable text columns `zama_public_amount` (decimal) and `zama_public_error`. Options can also be set via `STREAMLING__PLUGIN__ZAMA_PUBLIC_DECRYPT__<KEY>`; env vars take precedence.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `chain_id` | yes | | EVM chain id |
+| `rpc_url` | yes | | JSON-RPC endpoint the daemon uses |
+| `daemon_socket` | yes | | Absolute path of the daemon's Unix socket |
+| `handle_column` | no | `handle` | String column holding the handle |
+| `relayer_api_key` | no | | Zama relayer credential; required on mainnet only |
+
+A handle the KMS refuses gets its reason in `zama_public_error`; a retryable error or an unreachable daemon fails the batch so Streamling replays it.
+
+Example pipeline (every row must print `matches: true`): [`examples/pipeline-zama-public-decrypt.yaml`](examples/pipeline-zama-public-decrypt.yaml)
+
 ### Quick start
 
 ```bash
