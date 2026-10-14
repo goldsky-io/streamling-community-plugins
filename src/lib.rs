@@ -12,6 +12,7 @@ use crate::sinks::sqs::sink::SqsSink;
 use crate::sources::cloudtrail::CloudTrailSource;
 use crate::sources::s2::S2Source;
 use crate::transforms::zama_decrypt::ZamaDecryptTransform;
+use crate::transforms::zama_public_decrypt::ZamaPublicDecryptTransform;
 
 use streamling_plugin::{
     init_plugin_with_async_runtime, register_plugin_sink, register_plugin_source,
@@ -26,5 +27,6 @@ register_plugin_source!("s2_source", S2Source);
 register_plugin_source!("postgres_cdc_source", PostgresCdcSource);
 register_plugin_source!("cloudtrail_source", CloudTrailSource);
 register_plugin_transform!("zama_decrypt", ZamaDecryptTransform);
+register_plugin_transform!("zama_public_decrypt", ZamaPublicDecryptTransform);
 
 init_plugin_with_async_runtime!();
