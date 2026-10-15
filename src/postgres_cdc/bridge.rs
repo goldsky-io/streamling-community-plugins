@@ -16,10 +16,14 @@
 
 use crate::postgres_cdc::arrow::CdcRow;
 use crate::postgres_cdc::ledger::{SharedAck, SourceAckHandle, SourceId};
-use etl::destination::Destination;
-use etl::destination::async_result::AsyncResult;
+use etl::data::{Cell, OldTableRow, TableRow, UpdatedTableRow};
+use etl::destination::{
+    Destination, DropTableForCopyResult, TableCopyBatchId, WriteEventsDurability,
+    WriteEventsResult, WriteTableRowsResult,
+};
 use etl::error::EtlResult;
-use etl::types::{Cell, Event, OldTableRow, ReplicatedTableSchema, TableRow, UpdatedTableRow};
+use etl::event::Event;
+use etl::schema::ReplicatedTableSchema;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -283,7 +287,7 @@ impl ChannelDestination {
     async fn fan_out(
         &self,
         per_sub: Vec<(SourceId, mpsc::Sender<WriteUnit>, Vec<CdcRow>)>,
-        async_result: AsyncResult<()>,
+        async_result: WriteEventsResult,
     ) {
         let pending: HashSet<SourceId> = per_sub.iter().map(|(id, _, _)| *id).collect();
         let shared = SharedAck::new(async_result, pending);
@@ -305,7 +309,7 @@ impl Destination for ChannelDestination {
     async fn drop_table_for_copy(
         &self,
         replicated_table_schema: &ReplicatedTableSchema,
-        async_result: etl::destination::DropTableForCopyResult<()>,
+        async_result: DropTableForCopyResult<()>,
     ) -> EtlResult<()> {
         // Nothing to drop downstream. A restarted copy re-emits rows
         // (at-least-once; sinks upsert by key).
@@ -317,11 +321,15 @@ impl Destination for ChannelDestination {
         Ok(())
     }
 
+    // Every ack resolves as `Durable`, and only after checkpoint finalize, so
+    // etl never carries `Accepted` debt: an empty copy/durability barrier has
+    // no rows, fans out to nobody, and is truthfully durable at once.
     async fn write_table_rows(
         &self,
         replicated_table_schema: &ReplicatedTableSchema,
-        table_rows: Vec<etl::types::TableRow>,
-        async_result: etl::destination::WriteTableRowsResult<()>,
+        _batch_id: Option<TableCopyBatchId>,
+        table_rows: Vec<TableRow>,
+        async_result: WriteTableRowsResult,
     ) -> EtlResult<()> {
         let label = table_label(replicated_table_schema);
         let mut per_sub = Vec::new();
@@ -335,7 +343,7 @@ impl Destination for ChannelDestination {
                 }
             }
         }
-        if per_sub.is_empty() {
+        if per_sub.is_empty() && !table_rows.is_empty() {
             self.warn_unconsumed(&label);
         }
         self.fan_out(per_sub, async_result).await;
@@ -345,7 +353,8 @@ impl Destination for ChannelDestination {
     async fn write_events(
         &self,
         events: Vec<Event>,
-        async_result: etl::destination::WriteEventsResult<()>,
+        _durability: WriteEventsDurability,
+        async_result: WriteEventsResult,
     ) -> EtlResult<()> {
         let mut per_sub = Vec::new();
         for sub in self.subscribers.iter() {
@@ -391,10 +400,11 @@ fn data_event_tables(events: &[Event]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use etl::types::{
-        BeginEvent, ColumnSchema, CommitEvent, DeleteEvent, InsertEvent, PgLsn, TableId, TableName,
-        TableSchema, TruncateEvent, Type, UpdateEvent,
+    use etl::data::PartialTableRow;
+    use etl::event::{
+        BeginEvent, CommitEvent, DeleteEvent, InsertEvent, TruncateEvent, UpdateEvent,
     };
+    use etl::schema::{ColumnSchema, PgLsn, TableId, TableName, TableSchema, Type};
     use std::sync::Arc;
 
     fn users_schema() -> ReplicatedTableSchema {
@@ -402,8 +412,8 @@ mod tests {
             TableId::new(16384),
             TableName::new("public".into(), "users".into()),
             vec![
-                ColumnSchema::new("id".into(), Type::INT8, -1, 1, Some(1), false),
-                ColumnSchema::new("name".into(), Type::TEXT, -1, 2, None, true),
+                ColumnSchema::new("id".into(), Type::INT8, -1, 1, false).with_primary_key(1),
+                ColumnSchema::new("name".into(), Type::TEXT, -1, 2, true),
             ],
         );
         ReplicatedTableSchema::all(Arc::new(ts))
@@ -419,7 +429,6 @@ mod tests {
         old_table_row: Option<OldTableRow>,
     ) -> Event {
         Event::Update(UpdateEvent {
-            start_lsn: PgLsn::from(992u64),
             commit_lsn,
             tx_ordinal: 2,
             replicated_table_schema: s.clone(),
@@ -434,7 +443,6 @@ mod tests {
 
     fn begin(commit_lsn: PgLsn) -> Event {
         Event::Begin(BeginEvent {
-            start_lsn: PgLsn::from(990u64),
             commit_lsn,
             tx_ordinal: 0,
             timestamp: 0,
@@ -451,14 +459,12 @@ mod tests {
         let events = vec![
             begin(commit_lsn),
             Event::Insert(InsertEvent {
-                start_lsn: PgLsn::from(991u64),
                 commit_lsn,
                 tx_ordinal: 1,
                 replicated_table_schema: s.clone(),
                 table_row: row(1, "ada"),
             }),
             Event::Update(UpdateEvent {
-                start_lsn: PgLsn::from(992u64),
                 commit_lsn,
                 tx_ordinal: 2,
                 replicated_table_schema: s.clone(),
@@ -466,14 +472,12 @@ mod tests {
                 old_table_row: None,
             }),
             Event::Delete(DeleteEvent {
-                start_lsn: PgLsn::from(993u64),
                 commit_lsn,
                 tx_ordinal: 3,
                 replicated_table_schema: s.clone(),
                 old_table_row: Some(OldTableRow::Full(row(1, "grace"))),
             }),
             Event::Commit(CommitEvent {
-                start_lsn: PgLsn::from(994u64),
                 commit_lsn,
                 tx_ordinal: 4,
                 flags: 0,
@@ -550,7 +554,6 @@ mod tests {
         let s = users_schema();
         let c = converter();
         let events = vec![Event::Delete(DeleteEvent {
-            start_lsn: PgLsn::from(5u64),
             commit_lsn: PgLsn::from(9u64),
             tx_ordinal: 0,
             replicated_table_schema: s,
@@ -566,13 +569,12 @@ mod tests {
     fn partial_update_leaves_missing_columns_none() {
         let s = users_schema();
         let c = converter();
-        let partial = etl::types::PartialTableRow::new(
+        let partial = PartialTableRow::new(
             2,
             TableRow::new(vec![Cell::String("ada".into())]),
             vec![0], // `id` missing (unchanged toast)
         );
         let events = vec![Event::Update(UpdateEvent {
-            start_lsn: PgLsn::from(5u64),
             commit_lsn: PgLsn::from(9u64),
             tx_ordinal: 0,
             replicated_table_schema: s,
@@ -589,18 +591,10 @@ mod tests {
         let other = ReplicatedTableSchema::all(Arc::new(TableSchema::new(
             TableId::new(99),
             TableName::new("public".into(), "orders".into()),
-            vec![ColumnSchema::new(
-                "id".into(),
-                Type::INT8,
-                -1,
-                1,
-                Some(1),
-                false,
-            )],
+            vec![ColumnSchema::new("id".into(), Type::INT8, -1, 1, false).with_primary_key(1)],
         )));
         let c = converter();
         let events = vec![Event::Insert(InsertEvent {
-            start_lsn: PgLsn::from(5u64),
             commit_lsn: PgLsn::from(9u64),
             tx_ordinal: 0,
             replicated_table_schema: other.clone(),
@@ -619,14 +613,12 @@ mod tests {
         let c = converter();
         let events = vec![
             Event::Truncate(TruncateEvent {
-                start_lsn: PgLsn::from(50u64),
                 commit_lsn: PgLsn::from(60u64),
                 tx_ordinal: 1,
                 options: 0,
                 truncated_tables: vec![s.clone()],
             }),
             Event::Delete(DeleteEvent {
-                start_lsn: PgLsn::from(51u64),
                 commit_lsn: PgLsn::from(60u64),
                 tx_ordinal: 2,
                 replicated_table_schema: s,
@@ -645,7 +637,6 @@ mod tests {
         let conv_orders = RowConverter::new("public.orders".into(), &["id".into()], false);
 
         let events = vec![Event::Insert(InsertEvent {
-            start_lsn: PgLsn::from(1u64),
             commit_lsn: PgLsn::from(2u64),
             tx_ordinal: 0,
             replicated_table_schema: users.clone(),
