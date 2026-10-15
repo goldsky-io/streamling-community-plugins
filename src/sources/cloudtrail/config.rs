@@ -57,7 +57,7 @@ pub struct CloudTrailSourceConfig {
 }
 
 fn optional(opts: &PluginOptions, key: &str) -> Option<String> {
-    opts.lookup(key).filter(|value| !value.is_empty())
+    opts.lookup_non_empty(key)
 }
 
 fn parse_start_time(opts: &PluginOptions) -> Result<StartTime, PluginError> {

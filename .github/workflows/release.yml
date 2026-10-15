@@ -38,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy, rustfmt
       - name: Install sccache
@@ -53,9 +53,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          key: sccache-release-${{ runner.os }}-1.94.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            sccache-release-${{ runner.os }}-1.90.0-
+            sccache-release-${{ runner.os }}-1.94.1-
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
@@ -89,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.94.1
       - name: Resolve version from Cargo metadata
         id: resolve
         run: |
@@ -146,7 +146,7 @@ jobs:
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.94.1
       - name: Install sccache
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@v2
@@ -163,9 +163,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          key: sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.94.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-
+            sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.94.1-
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: useblacksmith/rust-cache@v3
@@ -218,7 +218,7 @@ jobs:
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.94.1
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
@@ -261,7 +261,7 @@ jobs:
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.94.1
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
