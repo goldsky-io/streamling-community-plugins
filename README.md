@@ -49,7 +49,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__MYSQL_SINK__<KEY>` env
 
 ### SQS Sink (`sqs`)
 
-Sends rows as JSON messages to an AWS SQS queue. Handles SQS 10-message batch limits, keeps every request within the 256 KiB SQS payload limit, and retries partial failures.
+Sends rows as JSON messages to an AWS SQS queue. Handles SQS 10-message batch limits, keeps every request within the 1 MiB SQS payload limit, and retries partial failures.
 
 All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
 
@@ -62,6 +62,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 | `secret_access_key` | no | — | AWS secret key (env var preferred) |
 | `session_token` | no | — | STS session token (env var preferred) |
 | `one_row_per_request` | no | `true` | `true` sends one message per row (`{...}`). `false` packs several rows into one message as a JSON array (`[{...},{...}]`) |
+| `max_message_bytes` | no | `1048576` | Byte budget per message and per `SendMessageBatch` request. Lower it to match a queue whose `MaximumMessageSize` attribute is below the 1 MiB AWS default |
 
 #### Batching rows into one message
 
@@ -79,7 +80,7 @@ sinks:
     batch_flush_interval: 5s
 ```
 
-Arrays are additionally capped by the 256 KiB SQS payload limit, so a large `batch_size` can still be split across several messages. A single row that exceeds that limit on its own fails the batch rather than being dropped or truncated.
+Arrays are additionally capped by `max_message_bytes` (1 MiB by default, the AWS limit for both a single message and the summed message lengths of one `SendMessageBatch`), so a large `batch_size` can still be split across several messages. A single row that exceeds that budget on its own fails the batch rather than being dropped or truncated.
 
 Example pipeline: [`examples/pipeline-sqs-sink.yaml`](examples/pipeline-sqs-sink.yaml)
 

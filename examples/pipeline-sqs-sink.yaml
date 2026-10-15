@@ -41,3 +41,7 @@ sinks:
     # one_row_per_request: false
     # batch_size: 100
     # batch_flush_interval: 5s
+    #
+    # Lower the per-message byte budget to match a queue whose
+    # MaximumMessageSize is below the 1 MiB AWS default:
+    # max_message_bytes: 262144

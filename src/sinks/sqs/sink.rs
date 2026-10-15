@@ -20,13 +20,12 @@ use crate::utils::record_batch_json;
 
 const SQS_MAX_BATCH_SIZE: usize = 10;
 const SQS_PARTIAL_FAILURE_MAX_RETRIES: u32 = 5;
-/// SQS caps a single message at 256 KiB and applies the same cap to the total
-/// payload of a `SendMessageBatch` request, so both are budgeted against this.
-const SQS_MAX_PAYLOAD_BYTES: usize = 262_144;
-/// Batch entry IDs are `msg_{i}` with `i < SQS_MAX_BATCH_SIZE`, so five bytes
-/// is the exact worst case and lets the payload budget be computed without
-/// materializing the ID.
-const SQS_ENTRY_ID_MAX_BYTES: usize = 5;
+/// AWS caps a single message and the summed message lengths of one
+/// `SendMessageBatch` request at the same 1 MiB.
+const SQS_MAX_PAYLOAD_BYTES: usize = 1_048_576;
+/// Lowest value a queue's `MaximumMessageSize` attribute accepts, so the floor
+/// for `max_message_bytes`.
+const SQS_MIN_PAYLOAD_BYTES: usize = 1_024;
 
 pub struct SqsSink {
     opts: PluginOptions,
@@ -34,6 +33,7 @@ pub struct SqsSink {
     client: OnceLock<SqsClient>,
     queue_url: OnceLock<String>,
     one_row_per_request: OnceLock<bool>,
+    max_message_bytes: OnceLock<usize>,
     running: std::sync::Arc<AtomicBool>,
 }
 
@@ -51,6 +51,7 @@ impl SqsSink {
             client: OnceLock::new(),
             queue_url: OnceLock::new(),
             one_row_per_request: OnceLock::new(),
+            max_message_bytes: OnceLock::new(),
             running: std::sync::Arc::new(AtomicBool::new(true)),
         }
     }
@@ -77,6 +78,16 @@ impl SinkPlugin for SqsSink {
 
         let queue_url = self.opts.get("queue_url")?;
         let one_row_per_request: bool = self.opts.get_parsed_or("one_row_per_request", true)?;
+        let max_message_bytes: usize = self
+            .opts
+            .get_parsed_or("max_message_bytes", SQS_MAX_PAYLOAD_BYTES)?;
+        if !(SQS_MIN_PAYLOAD_BYTES..=SQS_MAX_PAYLOAD_BYTES).contains(&max_message_bytes) {
+            return Err(PluginError::Internal(format!(
+                "sqs_sink: max_message_bytes is {max_message_bytes}, outside the \
+                 {SQS_MIN_PAYLOAD_BYTES}..={SQS_MAX_PAYLOAD_BYTES} byte range a queue's \
+                 MaximumMessageSize attribute allows"
+            )));
+        }
 
         let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
 
@@ -109,8 +120,14 @@ impl SinkPlugin for SqsSink {
         let _ = self.client.set(client);
         let _ = self.queue_url.set(queue_url.clone());
         let _ = self.one_row_per_request.set(one_row_per_request);
+        let _ = self.max_message_bytes.set(max_message_bytes);
 
-        info!(queue_url = %queue_url, one_row_per_request, "SQS sink initialized successfully");
+        info!(
+            queue_url = %queue_url,
+            one_row_per_request,
+            max_message_bytes,
+            "SQS sink initialized successfully"
+        );
         Ok(())
     }
 
@@ -136,6 +153,9 @@ impl SinkPlugin for SqsSink {
         let one_row_per_request = *self.one_row_per_request.get().ok_or_else(|| {
             PluginError::Internal("one_row_per_request is not initialized".to_string())
         })?;
+        let max_message_bytes = *self.max_message_bytes.get().ok_or_else(|| {
+            PluginError::Internal("max_message_bytes is not initialized".to_string())
+        })?;
 
         let json_rows =
             record_batch_json::record_batch_to_line_delimited_json(&batch).map_err(|e| {
@@ -158,10 +178,10 @@ impl SinkPlugin for SqsSink {
         let bodies = if one_row_per_request {
             rows
         } else {
-            pack_array_bodies(&rows, SQS_MAX_PAYLOAD_BYTES)?
+            pack_array_bodies(&rows, max_message_bytes)?
         };
 
-        let sent = Self::send_messages(client, queue_url, bodies).await?;
+        let sent = Self::send_messages(client, queue_url, bodies, max_message_bytes).await?;
         debug!("Sent {} messages to SQS", sent);
 
         Ok(())
@@ -185,24 +205,15 @@ impl SqsSink {
         client: &SqsClient,
         queue_url: &str,
         bodies: Vec<String>,
+        max_bytes: usize,
     ) -> Result<usize, PluginError> {
-        for body in &bodies {
-            let cost = body.len() + SQS_ENTRY_ID_MAX_BYTES;
-            if cost > SQS_MAX_PAYLOAD_BYTES {
-                return Err(PluginError::Internal(format!(
-                    "sqs_sink: a single message is {} bytes, which exceeds the {} byte SQS payload limit; \
-                     shrink the rows or lower the sink's batch_size",
-                    body.len(),
-                    SQS_MAX_PAYLOAD_BYTES
-                )));
-            }
-        }
+        ensure_bodies_fit(&bodies, max_bytes)?;
 
         let mut total_sent = 0;
         let mut to_send: Vec<(usize, String)> = bodies.into_iter().enumerate().collect();
 
         while !to_send.is_empty() {
-            let chunk_len = next_chunk_len(&to_send, SQS_MAX_BATCH_SIZE, SQS_MAX_PAYLOAD_BYTES);
+            let chunk_len = next_chunk_len(&to_send, SQS_MAX_BATCH_SIZE, max_bytes);
             let chunk: Vec<(usize, String)> = to_send.drain(..chunk_len).collect();
 
             let (sent, mut failed) = Self::send_chunk_with_retry(client, queue_url, chunk).await?;
@@ -229,7 +240,9 @@ impl SqsSink {
                 .map(|(i, (_idx, body))| {
                     aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
                         .id(format!("msg_{}", i))
-                        .message_body(body.as_str())
+                        // The SDK stores an owned body and a partial failure
+                        // retries from the original, so this copy stays.
+                        .message_body(body.clone())
                         .build()
                         .map_err(|e| {
                             PluginError::Internal(format!(
@@ -366,21 +379,40 @@ fn pack_array_bodies(rows: &[String], max_bytes: usize) -> Result<Vec<String>, P
     Ok(bodies)
 }
 
+/// Rejects a body that no `SendMessageBatch` request could carry.
+///
+/// SQS would reject it too; failing here names the size and the limit instead
+/// of surfacing an opaque SDK error, and dropping the row would be data loss.
+fn ensure_bodies_fit(bodies: &[String], max_bytes: usize) -> Result<(), PluginError> {
+    for body in bodies {
+        if body.len() > max_bytes {
+            return Err(PluginError::Internal(format!(
+                "sqs_sink: a single message is {} bytes, which exceeds the {} byte SQS message \
+                 limit; shrink the rows or lower the sink's batch_size",
+                body.len(),
+                max_bytes
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// How many leading bodies fit in one `SendMessageBatch` request, bounded by
 /// both the entry-count cap and the request-wide payload budget.
 ///
-/// Always at least one, so an oversized body surfaces as a send error instead
-/// of spinning forever on an empty chunk.
+/// The budget counts message bodies only: AWS sums message lengths, not the
+/// batch-entry correlation IDs. Always at least one, so an oversized body
+/// surfaces as a send error instead of spinning forever on an empty chunk.
 fn next_chunk_len(bodies: &[(usize, String)], max_count: usize, max_bytes: usize) -> usize {
     let mut total = 0;
     let mut count = 0;
 
     for (_, body) in bodies.iter().take(max_count) {
-        let cost = body.len() + SQS_ENTRY_ID_MAX_BYTES;
-        if count > 0 && total + cost > max_bytes {
+        if count > 0 && total + body.len() > max_bytes {
             break;
         }
-        total += cost;
+        total += body.len();
         count += 1;
     }
 
@@ -459,9 +491,43 @@ mod tests {
 
     #[test]
     fn next_chunk_len_stops_at_the_payload_budget() {
-        let bodies: Vec<(usize, String)> = rows(10, 95).into_iter().enumerate().collect();
-        // Each entry costs 95 + 5 = 100 bytes, so a 350-byte budget fits three.
+        let bodies: Vec<(usize, String)> = rows(10, 100).into_iter().enumerate().collect();
+        // Three 100-byte bodies fit in a 350-byte budget; a fourth would not.
         assert_eq!(next_chunk_len(&bodies, SQS_MAX_BATCH_SIZE, 350), 3);
+    }
+
+    #[test]
+    fn a_body_at_exactly_the_budget_packs_and_ships() {
+        // "[" + 13-byte row + "," + 13-byte row + "]" is exactly 29 bytes, so
+        // packing and the send-side budget have to agree on that boundary.
+        let bodies = pack_array_bodies(&rows(2, 13), 29).unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].len(), 29);
+
+        ensure_bodies_fit(&bodies, 29).unwrap();
+        let indexed: Vec<(usize, String)> = bodies.into_iter().enumerate().collect();
+        assert_eq!(next_chunk_len(&indexed, SQS_MAX_BATCH_SIZE, 29), 1);
+    }
+
+    #[test]
+    fn a_row_above_256_kib_is_still_sendable() {
+        let bodies = rows(1, 300_000);
+
+        ensure_bodies_fit(&bodies, SQS_MAX_PAYLOAD_BYTES).unwrap();
+        let indexed: Vec<(usize, String)> = bodies.into_iter().enumerate().collect();
+        assert_eq!(
+            next_chunk_len(&indexed, SQS_MAX_BATCH_SIZE, SQS_MAX_PAYLOAD_BYTES),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_bodies_fit_rejects_a_body_above_the_budget() {
+        let err = ensure_bodies_fit(&rows(1, 40), 30).unwrap_err();
+        assert!(
+            err.to_string().contains("40 bytes"),
+            "error should name the body size: {err}"
+        );
     }
 
     #[test]
