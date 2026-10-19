@@ -41,13 +41,13 @@ urlencoding = "2.1.3"
 sqlx = { version = "0.8.5", features = ["runtime-tokio", "mysql", "postgres", "tls-rustls"] }
 
 # Postgres CDC (embedded supabase/etl). Pinned to a rev: pre-1.0, not on
-# crates.io; pulls a forked tokio-postgres and sqlx 0.9-alpha (coexists with
-# our sqlx 0.8 as a separate major).
-# NOTE: the sqlx 0.9 line is pinned to 0.9.0-alpha.1 in Cargo.lock
-# (`cargo update -p sqlx@0.9.0 --precise 0.9.0-alpha.1`); sqlx 0.9.0 stable
-# changed Migrator::run_direct and breaks etl at this rev. Re-check when
-# bumping the etl rev.
-etl = { git = "https://github.com/supabase/etl", rev = "f7f6aea7fd856b4e0565fa06f5c3da4427ea7acb" }
+# crates.io; pulls a forked tokio-postgres and sqlx 0.9 (coexists with our
+# sqlx 0.8 as a separate major). Rev must stay at or after 3e17e70 (forked
+# tokio-postgres >= 0.7.18 / postgres-protocol >= 0.6.12 for
+# GHSA-3gjw-f78c-vvpw and GHSA-rgqc-3x5p-6gwg); etl requires Rust >= 1.95.
+etl = { git = "https://github.com/supabase/etl", rev = "3e17e70a0a085cd3078e82ee284a1c2ed42d271b" }
+# Same rev as etl; only for the `Validate` trait, which etl does not re-export.
+etl-config = { git = "https://github.com/supabase/etl", rev = "3e17e70a0a085cd3078e82ee284a1c2ed42d271b", default-features = false }
 # Must match etl's secrecy major for PgConnectionConfig::password.
 secrecy = "0.10"
 

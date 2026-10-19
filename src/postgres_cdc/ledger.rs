@@ -8,7 +8,7 @@
 //! Units never released before a covering checkpoint finalizes ⇒ etl never
 //! advances `confirmed_flush_lsn` past streamling's durable checkpoint.
 
-use etl::destination::async_result::AsyncResult;
+use etl::destination::{DestinationWriteStatus, WriteEventsResult};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -76,9 +76,11 @@ pub trait FinalAck: Send {
     fn send_ok(self);
 }
 
-impl FinalAck for AsyncResult<()> {
+/// Copy and streaming writes share this result type. Released only after a
+/// covering streamling checkpoint, so the write is durable.
+impl FinalAck for WriteEventsResult {
     fn send_ok(self) {
-        self.send(Ok(()));
+        self.send(Ok(DestinationWriteStatus::Durable));
     }
 }
 
@@ -87,7 +89,7 @@ impl FinalAck for AsyncResult<()> {
 /// (i.e. durably checkpointed past it), so a shared slot's confirmed_flush_lsn
 /// never advances past the slowest subscriber. Constructed with an empty
 /// subscriber set, it fires immediately.
-pub struct SharedAck<A: FinalAck = AsyncResult<()>> {
+pub struct SharedAck<A: FinalAck = WriteEventsResult> {
     inner: Mutex<SharedAckInner<A>>,
 }
 
