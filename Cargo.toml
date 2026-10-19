@@ -99,6 +99,10 @@ iceberg-storage-opendal = "0.10.1"
 reqwest = { version = "0.12", default-features = false }
 
 [dev-dependencies]
+aws-smithy-async = { version = "1", features = ["rt-tokio"] }
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+aws-smithy-types = "1"
+http = "1"
 regex = "1.11.1"
 s2-testcontainers = "0.39.1"
 streamling-e2e = "0.4.0"

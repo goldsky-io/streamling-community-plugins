@@ -1,9 +1,14 @@
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use aws_config::BehaviorVersion;
+use aws_config::sts::AssumeRoleProvider;
+use aws_config::{BehaviorVersion, ConfigLoader, SdkConfig};
 use aws_credential_types::Credentials;
+use aws_credential_types::provider::error::CredentialsError;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_sqs::Client as SqsClient;
+use aws_sdk_sqs::error::DisplayErrorContext;
+use aws_types::region::Region;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,10 +17,11 @@ use streamling_plugin::r#api::PluginStateBackendFactory;
 use streamling_plugin::api::SupportsGracefulShutdown;
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
-use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
+use streamling_plugin::{CheckpointEpoch, PluginError, PluginInitializationError, SinkPlugin};
 use tracing::{debug, info, warn};
 
-use crate::utils::plugin_options::PluginOptions;
+use super::config::{AssumeRoleConfig, SqsSinkConfig};
+use crate::utils::plugin_options::{PluginOptions, configuration_error};
 use crate::utils::record_batch_json;
 
 const SQS_MAX_BATCH_SIZE: usize = 10;
@@ -29,6 +35,7 @@ const SQS_MIN_PAYLOAD_BYTES: usize = 1_024;
 
 pub struct SqsSink {
     opts: PluginOptions,
+    config: SqsSinkConfig,
     _schema: SchemaRef,
     client: OnceLock<SqsClient>,
     queue_url: OnceLock<String>,
@@ -44,17 +51,88 @@ impl SqsSink {
         _state_backend_factory: PluginStateBackendFactory,
         _metric_recorder: PluginMetricsRecorder,
         options: HashMap<String, String>,
-    ) -> Self {
-        SqsSink {
-            opts: PluginOptions::new(options, "sqs_sink", "STREAMLING__PLUGIN__SQS_SINK"),
+    ) -> Result<Self, PluginInitializationError> {
+        let opts = PluginOptions::new(options, "sqs_sink", "STREAMLING__PLUGIN__SQS_SINK");
+        let config = SqsSinkConfig::from_options(&opts).map_err(configuration_error)?;
+        Ok(SqsSink {
+            opts,
+            config,
             _schema: schema,
             client: OnceLock::new(),
             queue_url: OnceLock::new(),
             one_row_per_request: OnceLock::new(),
             max_message_bytes: OnceLock::new(),
             running: std::sync::Arc::new(AtomicBool::new(true)),
-        }
+        })
     }
+}
+
+/// No `endpoint_url`/`region`: STS uses this config, and may be off in the queue's region.
+async fn load_sdk_config(
+    loader: ConfigLoader,
+    config: &SqsSinkConfig,
+    opts: &PluginOptions,
+) -> Result<SdkConfig, PluginError> {
+    let mut loader = loader;
+    let secret = |key| opts.get_secret(key).filter(|value| !value.is_empty());
+    if let (Some(access_key_id), Some(secret_access_key)) =
+        (secret("access_key_id"), secret("secret_access_key"))
+    {
+        loader = loader.credentials_provider(Credentials::new(
+            access_key_id,
+            secret_access_key,
+            secret("session_token"),
+            None,
+            "SqsSinkPlugin",
+        ));
+    }
+    let base = loader.load().await;
+
+    match &config.assume_role {
+        None => Ok(base),
+        Some(role) => with_assumed_role(base, role, config.region.as_deref()).await,
+    }
+}
+
+/// Swaps only the credentials provider so the lazy identity cache refreshes assumed credentials.
+async fn with_assumed_role(
+    base: SdkConfig,
+    role: &AssumeRoleConfig,
+    fallback_region: Option<&str>,
+) -> Result<SdkConfig, PluginError> {
+    let mut builder = AssumeRoleProvider::builder(&role.role_arn)
+        .session_name(&role.session_name)
+        .configure(&base);
+    if let (None, Some(region)) = (base.region(), fallback_region) {
+        builder = builder.region(Region::new(region.to_string()));
+    }
+    if let Some(external_id) = &role.external_id {
+        builder = builder.external_id(external_id);
+    }
+    let provider = builder.build().await;
+    // Assume once up front so a broken trust relationship fails startup, not the first batch.
+    provider
+        .provide_credentials()
+        .await
+        .map_err(|e| assume_role_error(role, &e))?;
+    Ok(base
+        .into_builder()
+        .credentials_provider(SharedCredentialsProvider::new(provider))
+        .build())
+}
+
+fn assume_role_error(role: &AssumeRoleConfig, error: &CredentialsError) -> PluginError {
+    let hint = if matches!(error, CredentialsError::ProviderError(_)) {
+        " The role's trust policy must allow this pipeline's AWS identity and that external ID."
+    } else {
+        ""
+    };
+    PluginError::Internal(format!(
+        "sqs_sink: could not assume role {} with external ID {}: {}.{hint}",
+        role.role_arn,
+        role.external_id.as_deref().unwrap_or("(none)"),
+        DisplayErrorContext(error)
+    ))
 }
 
 #[async_trait]
@@ -89,41 +167,34 @@ impl SinkPlugin for SqsSink {
             )));
         }
 
-        let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
-
-        if let Ok(region) = self.opts.get("region") {
-            config_loader = config_loader.region(aws_types::region::Region::new(region));
+        let sdk_config = load_sdk_config(
+            aws_config::defaults(BehaviorVersion::latest()),
+            &self.config,
+            &self.opts,
+        )
+        .await?;
+        let mut sqs_config = aws_sdk_sqs::config::Builder::from(&sdk_config);
+        if let Some(region) = &self.config.region {
+            sqs_config = sqs_config.region(Region::new(region.clone()));
         }
-
-        if let Ok(endpoint_url) = self.opts.get("endpoint_url") {
-            config_loader = config_loader.endpoint_url(endpoint_url);
+        if let Some(endpoint_url) = &self.config.endpoint_url {
+            sqs_config = sqs_config.endpoint_url(endpoint_url);
         }
-
-        let access_key_id = self.opts.get_secret("access_key_id");
-        let secret_access_key = self.opts.get_secret("secret_access_key");
-        let session_token = self.opts.get_secret("session_token");
-
-        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
-            let creds = Credentials::new(
-                access_key_id,
-                secret_access_key,
-                session_token,
-                None,
-                "SqsSinkPlugin",
-            );
-            config_loader = config_loader.credentials_provider(creds);
-        }
-
-        let sdk_config = config_loader.load().await;
-        let client = SqsClient::new(&sdk_config);
+        let client = SqsClient::from_conf(sqs_config.build());
 
         let _ = self.client.set(client);
         let _ = self.queue_url.set(queue_url.clone());
         let _ = self.one_row_per_request.set(one_row_per_request);
         let _ = self.max_message_bytes.set(max_message_bytes);
 
+        let role_arn = self
+            .config
+            .assume_role
+            .as_ref()
+            .map_or("-", |r| r.role_arn.as_str());
         info!(
             queue_url = %queue_url,
+            role_arn = %role_arn,
             one_row_per_request,
             max_message_bytes,
             "SQS sink initialized successfully"
@@ -260,7 +331,10 @@ impl SqsSink {
                 .send()
                 .await
                 .map_err(|e| {
-                    PluginError::Internal(format!("failed to send message batch to SQS: {}", e))
+                    PluginError::Internal(format!(
+                        "failed to send message batch to SQS: {}",
+                        DisplayErrorContext(&e)
+                    ))
                 })?;
 
             let failed = result.failed();
@@ -422,6 +496,11 @@ fn next_chunk_len(bodies: &[(usize, String)], max_count: usize, max_bytes: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sinks::sqs::config::DEFAULT_ROLE_SESSION_NAME;
+    use aws_smithy_async::rt::sleep::{SharedAsyncSleep, TokioSleep};
+    use aws_smithy_async::time::SharedTimeSource;
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_types::body::SdkBody;
 
     /// `count` rows of exactly `len` bytes each, every one valid JSON.
     fn rows(count: usize, len: usize) -> Vec<String> {
@@ -534,5 +613,176 @@ mod tests {
     fn next_chunk_len_never_returns_zero() {
         let bodies: Vec<(usize, String)> = rows(2, 1000).into_iter().enumerate().collect();
         assert_eq!(next_chunk_len(&bodies, SQS_MAX_BATCH_SIZE, 10), 1);
+    }
+
+    const ROLE: &str = "arn:aws:iam::123456789012:role/partner-role";
+    const EXTERNAL_ID: &str = "tenant:abc";
+
+    const ASSUME_ROLE_OK: &str = r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASIAASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials><AssumedRoleUser><AssumedRoleId>AROAEXAMPLE:streamling-sqs-sink</AssumedRoleId><Arn>arn:aws:sts::123456789012:assumed-role/partner-role/streamling-sqs-sink</Arn></AssumedRoleUser></AssumeRoleResult></AssumeRoleResponse>"#;
+
+    const ASSUME_ROLE_DENIED: &str = r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>not authorized to perform: sts:AssumeRole</Message></Error><RequestId>req-1</RequestId></ErrorResponse>"#;
+
+    fn sts_events(responses: &[(u16, &str)]) -> StaticReplayClient {
+        StaticReplayClient::new(
+            responses
+                .iter()
+                .map(|(status, body)| {
+                    ReplayEvent::new(
+                        http::Request::builder()
+                            .uri("https://sts.us-east-1.amazonaws.com/")
+                            .body(SdkBody::empty())
+                            .unwrap(),
+                        http::Response::builder()
+                            .status(*status)
+                            .body(SdkBody::from(*body))
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn opts(pairs: &[(&str, &str)]) -> PluginOptions {
+        let base = [
+            ("region", "us-east-1"),
+            ("endpoint_url", "http://localhost:9324"),
+            ("access_key_id", "AKIDBASE"),
+            ("secret_access_key", "base-secret"),
+        ];
+        let all: Vec<_> = base.iter().chain(pairs).copied().collect();
+        PluginOptions::for_test("sqs_sink", "STREAMLING__PLUGIN__SQS_SINK_UNIT_TEST", &all)
+    }
+
+    /// Built by hand so host AWS env or profiles (e.g. `AWS_ENDPOINT_URL`) can't redirect STS.
+    fn base_config(http: &StaticReplayClient, region: Option<&str>) -> SdkConfig {
+        SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(region.map(|r| Region::new(r.to_string())))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "AKIDBASE",
+                "base-secret",
+                None,
+                None,
+                "test",
+            )))
+            .http_client(http.clone())
+            .sleep_impl(SharedAsyncSleep::new(TokioSleep::new()))
+            .time_source(SharedTimeSource::default())
+            .build()
+    }
+
+    fn role() -> AssumeRoleConfig {
+        AssumeRoleConfig {
+            role_arn: ROLE.to_string(),
+            external_id: Some(EXTERNAL_ID.to_string()),
+            session_name: DEFAULT_ROLE_SESSION_NAME.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn assumes_the_role_at_sts_with_the_external_id() {
+        let http = sts_events(&[(200, ASSUME_ROLE_OK), (200, ASSUME_ROLE_OK)]);
+
+        let sdk = with_assumed_role(
+            base_config(&http, Some("us-east-1")),
+            &role(),
+            Some("eu-west-1"),
+        )
+        .await
+        .expect("role assumed");
+        let creds = sdk
+            .credentials_provider()
+            .expect("credentials provider")
+            .provide_credentials()
+            .await
+            .expect("assumed credentials");
+        assert_eq!(creds.access_key_id(), "ASIAASSUMED");
+
+        let requests: Vec<_> = http.actual_requests().collect();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request
+                    .uri()
+                    .starts_with("https://sts.us-east-1.amazonaws.com"),
+                "STS must not use the SQS endpoint_url, got {}",
+                request.uri()
+            );
+            let body = std::str::from_utf8(request.body().bytes().unwrap()).unwrap();
+            assert!(body.contains("Action=AssumeRole"), "{body}");
+            assert!(body.contains("ExternalId=tenant%3Aabc"), "{body}");
+            assert!(
+                body.contains("RoleSessionName=streamling-sqs-sink"),
+                "{body}"
+            );
+            assert!(
+                body.contains("RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fpartner-role"),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_assume_role_fails_with_the_role_and_external_id() {
+        let http = sts_events(&[(403, ASSUME_ROLE_DENIED)]);
+
+        let err = with_assumed_role(
+            base_config(&http, Some("us-east-1")),
+            &role(),
+            Some("eu-west-1"),
+        )
+        .await
+        .expect_err("denied")
+        .to_string();
+        assert!(err.contains(ROLE), "{err}");
+        assert!(err.contains(EXTERNAL_ID), "{err}");
+        assert!(err.contains("AccessDenied"), "{err}");
+        assert!(err.contains("trust policy"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sts_uses_the_host_region_and_falls_back_to_the_queue_region() {
+        let host = sts_events(&[(200, ASSUME_ROLE_OK)]);
+        with_assumed_role(
+            base_config(&host, Some("us-west-2")),
+            &role(),
+            Some("ap-east-1"),
+        )
+        .await
+        .expect("role assumed");
+        let uri = host.actual_requests().next().unwrap().uri().to_string();
+        assert!(
+            uri.starts_with("https://sts.us-west-2.amazonaws.com"),
+            "{uri}"
+        );
+
+        let no_host = sts_events(&[(200, ASSUME_ROLE_OK)]);
+        with_assumed_role(base_config(&no_host, None), &role(), Some("ap-east-1"))
+            .await
+            .expect("role assumed");
+        let uri = no_host.actual_requests().next().unwrap().uri().to_string();
+        assert!(
+            uri.starts_with("https://sts.ap-east-1.amazonaws.com"),
+            "{uri}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_role_no_sts_call_is_made() {
+        let http = sts_events(&[]);
+        let opts = opts(&[]);
+        let config = SqsSinkConfig::from_options(&opts).unwrap();
+        let loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http.clone());
+        let sdk = load_sdk_config(loader, &config, &opts)
+            .await
+            .expect("static credentials");
+        let creds = sdk
+            .credentials_provider()
+            .expect("credentials provider")
+            .provide_credentials()
+            .await
+            .expect("static credentials");
+        assert_eq!(creds.access_key_id(), "AKIDBASE");
+        assert_eq!(http.actual_requests().count(), 0);
     }
 }
