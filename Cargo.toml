@@ -87,6 +87,8 @@ regex = "1.11.1"
 s2-testcontainers = "0.39.1"
 streamling-e2e = "0.4.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# e2e tests print plugin/etl logs (captured; shown on failure).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 
 [lib]

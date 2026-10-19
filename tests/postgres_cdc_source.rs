@@ -67,8 +67,19 @@ fn collect_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ObservedRow> {
         .collect()
 }
 
+/// Routes plugin + etl logs to the test writer (shown on failure).
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn copy_then_stream_insert_update_delete() {
+    init_tracing();
     let Ok(url) = std::env::var("E2E_POSTGRES_CDC_URL") else {
         eprintln!("skipping: E2E_POSTGRES_CDC_URL not set");
         return;
@@ -261,6 +272,7 @@ async fn cleanup_pub_slot_and_table(pool: &sqlx::PgPool, publication: &str, tabl
 
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_create_publication_creates_and_streams() {
+    init_tracing();
     let Ok(url) = std::env::var("E2E_POSTGRES_CDC_URL") else {
         eprintln!("skipping: E2E_POSTGRES_CDC_URL not set");
         return;

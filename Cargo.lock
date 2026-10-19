@@ -1359,6 +1359,7 @@ dependencies = [
  "streamling-plugin",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uint",
  "url",
  "urlencoding",
