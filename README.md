@@ -56,13 +56,18 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 | YAML option | Required | Default | Description |
 |---|---|---|---|
 | `queue_url` | yes | — | SQS queue URL |
-| `region` | no | — | AWS region override |
-| `endpoint_url` | no | — | Custom SQS endpoint (e.g. LocalStack) |
-| `access_key_id` | no | — | AWS access key (env var preferred) |
+| `region` | no | from `queue_url` | AWS region of the queue. Defaults to the region in a standard `queue_url` (`sqs.<region>.amazonaws.com`). Role assumption uses the host's region, falling back to this one |
+| `endpoint_url` | no | — | Custom SQS endpoint (e.g. LocalStack). Applies to SQS only; role assumption still calls STS |
+| `access_key_id` | no | — | AWS access key (env var preferred). Must be set together with `secret_access_key` |
 | `secret_access_key` | no | — | AWS secret key (env var preferred) |
 | `session_token` | no | — | STS session token (env var preferred) |
+| `role_arn` | no | — | IAM role to assume before sending, e.g. a role in the queue owner's account. The static keys above, or the default credential chain, are used to assume it |
+| `external_id` | no | — | External ID sent with `sts:AssumeRole`. Read only from `STREAMLING__PLUGIN__SQS_SINK__EXTERNAL_ID`, never YAML, so whoever runs the pipeline chooses it rather than its author. Ignored without `role_arn` |
+| `role_session_name` | no | `streamling-sqs-sink` | Session name for the assumed role |
 | `one_row_per_request` | no | `true` | `true` sends one message per row (`{...}`). `false` packs several rows into one message as a JSON array (`[{...},{...}]`) |
 | `max_message_bytes` | no | `1048576` | Byte budget per message and per `SendMessageBatch` request. Lower it to match a queue whose `MaximumMessageSize` attribute is below the 1 MiB AWS default |
+
+Assumed-role credentials are refreshed automatically before they expire.
 
 #### Batching rows into one message
 
