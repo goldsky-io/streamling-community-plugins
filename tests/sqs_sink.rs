@@ -610,3 +610,234 @@ sinks:
         );
     }
 }
+
+// ============================================================================
+// Scenario 6: Assume a role before sending
+// ============================================================================
+
+const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/partner-role";
+
+/// Minimal STS endpoint: records each request's form parameters and answers
+/// AssumeRole with short-lived credentials, or with AccessDenied.
+struct MockSts {
+    url: String,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+}
+
+impl MockSts {
+    async fn start(deny: bool) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let content_length = text[..end]
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + content_length {
+                                break buf[end + 4..end + 4 + content_length].to_vec();
+                            }
+                        }
+                    };
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(url::form_urlencoded::parse(&body).into_owned().collect());
+                    let (status, xml) = if deny {
+                        (
+                            "403 Forbidden",
+                            r#"<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>not authorized to perform: sts:AssumeRole</Message></Error><RequestId>1</RequestId></ErrorResponse>"#.to_string(),
+                        )
+                    } else {
+                        let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
+                        (
+                            "200 OK",
+                            format!(
+                                r#"<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIAMOCKASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>{}</Expiration></Credentials><AssumedRoleUser><AssumedRoleId>AROAMOCK:s</AssumedRoleId><Arn>arn:aws:sts::123456789012:assumed-role/partner-role/s</Arn></AssumedRoleUser></AssumeRoleResult></AssumeRoleResponse>"#,
+                                expiration.format("%Y-%m-%dT%H:%M:%SZ")
+                            ),
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{xml}",
+                        xml.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        MockSts { url, calls }
+    }
+
+    fn calls(&self) -> Vec<std::collections::HashMap<String, String>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+fn role_pipeline(input_topic: &str, queue_url: &str, endpoint_url: &str) -> String {
+    format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {input_topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  sqs_sink:
+    type: sqs
+    from: kafka_source
+    queue_url: {queue_url}
+    endpoint_url: {endpoint_url}
+    region: us-east-1
+    role_arn: {ROLE_ARN}
+    external_id: from-yaml
+"#
+    )
+}
+
+/// The external ID set through env wins over the one in YAML, every
+/// AssumeRole goes to STS rather than the SQS endpoint, and rows still arrive.
+#[tokio::test]
+async fn test_sqs_sink_assumes_role_with_env_external_id() {
+    init_tracing();
+    let sts = MockSts::start(false).await;
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_sqs())
+        .await
+        .expect("Failed to create test context");
+    let sqs = ctx.sqs.as_ref().expect("SQS resource should be created");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce = 5;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &role_pipeline(&ctx.kafka_topic, &sqs.queue_url, &sqs.endpoint_url),
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .env("AWS_ENDPOINT_URL_STS", &sts.url)
+                .env(
+                    "STREAMLING__PLUGIN__SQS_SINK__EXTERNAL_ID",
+                    "tenant:from-env",
+                )
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let calls = sts.calls();
+    assert!(!calls.is_empty(), "the sink never called STS");
+    for call in &calls {
+        assert_eq!(call.get("Action").map(String::as_str), Some("AssumeRole"));
+        assert_eq!(call.get("RoleArn").map(String::as_str), Some(ROLE_ARN));
+        assert_eq!(
+            call.get("ExternalId").map(String::as_str),
+            Some("tenant:from-env")
+        );
+        assert_eq!(
+            call.get("RoleSessionName").map(String::as_str),
+            Some("streamling-sqs-sink")
+        );
+    }
+
+    let messages = sqs
+        .receive_all_messages(records_to_produce as usize + 10, Duration::from_secs(10))
+        .await
+        .expect("Failed to receive messages from SQS");
+    assert_eq!(messages.len(), records_to_produce as usize);
+}
+
+/// A denied AssumeRole fails the pipeline instead of writing anything.
+#[tokio::test]
+async fn test_sqs_sink_fails_when_role_is_denied() {
+    init_tracing();
+    let sts = MockSts::start(true).await;
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_sqs())
+        .await
+        .expect("Failed to create test context");
+    let sqs = ctx.sqs.as_ref().expect("SQS resource should be created");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    ctx.kafka
+        .produce_avro_records(&[TestRecord {
+            id: 1,
+            value: "value_1".to_string(),
+            timestamp: 1001,
+        }])
+        .await
+        .expect("Failed to produce records");
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &role_pipeline(&ctx.kafka_topic, &sqs.queue_url, &sqs.endpoint_url),
+            PipelineOpts::new()
+                .record_limit(1)
+                .env("AWS_ENDPOINT_URL_STS", &sts.url)
+                .env(
+                    "STREAMLING__PLUGIN__SQS_SINK__EXTERNAL_ID",
+                    "tenant:from-env",
+                )
+                .timeout(Duration::from_secs(60)),
+        )
+        .await;
+    // The harness reports a non-zero exit as an error.
+    assert!(
+        status.map_or(true, |status| !status.success()),
+        "a denied AssumeRole must fail the pipeline"
+    );
+    assert!(!sts.calls().is_empty(), "the sink never called STS");
+
+    let messages = sqs
+        .receive_all_messages(10, Duration::from_secs(5))
+        .await
+        .expect("Failed to receive messages from SQS");
+    assert!(
+        messages.is_empty(),
+        "nothing may be written without the role"
+    );
+}

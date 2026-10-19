@@ -56,10 +56,6 @@ pub struct CloudTrailSourceConfig {
     pub on_malformed: OnMalformed,
 }
 
-fn optional(opts: &PluginOptions, key: &str) -> Option<String> {
-    opts.lookup(key).filter(|value| !value.is_empty())
-}
-
 fn parse_start_time(opts: &PluginOptions) -> Result<StartTime, PluginError> {
     let value = opts.get_or("start_time", "now");
     match value.to_ascii_lowercase().as_str() {
@@ -119,8 +115,8 @@ fn parse_on_malformed(opts: &PluginOptions) -> Result<OnMalformed, PluginError> 
 pub fn parse_config(opts: &PluginOptions) -> Result<CloudTrailSourceConfig, PluginError> {
     // A lone access key would silently fall back to the default credential
     // chain — and possibly a different account. Catch it before startup.
-    let has_access_key = optional(opts, "access_key_id").is_some();
-    let has_secret_key = optional(opts, "secret_access_key").is_some();
+    let has_access_key = opts.lookup_non_empty("access_key_id").is_some();
+    let has_secret_key = opts.lookup_non_empty("secret_access_key").is_some();
     if has_access_key != has_secret_key {
         return Err(PluginError::Internal(
             "cloudtrail_source: access_key_id and secret_access_key must be set \
@@ -144,8 +140,8 @@ pub fn parse_config(opts: &PluginOptions) -> Result<CloudTrailSourceConfig, Plug
     }
 
     Ok(CloudTrailSourceConfig {
-        region: optional(opts, "region"),
-        endpoint_url: optional(opts, "endpoint_url"),
+        region: opts.lookup_non_empty("region"),
+        endpoint_url: opts.lookup_non_empty("endpoint_url"),
         start_time: parse_start_time(opts)?,
         poll_interval_secs: opts
             .get_parsed::<NonZeroU64>("poll_interval_secs", "60")?
