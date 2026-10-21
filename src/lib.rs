@@ -13,6 +13,7 @@ use crate::sinks::sqs::sink::SqsSink;
 use crate::sources::cloudtrail::CloudTrailSource;
 use crate::sources::iceberg::IcebergSource;
 use crate::sources::s2::S2Source;
+use crate::transforms::erc7984_decode::Erc7984DecodeTransform;
 use crate::transforms::zama_decrypt::ZamaDecryptTransform;
 
 use streamling_plugin::{
@@ -29,6 +30,7 @@ register_plugin_source!("s2_source", S2Source);
 register_plugin_source!("postgres_cdc_source", PostgresCdcSource);
 register_plugin_source!("cloudtrail_source", CloudTrailSource);
 register_plugin_source!("iceberg_source", IcebergSource);
+register_plugin_transform!("erc7984_decode", Erc7984DecodeTransform);
 register_plugin_transform!("zama_decrypt", ZamaDecryptTransform);
 
 init_plugin_with_async_runtime!();

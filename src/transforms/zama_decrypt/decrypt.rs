@@ -1,14 +1,15 @@
 //! Turns decoded transfers into cleartext amounts. Each handle is decrypted on
 //! behalf of one of the two transfer parties that delegated to us. Rows with
-//! no delegating party, or that the relayer rejects, are reported in place;
-//! a daemon that cannot be reached fails the whole batch instead.
+//! no delegating party, or that the relayer refuses for good, are reported in
+//! place; a failure that may clear on a retry fails the whole batch instead.
 
 use super::decode::DecodedTransfer;
 use alloy_primitives::{Address, B256};
+use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 use zama_sdk::{
     BatchItem, ClearValue, ClientError, DelegatedBatchOptions, DelegationQuery, DelegationStatus,
     EncryptedInput, ErrorKind, Sdk, SdkError, async_trait,
@@ -22,21 +23,22 @@ pub struct Decrypted {
     pub error: Option<String>,
 }
 
-/// A failed daemon call, split by who has to deal with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendError {
-    /// The SDK answered: the request itself was refused (ACL, relayer, input).
-    /// Reported on the affected rows; the batch still goes through.
-    Sdk(String),
-    /// The daemon could not be reached, or the context on it is gone. The
-    /// batch fails so the host retries it, and the connection is rebuilt.
-    Connection(String),
+    /// The request was refused for good (ACL, relayer, input). Reported on
+    /// the affected rows; the batch still goes through.
+    Rejected(String),
+    /// May clear on a retry: daemon unreachable, context gone, or an SDK error
+    /// flagged retryable (relayer timeout, RPC rate limit, delegation not yet
+    /// propagated). Fails the batch so Streamling replays it instead of
+    /// writing nulls.
+    Transient(String),
 }
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sdk(message) | Self::Connection(message) => f.write_str(message),
+            Self::Rejected(message) | Self::Transient(message) => f.write_str(message),
         }
     }
 }
@@ -44,14 +46,18 @@ impl fmt::Display for BackendError {
 impl From<ClientError> for BackendError {
     fn from(error: ClientError) -> Self {
         match error.kind() {
-            ErrorKind::Sdk | ErrorKind::InvalidInput => Self::Sdk(error.to_string()),
-            kind => Self::Connection(format!("{error} ({kind:?})")),
+            ErrorKind::Sdk | ErrorKind::InvalidInput => {
+                if error.sdk_error().is_some_and(|sdk| sdk.retryable) {
+                    Self::Transient(format!("{error} (retryable)"))
+                } else {
+                    Self::Rejected(error.to_string())
+                }
+            }
+            kind => Self::Transient(format!("{error} ({kind:?})")),
         }
     }
 }
 
-/// The daemon calls the decryptor needs. A trait so the selection, caching
-/// and error handling can be tested without a daemon.
 #[async_trait]
 pub trait Backend: Send + Sync {
     async fn delegation_status(
@@ -116,11 +122,27 @@ struct Delegation {
     expiry_timestamp: u64,
 }
 
+impl Delegation {
+    fn is_fresh(&self, now: Instant) -> bool {
+        let age = now.saturating_duration_since(self.checked_at);
+        if self.active {
+            age < ACTIVE_RECHECK && !expired(self.expiry_timestamp)
+        } else {
+            age < INACTIVE_RECHECK
+        }
+    }
+}
+
 /// How long an active answer is trusted. Bounded because a permanent
 /// delegation has no expiry to fall back on, and revocations must be seen.
 const ACTIVE_RECHECK: Duration = Duration::from_secs(5 * 60);
-/// How long an inactive answer is trusted before asking the chain again.
 const INACTIVE_RECHECK: Duration = Duration::from_secs(60);
+/// Each lookup is a daemon round trip to the RPC; serial lookups stall a
+/// backfill over many holders.
+const LOOKUP_CONCURRENCY: usize = 8;
+
+/// Per `(token, party)`: whether the party delegated to us, or why the lookup was refused.
+type DelegationAnswers = HashMap<(Address, Address), Result<bool, String>>;
 
 impl<B: Backend> Decryptor<B> {
     pub fn new(backend: B, delegate: Address, max_concurrency: Option<u32>) -> Self {
@@ -137,25 +159,29 @@ impl<B: Backend> Decryptor<B> {
     }
 
     /// Output has the same length as `rows`; entries without a transfer stay
-    /// default. `Err` means the daemon is unusable and nothing was produced.
+    /// default. `Err` means the batch must be replayed and nothing was produced.
     pub async fn decrypt(
         &self,
         rows: &[Option<DecodedTransfer>],
     ) -> Result<Vec<Decrypted>, BackendError> {
         let mut output = vec![Decrypted::default(); rows.len()];
+        let transfers: Vec<(usize, DecodedTransfer)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, transfer)| transfer.map(|transfer| (row, transfer)))
+            .collect();
+        let answers = self.delegation_answers(&transfers).await?;
         // Group by delegator: the batch RPC decrypts for one delegator per call.
         let mut groups: HashMap<Address, Vec<(usize, DecodedTransfer)>> = HashMap::new();
-        for (row, transfer) in rows.iter().enumerate() {
-            let Some(transfer) = transfer else { continue };
-            match self.pick_delegator(transfer).await {
-                Ok(Some(delegator)) => groups.entry(delegator).or_default().push((row, *transfer)),
+        for (row, transfer) in transfers {
+            match pick_delegator(&transfer, &answers) {
+                Ok(Some(delegator)) => groups.entry(delegator).or_default().push((row, transfer)),
                 Ok(None) => {
                     output[row].error = Some("no active delegation from either party".into());
                 }
-                Err(BackendError::Sdk(message)) => {
+                Err(message) => {
                     output[row].error = Some(format!("delegation check failed: {message}"));
                 }
-                Err(error) => return Err(error),
             }
         }
         for (delegator, entries) in groups {
@@ -178,10 +204,10 @@ impl<B: Backend> Decryptor<B> {
                 .await
             {
                 Ok(items) => items,
-                Err(BackendError::Sdk(message)) => {
+                Err(BackendError::Rejected(message)) => {
                     tracing::warn!(%delegator, "zama_decrypt: batch decrypt failed: {message}");
                     for (row, transfer) in entries {
-                        self.forget(transfer.token, delegator).await;
+                        self.forget(transfer.token, delegator);
                         output[row].error = Some(format!("batch decrypt failed: {message}"));
                     }
                     continue;
@@ -206,9 +232,16 @@ impl<B: Backend> Decryptor<B> {
                         Ok(amount) => cell.amount = Some(amount),
                         Err(error) => cell.error = Some(error),
                     },
+                    Some(Err(error)) if error.retryable => {
+                        // A relayer blip must not become a permanent null row.
+                        return Err(BackendError::Transient(format!(
+                            "{}: {} (retryable)",
+                            error.code, error.message
+                        )));
+                    }
                     Some(Err(error)) => {
                         // The delegation may have been revoked; re-read it next time.
-                        self.forget(transfer.token, delegator).await;
+                        self.forget(transfer.token, delegator);
                         cell.error = Some(format!("{}: {}", error.code, error.message));
                     }
                     None => cell.error = Some("relayer returned no result for handle".into()),
@@ -218,70 +251,133 @@ impl<B: Backend> Decryptor<B> {
         Ok(output)
     }
 
-    /// Prefers the receiver, since balances are what downstream consumers track.
-    async fn pick_delegator(
+    /// Receivers first, then only the senders of transfers whose receiver did
+    /// not delegate, so the receiver preference costs no extra lookups.
+    async fn delegation_answers(
         &self,
-        transfer: &DecodedTransfer,
-    ) -> Result<Option<Address>, BackendError> {
-        for party in [transfer.to, transfer.from] {
-            if party == Address::ZERO {
-                continue;
-            }
-            if self.is_delegated(transfer.token, party).await? {
-                return Ok(Some(party));
-            }
-        }
-        Ok(None)
+        transfers: &[(usize, DecodedTransfer)],
+    ) -> Result<DelegationAnswers, BackendError> {
+        let mut answers = DelegationAnswers::new();
+        let receivers = transfers
+            .iter()
+            .map(|(_, transfer)| (transfer.token, transfer.to));
+        self.resolve(receivers, &mut answers).await?;
+        let senders: Vec<(Address, Address)> = transfers
+            .iter()
+            .filter(|(_, transfer)| {
+                !matches!(
+                    answers.get(&(transfer.token, transfer.to)),
+                    Some(Ok(true)) | Some(Err(_))
+                )
+            })
+            .map(|(_, transfer)| (transfer.token, transfer.from))
+            .collect();
+        self.resolve(senders.into_iter(), &mut answers).await?;
+        Ok(answers)
     }
 
-    async fn is_delegated(&self, token: Address, delegator: Address) -> Result<bool, BackendError> {
+    async fn resolve(
+        &self,
+        pairs: impl Iterator<Item = (Address, Address)>,
+        answers: &mut DelegationAnswers,
+    ) -> Result<(), BackendError> {
         let now = Instant::now();
-        if let Some(cached) = self
+        let mut pending: HashSet<(Address, Address)> = HashSet::new();
+        {
+            let mut cache = self
+                .delegations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cache.retain(|_, delegation| delegation.is_fresh(now));
+            for pair in pairs {
+                if pair.1 == Address::ZERO || answers.contains_key(&pair) {
+                    continue;
+                }
+                match cache.get(&pair) {
+                    Some(cached) => {
+                        answers.insert(pair, Ok(cached.active));
+                    }
+                    None => {
+                        pending.insert(pair);
+                    }
+                }
+            }
+        }
+        let results: Vec<((Address, Address), Result<DelegationStatus, BackendError>)> =
+            stream::iter(pending)
+                .map(|(token, delegator)| async move {
+                    let status = self
+                        .backend
+                        .delegation_status(DelegationQuery {
+                            contract_address: token,
+                            delegator_address: delegator,
+                            delegate_address: self.delegate,
+                        })
+                        .await;
+                    ((token, delegator), status)
+                })
+                .buffer_unordered(LOOKUP_CONCURRENCY)
+                .collect()
+                .await;
+        let mut cache = self
             .delegations
             .lock()
-            .await
-            .get(&(token, delegator))
-            .copied()
-        {
-            let age = now.saturating_duration_since(cached.checked_at);
-            let fresh = if cached.active {
-                age < ACTIVE_RECHECK && !expired(cached.expiry_timestamp)
-            } else {
-                age < INACTIVE_RECHECK
-            };
-            if fresh {
-                return Ok(cached.active);
+            .unwrap_or_else(PoisonError::into_inner);
+        for ((token, delegator), status) in results {
+            match status {
+                Ok(status) => {
+                    tracing::debug!(
+                        %token,
+                        %delegator,
+                        active = status.is_active,
+                        expiry = status.expiry_timestamp,
+                        "zama_decrypt: delegation status fetched"
+                    );
+                    cache.insert(
+                        (token, delegator),
+                        Delegation {
+                            active: status.is_active,
+                            checked_at: now,
+                            expiry_timestamp: status.expiry_timestamp,
+                        },
+                    );
+                    answers.insert((token, delegator), Ok(status.is_active));
+                }
+                Err(BackendError::Rejected(message)) => {
+                    answers.insert((token, delegator), Err(message));
+                }
+                Err(error) => return Err(error),
             }
         }
-        let status = self
-            .backend
-            .delegation_status(DelegationQuery {
-                contract_address: token,
-                delegator_address: delegator,
-                delegate_address: self.delegate,
-            })
-            .await?;
-        tracing::debug!(
-            %token,
-            %delegator,
-            active = status.is_active,
-            expiry = status.expiry_timestamp,
-            "zama_decrypt: delegation status fetched"
-        );
-        self.delegations.lock().await.insert(
-            (token, delegator),
-            Delegation {
-                active: status.is_active,
-                checked_at: now,
-                expiry_timestamp: status.expiry_timestamp,
-            },
-        );
-        Ok(status.is_active)
+        Ok(())
     }
 
-    async fn forget(&self, token: Address, delegator: Address) {
-        self.delegations.lock().await.remove(&(token, delegator));
+    fn forget(&self, token: Address, delegator: Address) {
+        self.delegations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(token, delegator));
     }
+}
+
+/// Prefers the receiver, since balances are what downstream consumers track.
+/// A refused lookup for the receiver is reported as is rather than falling
+/// back to the sender, so the row says why it was not decrypted.
+fn pick_delegator(
+    transfer: &DecodedTransfer,
+    answers: &DelegationAnswers,
+) -> Result<Option<Address>, String> {
+    for party in [transfer.to, transfer.from] {
+        if party == Address::ZERO {
+            continue;
+        }
+        match answers.get(&(transfer.token, party)) {
+            Some(Ok(true)) => return Ok(Some(party)),
+            Some(Err(message)) => return Err(message.clone()),
+            Some(Ok(false)) | None => {}
+        }
+    }
+    Ok(None)
 }
 
 /// A clock that cannot be read counts as expired, so the chain is asked again.
@@ -306,11 +402,13 @@ fn render(value: &ClearValue) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use zama_sdk::{BigInt, PERMANENT_DELEGATION_EXPIRY};
 
     const TOKEN: Address = Address::repeat_byte(0x11);
     const ALICE: Address = Address::repeat_byte(0xaa);
     const BOB: Address = Address::repeat_byte(0xbb);
+    const CAROL: Address = Address::repeat_byte(0xcc);
     const DELEGATE: Address = Address::repeat_byte(0xdd);
     const HANDLE: B256 = B256::repeat_byte(0x01);
     const OTHER_HANDLE: B256 = B256::repeat_byte(0x02);
@@ -324,26 +422,28 @@ mod tests {
         })
     }
 
-    fn sdk_error(code: &str) -> SdkError {
+    fn sdk_error(code: &str, retryable: bool) -> SdkError {
         SdkError {
             code: code.into(),
             message: "nope".into(),
-            retryable: false,
+            retryable,
             retry_after_seconds: None,
             revert_data: None,
         }
     }
 
-    /// Scripted daemon: delegation answers per delegator, one batch answer
-    /// per call in order, and a record of what was asked.
     type BatchAnswer = Result<Vec<(B256, Result<ClearValue, SdkError>)>, BackendError>;
 
+    /// Scripted daemon: delegation answers per delegator, one batch answer
+    /// per call in order, and a record of what was asked.
     #[derive(Default)]
     struct Fake {
         delegations: HashMap<Address, Result<DelegationStatus, BackendError>>,
         batches: StdMutex<Vec<BatchAnswer>>,
         status_calls: StdMutex<Vec<Address>>,
         batch_calls: StdMutex<Vec<(Address, Vec<B256>)>>,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
     }
 
     impl Fake {
@@ -380,6 +480,11 @@ mod tests {
             query: DelegationQuery,
         ) -> Result<DelegationStatus, BackendError> {
             assert_eq!(query.delegate_address, DELEGATE);
+            let running = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(running, Ordering::SeqCst);
+            // Let the other lookups of the same round start before answering.
+            tokio::task::yield_now().await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.status_calls
                 .lock()
                 .unwrap()
@@ -458,6 +563,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_lookups_run_concurrently_and_skip_senders_when_the_receiver_delegated() {
+        let fake = Fake::default()
+            .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
+            .delegated(BOB, PERMANENT_DELEGATION_EXPIRY)
+            .delegated(CAROL, PERMANENT_DELEGATION_EXPIRY)
+            .batch(vec![(HANDLE, Ok(ClearValue::Number(1)))])
+            .batch(vec![(HANDLE, Ok(ClearValue::Number(1)))])
+            .batch(vec![(HANDLE, Ok(ClearValue::Number(1)))]);
+        let decryptor = with(fake);
+        let rows = [
+            transfer(DELEGATE, ALICE, HANDLE),
+            transfer(DELEGATE, BOB, HANDLE),
+            transfer(DELEGATE, CAROL, HANDLE),
+        ];
+        let out = decryptor.decrypt(&rows).await.expect("batch ok");
+        assert!(out.iter().all(|row| row.amount.is_some()));
+        // The three receivers were looked up in one concurrent round, and no
+        // sender was asked because every receiver had delegated.
+        assert_eq!(decryptor.backend.max_in_flight.load(Ordering::SeqCst), 3);
+        let mut asked = decryptor.backend.status_calls.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec![ALICE, BOB, CAROL]);
+    }
+
+    #[tokio::test]
     async fn duplicate_handles_are_asked_once_and_filled_twice() {
         let fake = Fake::default()
             .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
@@ -476,7 +606,7 @@ mod tests {
     async fn relayer_rejection_is_a_row_error_and_evicts_the_delegation() {
         let fake = Fake::default()
             .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
-            .batch(vec![(HANDLE, Err(sdk_error("NOT_ENTITLED")))])
+            .batch(vec![(HANDLE, Err(sdk_error("NOT_ENTITLED", false)))])
             .batch(vec![(HANDLE, Ok(ClearValue::Number(1)))]);
         let decryptor = with(fake);
         let rows = [transfer(BOB, ALICE, HANDLE)];
@@ -490,10 +620,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retryable_relayer_error_fails_the_batch_instead_of_nulling_the_row() {
+        let fake = Fake::default()
+            .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
+            .batch(vec![(HANDLE, Err(sdk_error("RELAYER_TIMEOUT", true)))]);
+        let decryptor = with(fake);
+        let error = decryptor
+            .decrypt(&[transfer(BOB, ALICE, HANDLE)])
+            .await
+            .expect_err("must fail");
+        assert_eq!(
+            error,
+            BackendError::Transient("RELAYER_TIMEOUT: nope (retryable)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_delegation_lookup_is_a_row_error() {
+        let mut fake = Fake::default();
+        fake.delegations
+            .insert(ALICE, Err(BackendError::Rejected("bad contract".into())));
+        let decryptor = with(fake);
+        let out = decryptor
+            .decrypt(&[transfer(BOB, ALICE, HANDLE)])
+            .await
+            .expect("batch ok");
+        assert_eq!(
+            out[0].error.as_deref(),
+            Some("delegation check failed: bad contract")
+        );
+    }
+
+    #[tokio::test]
     async fn sdk_level_batch_failure_marks_rows_without_failing_the_batch() {
         let fake = Fake::default()
             .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
-            .batch_error(BackendError::Sdk("relayer said no".into()));
+            .batch_error(BackendError::Rejected("relayer said no".into()));
         let decryptor = with(fake);
         let out = decryptor
             .decrypt(&[transfer(BOB, ALICE, HANDLE)])
@@ -506,20 +668,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_failure_fails_the_batch() {
+    async fn transient_failure_fails_the_batch() {
         let fake = Fake::default()
             .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
-            .batch_error(BackendError::Connection("context lost".into()));
+            .batch_error(BackendError::Transient("context lost".into()));
         let decryptor = with(fake);
         let error = decryptor
             .decrypt(&[transfer(BOB, ALICE, HANDLE)])
             .await
             .expect_err("must fail");
-        assert_eq!(error, BackendError::Connection("context lost".into()));
+        assert_eq!(error, BackendError::Transient("context lost".into()));
 
         let mut fake = Fake::default();
         fake.delegations
-            .insert(ALICE, Err(BackendError::Connection("socket closed".into())));
+            .insert(ALICE, Err(BackendError::Transient("socket closed".into())));
         let decryptor = with(fake);
         assert!(
             decryptor
@@ -540,6 +702,32 @@ mod tests {
         decryptor.decrypt(&rows).await.expect("batch ok");
         decryptor.decrypt(&rows).await.expect("batch ok");
         assert_eq!(decryptor.backend.status_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_cache_entries_are_swept_on_the_next_batch() {
+        let fake = Fake::default()
+            .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
+            .batch(vec![(HANDLE, Ok(ClearValue::Number(1)))]);
+        let decryptor = with(fake);
+        // An active answer whose on-chain expiry has passed is no longer fresh.
+        decryptor.delegations.lock().unwrap().insert(
+            (TOKEN, CAROL),
+            Delegation {
+                active: true,
+                checked_at: Instant::now(),
+                expiry_timestamp: 1,
+            },
+        );
+        decryptor
+            .decrypt(&[transfer(BOB, ALICE, HANDLE)])
+            .await
+            .expect("batch ok");
+        let cache = decryptor.delegations.lock().unwrap();
+        assert!(!cache.contains_key(&(TOKEN, CAROL)));
+        assert!(cache.contains_key(&(TOKEN, ALICE)));
+        // Bob was never asked: Alice, the receiver, had delegated.
+        assert!(!cache.contains_key(&(TOKEN, BOB)));
     }
 
     #[test]

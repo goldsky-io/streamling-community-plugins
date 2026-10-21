@@ -5,10 +5,10 @@ edition = "2024"
 
 [dependencies]
 streamling-plugin = "0.2.3"
-# Rust client for the Zama SDK daemon, not yet published to crates.io: pinned
-# to a commit of zama-ai/sdk (package clients/rust). The daemon speaks a beta
-# protocol, so bump this rev together with the daemon image.
-zama-sdk = { git = "https://github.com/zama-ai/sdk", rev = "3858a8add72bd014db99e056757ddb897495feb7" }
+# Rust client for the Zama SDK daemon. Pinned exactly: the daemon protocol is
+# beta and the client must run at the same version as the daemon, which is
+# built from the matching `v<version>` tag of zama-ai/sdk.
+zama_sdk = "=3.8.0-beta.5"
 alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
 # EIP-712 hashing and secp256k1 signing of decryption permits.
 alloy-dyn-abi = { version = "1.7", default-features = false, features = ["std", "eip712"] }

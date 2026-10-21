@@ -1,6 +1,6 @@
 use super::config::{PLUGIN_NAME, Settings};
 use super::daemon;
-use super::decode::{DecodedTransfer, decode_batch, validate_columns};
+use super::decode::{decode_batch, validate_columns};
 use super::decrypt::{Decrypted, Decryptor, SdkBackend};
 use crate::utils::plugin_options::configuration_error;
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
@@ -16,26 +16,18 @@ use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{
     CheckpointEpoch, PluginError, PluginInitializationError, PluginLabel, TransformPlugin,
 };
-use tokio::sync::RwLock;
+use tokio::sync::OnceCell;
 
-/// Columns appended to every row. Nullable: rows that are not confidential
-/// transfers pass through with all of them null.
-pub const OUTPUT_COLUMNS: [&str; 6] = [
-    "zama_token",
-    "zama_from",
-    "zama_to",
-    "zama_handle",
-    "zama_amount",
-    "zama_delegator",
-];
+/// Appended to every row; all null when the row is not a decoded transfer.
+pub const OUTPUT_COLUMNS: [&str; 2] = ["zama_amount", "zama_delegator"];
 pub const ERROR_COLUMN: &str = "zama_error";
 
 pub struct ZamaDecryptTransform {
     settings: Settings,
     output_schema: SchemaRef,
-    /// The daemon session. Dropped after a connection failure so the next
-    /// batch reconnects.
-    decryptor: RwLock<Option<Arc<Decryptor<SdkBackend>>>>,
+    /// No reconnect path: Streamling terminates a transform on any batch error
+    /// and restarts the pipeline, which replays the batch into a new instance.
+    decryptor: OnceCell<Decryptor<SdkBackend>>,
     metrics: PluginMetricsRecorder,
     running: Arc<AtomicBool>,
 }
@@ -54,41 +46,28 @@ impl ZamaDecryptTransform {
         Ok(Self {
             settings,
             output_schema,
-            decryptor: RwLock::new(None),
+            decryptor: OnceCell::new(),
             metrics,
             running: Arc::new(AtomicBool::new(true)),
         })
     }
 
-    async fn decryptor(&self) -> Result<Arc<Decryptor<SdkBackend>>, PluginError> {
-        if let Some(decryptor) = self.decryptor.read().await.as_ref() {
-            return Ok(decryptor.clone());
-        }
-        let mut slot = self.decryptor.write().await;
-        if let Some(decryptor) = slot.as_ref() {
-            return Ok(decryptor.clone());
-        }
-        let sdk = daemon::connect(&self.settings).await?;
-        let decryptor = Arc::new(Decryptor::new(
-            SdkBackend(sdk),
-            self.settings.delegate_address(),
-            self.settings.max_concurrency,
-        ));
-        *slot = Some(decryptor.clone());
-        tracing::info!(
-            delegate = %self.settings.delegate_address(),
-            chain_id = self.settings.chain_id,
-            "{PLUGIN_NAME}: connected to daemon"
-        );
-        Ok(decryptor)
-    }
-
-    async fn disconnect(&self) {
-        if let Some(decryptor) = self.decryptor.write().await.take()
-            && let Err(error) = decryptor.close().await
-        {
-            tracing::warn!("{PLUGIN_NAME}: closing SDK context failed: {error}");
-        }
+    async fn decryptor(&self) -> Result<&Decryptor<SdkBackend>, PluginError> {
+        self.decryptor
+            .get_or_try_init(|| async {
+                let sdk = daemon::connect(&self.settings).await?;
+                tracing::info!(
+                    delegate = %self.settings.delegate_address(),
+                    chain_id = self.settings.chain_id,
+                    "{PLUGIN_NAME}: connected to daemon"
+                );
+                Ok(Decryptor::new(
+                    SdkBackend(sdk),
+                    self.settings.delegate_address(),
+                    self.settings.max_concurrency,
+                ))
+            })
+            .await
     }
 }
 
@@ -96,7 +75,6 @@ fn configuration(message: String) -> PluginInitializationError {
     PluginInitializationError::Configuration(format!("{PLUGIN_NAME}: {message}").into())
 }
 
-/// Input schema plus the plugin's columns. Rejects inputs that already carry them.
 pub fn output_schema(input: &SchemaRef) -> Result<SchemaRef, String> {
     let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
     for name in OUTPUT_COLUMNS.iter().chain([&ERROR_COLUMN]) {
@@ -114,18 +92,10 @@ pub fn output_schema(input: &SchemaRef) -> Result<SchemaRef, String> {
 fn append_columns(
     batch: &RecordBatch,
     schema: SchemaRef,
-    decoded: &[Option<DecodedTransfer>],
     decrypted: &[Decrypted],
 ) -> Result<RecordBatch, PluginError> {
     let text = |values: Vec<Option<String>>| Arc::new(StringArray::from(values)) as ArrayRef;
-    let transfer = |f: fn(&DecodedTransfer) -> String| {
-        text(decoded.iter().map(|row| row.as_ref().map(f)).collect())
-    };
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    columns.push(transfer(|t| format!("{:#x}", t.token)));
-    columns.push(transfer(|t| format!("{:#x}", t.from)));
-    columns.push(transfer(|t| format!("{:#x}", t.to)));
-    columns.push(transfer(|t| format!("{:#x}", t.handle)));
     columns.push(text(
         decrypted.iter().map(|row| row.amount.clone()).collect(),
     ));
@@ -149,7 +119,11 @@ impl SupportsGracefulShutdown for ZamaDecryptTransform {
 
     async fn terminate(&self) -> Result<(), PluginError> {
         self.running.store(false, Ordering::SeqCst);
-        self.disconnect().await;
+        if let Some(decryptor) = self.decryptor.get()
+            && let Err(error) = decryptor.close().await
+        {
+            tracing::warn!("{PLUGIN_NAME}: closing SDK context failed: {error}");
+        }
         Ok(())
     }
 }
@@ -179,18 +153,15 @@ impl TransformPlugin for ZamaDecryptTransform {
         let decrypted = if transfers == 0 {
             vec![Decrypted::default(); decoded.len()]
         } else {
-            let decryptor = self.decryptor().await?;
-            match decryptor.decrypt(&decoded).await {
-                Ok(decrypted) => decrypted,
-                Err(error) => {
-                    // Nothing was emitted for this batch; drop the session so
-                    // the next attempt reconnects.
-                    self.disconnect().await;
-                    return Err(PluginError::Execution(format!(
-                        "{PLUGIN_NAME}: daemon unavailable: {error}"
-                    )));
-                }
-            }
+            self.decryptor()
+                .await?
+                .decrypt(&decoded)
+                .await
+                .map_err(|error| {
+                    PluginError::Execution(format!(
+                        "{PLUGIN_NAME}: failing the batch for replay: {error}"
+                    ))
+                })?
         };
         let failed = decrypted.iter().filter(|row| row.error.is_some()).count();
         self.metrics
@@ -201,7 +172,7 @@ impl TransformPlugin for ZamaDecryptTransform {
             .record_count("zama_decrypt.failed", failed as u64);
         self.metrics
             .record_latency("zama_decrypt.batch", started.elapsed());
-        append_columns(&batch, self.output_schema.clone(), &decoded, &decrypted)
+        append_columns(&batch, self.output_schema.clone(), &decrypted)
     }
 
     async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
@@ -218,17 +189,16 @@ impl TransformPlugin for ZamaDecryptTransform {
 
 #[cfg(test)]
 mod tests {
-    use super::super::decode::tests::{FROM, HANDLE, TO, TOKEN, batch, columns, transfer_topic};
+    use super::super::decode::tests::{FROM, HANDLE, TO, TOKEN, batch};
     use super::*;
     use alloy_primitives::Address;
     use arrow::array::Array;
-    use std::collections::HashSet;
 
     #[test]
     fn output_schema_appends_nullable_text_columns() {
         let input = batch(&[]).schema();
         let output = output_schema(&input).expect("schema");
-        assert_eq!(output.fields().len(), input.fields().len() + 7);
+        assert_eq!(output.fields().len(), input.fields().len() + 3);
         let field = output.field_with_name("zama_amount").expect("field");
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert!(field.is_nullable());
@@ -246,18 +216,10 @@ mod tests {
 
     #[test]
     fn appended_columns_line_up_with_rows() {
-        let topic = transfer_topic();
         let input = batch(&[
-            [
-                Some(TOKEN),
-                Some(&topic),
-                Some(FROM),
-                Some(TO),
-                Some(HANDLE),
-            ],
-            [Some(TOKEN), Some("0x00"), None, None, None],
+            [Some(TOKEN), Some(FROM), Some(TO), Some(HANDLE)],
+            [Some(TOKEN), None, None, None],
         ]);
-        let decoded = decode_batch(&input, &columns(), &HashSet::new()).expect("decode");
         let decrypted = vec![
             Decrypted {
                 amount: Some("42".into()),
@@ -267,7 +229,7 @@ mod tests {
             Decrypted::default(),
         ];
         let schema = output_schema(&input.schema()).expect("schema");
-        let output = append_columns(&input, schema, &decoded, &decrypted).expect("batch");
+        let output = append_columns(&input, schema, &decrypted).expect("batch");
         assert_eq!(output.num_rows(), 2);
         let amount = output
             .column_by_name("zama_amount")
@@ -277,13 +239,13 @@ mod tests {
             .expect("utf8");
         assert_eq!(amount.value(0), "42");
         assert!(amount.is_null(1));
-        let token = output
-            .column_by_name("zama_token")
+        let delegator = output
+            .column_by_name("zama_delegator")
             .expect("column")
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("utf8");
-        assert_eq!(token.value(0), TOKEN);
-        assert!(token.is_null(1));
+        assert_eq!(delegator.value(0), format!("{:#x}", Address::ZERO));
+        assert!(delegator.is_null(1));
     }
 }
