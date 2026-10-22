@@ -30,6 +30,7 @@ use etl::config::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PgConnectionConfig,
     PipelineConfig, TableSyncCopyConfig, TcpKeepaliveConfig, TlsConfig,
 };
+use etl_config::shared::Validate;
 use sha2::{Digest, Sha256};
 use streamling_plugin::PluginError;
 
@@ -207,6 +208,11 @@ pub fn parse_options(options: &PluginOptions) -> Result<ParsedConfig, PluginErro
         table_sync_copy: TableSyncCopyConfig::default(),
         invalidated_slot_behavior: InvalidatedSlotBehavior::default(),
         max_copy_connections_per_table: PipelineConfig::DEFAULT_MAX_COPY_CONNECTIONS_PER_TABLE,
+        replication_slot: Default::default(),
+        table_sync_monitor_refresh_interval_ms:
+            PipelineConfig::DEFAULT_TABLE_SYNC_MONITOR_REFRESH_INTERVAL_MS,
+        // Install etl's DDL helpers + event trigger on the source, as before.
+        run_source_migrations: true,
     };
 
     let (table_schema, table_name) = parse_table(&options.get("table")?)?;

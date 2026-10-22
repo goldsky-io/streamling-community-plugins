@@ -20,7 +20,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
-use etl::types::Cell;
+use etl::data::Cell;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -226,7 +226,7 @@ mod tests {
         Array, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
-    use etl::types::Type;
+    use etl::schema::Type;
 
     fn schema() -> SchemaRef {
         Arc::new(
