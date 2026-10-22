@@ -47,6 +47,11 @@ impl PluginOptions {
             .or_else(|| self.options.get(key).cloned())
     }
 
+    /// Like [`lookup`](Self::lookup), but an empty string counts as unset.
+    pub fn lookup_non_empty(&self, key: &str) -> Option<String> {
+        self.lookup(key).filter(|value| !value.is_empty())
+    }
+
     /// A required option. An option set to the empty string counts as unset:
     /// no required option has a meaningful empty value, and reporting it here
     /// beats the downstream failure it would otherwise cause.
