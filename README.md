@@ -57,10 +57,15 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 |---|---|---|
 | `queue_url` | yes | SQS queue URL |
 | `region` | no | AWS region override |
-| `endpoint_url` | no | Custom SQS endpoint (e.g. LocalStack) |
-| `access_key_id` | no | AWS access key (env var preferred) |
+| `endpoint_url` | no | Custom SQS endpoint (e.g. LocalStack). Applies to SQS only; role assumption still calls STS |
+| `access_key_id` | no | AWS access key (env var preferred). Must be set together with `secret_access_key` |
 | `secret_access_key` | no | AWS secret key (env var preferred) |
 | `session_token` | no | STS session token (env var preferred) |
+| `role_arn` | no | IAM role to assume before sending, e.g. a role in the queue owner's account. The static keys above, or the default credential chain, are used to assume it |
+| `external_id` | no | External ID sent with `sts:AssumeRole`. Ignored without `role_arn` |
+| `role_session_name` | no | Session name for the assumed role (default `streamling-sqs-sink`) |
+
+Assumed-role credentials are refreshed automatically before they expire.
 
 Example pipeline: [`examples/pipeline-sqs-sink.yaml`](examples/pipeline-sqs-sink.yaml)
 
