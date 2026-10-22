@@ -1,6 +1,7 @@
 pub mod postgres_cdc;
 pub mod sinks;
 pub mod sources;
+pub mod transforms;
 pub mod utils;
 
 use crate::postgres_cdc::PostgresCdcSource;
@@ -10,9 +11,11 @@ use crate::sinks::s3::S3Sink;
 use crate::sinks::sqs::sink::SqsSink;
 use crate::sources::cloudtrail::CloudTrailSource;
 use crate::sources::s2::S2Source;
+use crate::transforms::zama_decrypt::ZamaDecryptTransform;
 
 use streamling_plugin::{
     init_plugin_with_async_runtime, register_plugin_sink, register_plugin_source,
+    register_plugin_transform,
 };
 
 register_plugin_sink!("s3_sink", S3Sink);
@@ -22,5 +25,6 @@ register_plugin_sink!("s2_sink", S2Sink);
 register_plugin_source!("s2_source", S2Source);
 register_plugin_source!("postgres_cdc_source", PostgresCdcSource);
 register_plugin_source!("cloudtrail_source", CloudTrailSource);
+register_plugin_transform!("zama_decrypt", ZamaDecryptTransform);
 
 init_plugin_with_async_runtime!();
