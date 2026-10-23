@@ -1,3 +1,4 @@
+pub mod iceberg;
 pub mod plugin_options;
 pub mod record_batch_json;
 pub mod s2;
