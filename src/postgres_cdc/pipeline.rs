@@ -80,7 +80,7 @@ struct Inner {
     refcount: usize,
     subs: Vec<PendingSub>,
     started: bool,
-    shutdown: Option<etl::concurrency::ShutdownTx>,
+    shutdown: Option<etl::pipeline::ShutdownTx>,
 }
 
 /// The table a source contributes to its group, and how its rows are shaped.
@@ -429,6 +429,10 @@ mod tests {
             table_sync_copy: TableSyncCopyConfig::default(),
             invalidated_slot_behavior: InvalidatedSlotBehavior::default(),
             max_copy_connections_per_table: PipelineConfig::DEFAULT_MAX_COPY_CONNECTIONS_PER_TABLE,
+            replication_slot: Default::default(),
+            table_sync_monitor_refresh_interval_ms:
+                PipelineConfig::DEFAULT_TABLE_SYNC_MONITOR_REFRESH_INTERVAL_MS,
+            run_source_migrations: true,
         }
     }
 

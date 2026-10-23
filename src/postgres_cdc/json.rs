@@ -6,7 +6,7 @@
 //! arrays as JSON arrays with null elements preserved.
 
 use base64::Engine;
-use etl::types::{ArrayCell, Cell};
+use etl::data::{ArrayCell, Cell};
 use serde_json::{Value, json};
 
 pub fn cell_to_json(cell: &Cell) -> Value {
@@ -23,6 +23,7 @@ pub fn cell_to_json(cell: &Cell) -> Value {
         Cell::Numeric(n) => json!(n.to_string()),
         Cell::Date(d) => json!(d.format("%Y-%m-%d").to_string()),
         Cell::Time(t) => json!(t.format("%H:%M:%S%.6f").to_string()),
+        Cell::TimeTz(t) => json!(t.to_string()),
         Cell::Timestamp(ts) => json!(ts.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()),
         Cell::TimestampTz(ts) => json!(ts.to_rfc3339()),
         Cell::Uuid(u) => json!(u.to_string()),
@@ -54,6 +55,7 @@ fn array_to_json(arr: &ArrayCell) -> Value {
         ArrayCell::Numeric(v) => map(v, |n| json!(n.to_string())),
         ArrayCell::Date(v) => map(v, |d| json!(d.format("%Y-%m-%d").to_string())),
         ArrayCell::Time(v) => map(v, |t| json!(t.format("%H:%M:%S%.6f").to_string())),
+        ArrayCell::TimeTz(v) => map(v, |t| json!(t.to_string())),
         ArrayCell::Timestamp(v) => map(v, |ts| {
             json!(ts.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
         }),

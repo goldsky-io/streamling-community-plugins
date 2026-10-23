@@ -1,4 +1,3 @@
 [toolchain]
-# 1.94 is the MSRV of iceberg-rust 0.10 (the first release on Arrow 58).
-channel = "1.94.1"
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]

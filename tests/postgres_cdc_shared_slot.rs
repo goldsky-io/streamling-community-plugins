@@ -53,8 +53,19 @@ fn ids(batch: &arrow::record_batch::RecordBatch) -> Vec<i64> {
     (0..batch.num_rows()).map(|i| id.value(i)).collect()
 }
 
+/// Routes plugin + etl logs to the test writer (shown on failure).
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_tables_share_one_slot() {
+    init_tracing();
     let Ok(url_s) = std::env::var("E2E_POSTGRES_CDC_URL") else {
         eprintln!("skipping: E2E_POSTGRES_CDC_URL not set");
         return;
