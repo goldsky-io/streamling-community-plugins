@@ -610,3 +610,248 @@ sinks:
         );
     }
 }
+
+// ============================================================================
+// Scenario 6: JSON array message bodies (one_row_per_request: false)
+// ============================================================================
+
+/// Test that `one_row_per_request: false` packs several rows into a single SQS
+/// message as a JSON array, sized by the sink node's `batch_size`.
+#[tokio::test]
+async fn test_sqs_sink_batched_array_messages() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_sqs())
+        .await
+        .expect("Failed to create test context");
+
+    let sqs = ctx.sqs.as_ref().expect("SQS resource should be created");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce = 50;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    // batch_size on the sink node merges upstream batches before the plugin
+    // sees them; the accumulator never splits an upstream batch, so capping
+    // STREAMLING__RECORD_BATCH_SIZE below batch_size is what makes the merged
+    // size an exact upper bound.
+    let batch_size = 10;
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {input_topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  sqs_sink:
+    type: sqs
+    from: kafka_source
+    queue_url: {queue_url}
+    endpoint_url: {endpoint_url}
+    region: us-east-1
+    one_row_per_request: false
+    batch_size: {batch_size}
+    batch_flush_interval: 1s
+"#,
+        input_topic = ctx.kafka_topic,
+        queue_url = sqs.queue_url,
+        endpoint_url = sqs.endpoint_url,
+        batch_size = batch_size,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "5")
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let messages = sqs
+        .receive_all_messages(records_to_produce as usize + 10, Duration::from_secs(15))
+        .await
+        .expect("Failed to receive messages from SQS");
+
+    assert!(!messages.is_empty(), "Expected at least one message in SQS");
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut max_array_len = 0;
+    for msg in &messages {
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(msg).expect("Message body should be a JSON array");
+        assert!(
+            rows.len() <= batch_size,
+            "Array of {} rows exceeds batch_size {}",
+            rows.len(),
+            batch_size
+        );
+        max_array_len = max_array_len.max(rows.len());
+        for row in rows {
+            ids.push(
+                row.get("id")
+                    .and_then(|id| id.as_i64())
+                    .expect("Array element should contain 'id'"),
+            );
+        }
+    }
+
+    assert!(
+        max_array_len > 1,
+        "Expected at least one message carrying multiple rows, got arrays of at most {} row",
+        max_array_len
+    );
+
+    assert_eq!(
+        ids.len(),
+        records_to_produce as usize,
+        "Expected {} rows across all array bodies, got {}",
+        records_to_produce,
+        ids.len()
+    );
+
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=records_to_produce).collect::<Vec<i64>>(),
+        "Array bodies should carry every produced id exactly once"
+    );
+}
+
+// ============================================================================
+// Scenario 7: max_message_bytes caps an array body
+// ============================================================================
+
+/// Test that `max_message_bytes` bounds every array body, splitting a merged
+/// batch across several messages when the rows do not fit in one.
+#[tokio::test]
+async fn test_sqs_sink_array_bodies_respect_max_message_bytes() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_sqs())
+        .await
+        .expect("Failed to create test context");
+
+    let sqs = ctx.sqs.as_ref().expect("SQS resource should be created");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce = 50;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    // 1 KiB is the floor the option accepts, and 50 rows of this shape are
+    // several KiB, so the packer has to split them.
+    let max_message_bytes = 1024;
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {input_topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  sqs_sink:
+    type: sqs
+    from: kafka_source
+    queue_url: {queue_url}
+    endpoint_url: {endpoint_url}
+    region: us-east-1
+    one_row_per_request: false
+    max_message_bytes: {max_message_bytes}
+    batch_size: {records_to_produce}
+    batch_flush_interval: 1s
+"#,
+        input_topic = ctx.kafka_topic,
+        queue_url = sqs.queue_url,
+        endpoint_url = sqs.endpoint_url,
+        max_message_bytes = max_message_bytes,
+        records_to_produce = records_to_produce,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let messages = sqs
+        .receive_all_messages(records_to_produce as usize + 10, Duration::from_secs(15))
+        .await
+        .expect("Failed to receive messages from SQS");
+
+    assert!(!messages.is_empty(), "Expected at least one message in SQS");
+
+    let mut ids: Vec<i64> = Vec::new();
+    for msg in &messages {
+        assert!(
+            msg.len() <= max_message_bytes,
+            "Message body of {} bytes exceeds max_message_bytes {}",
+            msg.len(),
+            max_message_bytes
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(msg).expect("Message body should be a JSON array");
+        for row in rows {
+            ids.push(
+                row.get("id")
+                    .and_then(|id| id.as_i64())
+                    .expect("Array element should contain 'id'"),
+            );
+        }
+    }
+
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=records_to_produce).collect::<Vec<i64>>(),
+        "Split array bodies should still carry every produced id exactly once"
+    );
+}
