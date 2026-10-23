@@ -19,30 +19,29 @@ env:
 jobs:
   validate-and-test:
     runs-on: blacksmith-8vcpu-ubuntu-2204
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_CACHE_SIZE: "10G"
     steps:
       - uses: actions/checkout@v4
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
-      - name: Install sccache
-        uses: taiki-e/install-action@v2
+      # kache remote: Tigris bucket github-action-kache. kache uploads only from pushes to a protected branch
+      # (main); every other push reads main's entries and writes nothing.
+      # manifest-key keeps each build variant's prefetch manifest from clobbering the others'.
+      # The action and kache are pinned (third-party code runs with GH_TOKEN in the job): bump both deliberately.
+      - name: Setup kache
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache
-      - name: Set SCCACHE_DIR env
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-plugins-${{ runner.os }}-1.95.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-plugins-${{ runner.os }}-1.95.0-
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: community-plugins-check-test
+          # C/C++ objects from -sys build scripts ride RUSTC_WRAPPER through the cc crate (needs cc >= 1.2.66).
+          cache-c-cpp: "true"
+          pr-comment: "false"
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
@@ -82,21 +81,18 @@ jobs:
           chmod +x streamling-bin/streamling
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
-      - name: Install sccache
-        uses: taiki-e/install-action@v2
+      - name: Setup kache
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache
-      - name: Set SCCACHE_DIR env
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-${{ runner.os }}-${{ runner.arch }}-1.95.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-release-${{ runner.os }}-${{ runner.arch }}-1.95.0-
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: community-plugins-release
+          cache-c-cpp: "true"
+          pr-comment: "false"
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
@@ -107,12 +103,10 @@ jobs:
         run: cargo build --release --locked --lib
         env:
           CARGO_INCREMENTAL: 0
-          RUSTC_WRAPPER: sccache
-          SCCACHE_CACHE_SIZE: "10G"
           LIBZ_SYS_STATIC: 1
           PKG_CONFIG_ALL_STATIC: 1
-      - name: Show sccache stats
-        run: sccache --show-stats || true
+      - name: Show kache stats
+        run: kache stats || true
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -129,9 +123,6 @@ jobs:
   plugin-e2e:
     needs: [build-release]
     runs-on: blacksmith-8vcpu-ubuntu-2204
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_CACHE_SIZE: "10G"
     steps:
       - uses: actions/checkout@v4
       # k3s-setup.sh and its manifests live in the streamling repo at the same
@@ -157,21 +148,21 @@ jobs:
       # Rust + caching (only for compiling the test binary, not streamling)
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
-      - name: Install sccache
-        uses: taiki-e/install-action@v2
+      - name: Setup kache
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache,nextest
-      - name: Set SCCACHE_DIR env
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        uses: actions/cache@v4
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: community-plugins-e2e
+          cache-c-cpp: "true"
+          pr-comment: "false"
+      - uses: taiki-e/install-action@v2
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-plugin-e2e-${{ runner.os }}-1.95.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-plugin-e2e-${{ runner.os }}-1.95.0-
+          tool: nextest
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:

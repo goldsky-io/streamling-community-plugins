@@ -33,29 +33,25 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2204
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_CACHE_SIZE: "10G"
     steps:
       - uses: actions/checkout@v4
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
-      - name: Install sccache
-        uses: taiki-e/install-action@v2
+      # kache setup mirrors ci.yml (see the comment there).
+      - name: Setup kache
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache
-      - name: Set SCCACHE_DIR env
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-${{ runner.os }}-1.95.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-release-${{ runner.os }}-1.95.0-
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: community-plugins-check-test
+          cache-c-cpp: "true"
+          pr-comment: "false"
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@v3
         with:
@@ -75,7 +71,6 @@ jobs:
           RUST_LOG: info
           CARGO_INCREMENTAL: 0
           CARGO_PROFILE_TEST_DEBUG: 0
-          RUSTC_WRAPPER: sccache
         timeout-minutes: 15
 
   # Resolve the release version/tag from the `community_plugins` crate and refuse
@@ -147,25 +142,19 @@ jobs:
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.95.0
-      - name: Install sccache
+      - name: Setup kache
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@v2
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache
-      - name: Set SCCACHE_DIR env
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.95.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.95.0-
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: community-plugins-release-opt-${{ matrix.arch }}
+          cache-c-cpp: "true"
+          pr-comment: "false"
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: useblacksmith/rust-cache@v3
@@ -178,13 +167,11 @@ jobs:
         run: cargo build --profile release-optimized --lib --locked
         env:
           CARGO_INCREMENTAL: 0
-          RUSTC_WRAPPER: sccache
-          SCCACHE_CACHE_SIZE: "10G"
           LIBZ_SYS_STATIC: 1
           PKG_CONFIG_ALL_STATIC: 1
-      - name: Show sccache stats
+      - name: Show kache stats
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        run: sccache --show-stats || true
+        run: kache stats || true
       - name: Upload release library
         uses: actions/upload-artifact@v4
         with:
