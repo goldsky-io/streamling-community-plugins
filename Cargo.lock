@@ -1372,6 +1372,7 @@ dependencies = [
  "object_store 0.12.5",
  "parquet",
  "regex",
+ "reqwest 0.12.28",
  "rustls",
  "s2-sdk",
  "s2-testcontainers",

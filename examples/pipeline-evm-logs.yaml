@@ -1,0 +1,29 @@
+# Example pipeline: evm_logs_source -> print
+#
+# Reads the ERC-7984 ConfidentialTransfer logs of the Sepolia cUSDCMock token
+# over a fixed block range, then stops.
+#
+# Run from the repository root with STREAMLING__PLUGIN__PATH pointing to this
+# repo's compiled plugin library. Swap rpc_url for a Goldsky Edge/eRPC URL; put
+# keyed URLs in STREAMLING__PLUGIN__EVM_LOGS_SOURCE__RPC_URL instead of here.
+# A run this short ends before the first checkpoint, so it re-reads the range
+# each time; longer runs resume from ./state.db.
+name: evm-logs-sepolia
+sources:
+  logs:
+    type: evm_logs_source
+    primary_key: id
+    # Needs an RPC that serves old logs; publicnode prunes history.
+    rpc_url: https://sepolia.gateway.tenderly.co
+    start_block: "11915000"
+    end_block: "11915300"
+    addresses: "0x7c5bf43b851c1dff1a4fee8db225b87f2c223639"
+    # keccak256("ConfidentialTransfer(address,address,bytes32)")
+    topic0: "0x67500e8d0ed826d2194f514dd0d8124f35648ab6e3fb5e6ed867134cffe661e9"
+
+transforms: {}
+
+sinks:
+  out:
+    type: print
+    from: logs

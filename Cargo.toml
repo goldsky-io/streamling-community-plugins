@@ -37,6 +37,9 @@ uuid = { version = "1.0", features = ["v4", "v7"] }
 # URL encoding (for S3 partitioning)
 urlencoding = "2.1.3"
 
+# EVM logs source (JSON-RPC)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
 # MySQL sink + Postgres CDC schema discovery
 sqlx = { version = "0.8.5", features = ["runtime-tokio", "mysql", "postgres", "tls-rustls"] }
 

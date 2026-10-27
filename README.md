@@ -161,6 +161,33 @@ Tip: management events are dominated by reads. Set `lookup_attribute_key: ReadOn
 with `lookup_attribute_value: "false"` to keep only mutating API calls and cut
 most of the noise server-side.
 
+### EVM Logs Source (`evm_logs_source`)
+
+Reads event logs from any Ethereum JSON-RPC endpoint (a Goldsky Edge/eRPC URL or
+a public RPC) with `eth_getLogs` and emits one row per log, with the column names
+and types of the `edge.evm.logs` dataset: `id` (`<block_hash>_<log_index>`),
+`block_number`, `block_hash`, `block_timestamp`, `transaction_hash`,
+`transaction_index`, `log_index`, `address`, `data`, `topics` (`List<Utf8>`),
+`removed`, `_gs_op`. The dataset's receipt and transaction columns are not
+produced. Logs are read only once `confirmations` blocks deep and never revised;
+delivery is at-least-once with a checkpointed block number. See
+[`src/sources/evm_logs/mod.rs`](src/sources/evm_logs/mod.rs) and
+[`examples/pipeline-evm-logs.yaml`](examples/pipeline-evm-logs.yaml).
+
+All YAML options can also be set via `STREAMLING__PLUGIN__EVM_LOGS_SOURCE__<KEY>`
+environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `rpc_url` | yes | — | HTTP(S) JSON-RPC endpoint; set keyed URLs via the env var. Must serve logs for the range read (many free RPCs prune history) |
+| `start_block` | no | `latest` | Block to start at without a checkpoint, or `latest` (newest confirmed block) |
+| `end_block` | no | — | Last block, inclusive; the source stops after it |
+| `addresses` | no | all | Comma-separated contract addresses |
+| `topic0` | no | any | Comma-separated event signature hashes |
+| `confirmations` | no | `12` | Blocks kept between the head and the newest block read (reorg protection) |
+| `blocks_per_request` | no | `1000` | Max blocks per `eth_getLogs`; halved while the RPC rejects a range |
+| `poll_interval_ms` | no | `2000` | Delay between head checks once caught up |
+
 ### Postgres CDC Source (`postgres_cdc_source`)
 
 Streams Postgres logical-replication changes (an initial table copy followed by
