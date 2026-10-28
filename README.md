@@ -364,6 +364,26 @@ A handle the KMS refuses gets its reason in `zama_public_error`; a retryable err
 
 Example pipeline (every row must print `matches: true`): [`examples/pipeline-zama-public-decrypt.yaml`](examples/pipeline-zama-public-decrypt.yaml)
 
+### Running the Zama examples locally
+
+The examples read committed Sepolia log fixtures (`examples/fixtures/`), so they need only Streamling, this repo's plugin library and the Zama SDK daemon. On Goldsky the logs come from the [`edge.evm.logs` dataset](https://docs.goldsky.com/turbo-pipelines/sources/edge-evm) instead.
+
+```bash
+# Zama SDK daemon, same version as `zama_sdk` in Cargo.toml; needs Node 24+
+git clone --depth 1 --branch v3.8.0-beta.5 https://github.com/zama-ai/sdk.git
+(cd sdk && CI=1 pnpm install --frozen-lockfile && CI=1 pnpm daemon:build)
+mkdir -p /tmp/zama-sdk && chmod 700 /tmp/zama-sdk
+(cd sdk/packages/sdk-daemon && ZAMA_SDK_DAEMON_SOCKET_PATH=/tmp/zama-sdk/zama.sock node dist/main.js) &
+
+# Plugin library, then the examples (Streamling built from https://github.com/goldsky-io/streamling)
+just build-release
+export STREAMLING__PLUGIN__PATH="$PWD/target/release/libcommunity_plugins.dylib"  # .so on Linux
+streamling examples/pipeline-zama-public-decrypt.yaml
+STREAMLING__PLUGIN__ZAMA_DECRYPT__DELEGATE_PRIVATE_KEY=0x<64 hex> streamling examples/pipeline-zama-delegated-decrypt.yaml
+```
+
+An older `node` first on `PATH` makes context creation fail with `INTERNAL TypeError` in the daemon log.
+
 ### Quick start
 
 ```bash

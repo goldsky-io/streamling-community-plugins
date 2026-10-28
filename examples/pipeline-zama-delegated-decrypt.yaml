@@ -1,4 +1,4 @@
-# Example pipeline: ConfidentialTransfer logs -> zama_decrypt -> print
+# Example pipeline: ConfidentialTransfer logs -> erc7984_decode -> zama_decrypt -> print
 #
 # Decrypts ERC-7984 transfer amounts for wallets that delegated decryption on-chain
 # (ACL.delegateForUserDecryption) to the address of a delegate key. The committed
@@ -21,6 +21,10 @@
 #      pipeline-zama-public-decrypt.yaml. Rows of your wallet print zama_amount and
 #      zama_delegator; other parties' rows keep the error. A finished run is
 #      checkpointed in ./state.db; delete it to run again (or after a new CSV).
+#
+# On Goldsky, the same logs come from the `edge.evm.logs` dataset instead of a CSV
+# (https://docs.goldsky.com/turbo-pipelines/sources/edge-evm); give
+# erc7984_decode `topics_column: topics` for its list-shaped topics.
 name: zama-delegated-decrypt-sepolia
 sources:
   logs:
@@ -32,9 +36,13 @@ sources:
     primary_key: id
 
 transforms:
+  decoded:
+    type: erc7984_decode
+    from: logs
+
   decrypted:
     type: zama_decrypt
-    from: logs
+    from: decoded
     chain_id: "11155111"
     rpc_url: https://ethereum-sepolia-rpc.publicnode.com
     daemon_socket: /tmp/zama-sdk/zama.sock  # or STREAMLING__PLUGIN__ZAMA_DECRYPT__DAEMON_SOCKET
