@@ -8,9 +8,13 @@
 #
 # Run from the repository root with:
 #   - STREAMLING__PLUGIN__PATH pointing to this repo's compiled plugin library.
-#   - The Zama SDK daemon (@zama-fhe/sdk-daemon, built from the zama-ai/sdk commit
-#     pinned in Cargo.toml) listening on `daemon_socket`; its directory must be 0700.
+#   - The Zama SDK daemon listening on `daemon_socket`; see "Running the Zama
+#     examples locally" in the README.
 # A finished run is checkpointed in ./state.db; delete it to run again.
+#
+# On Goldsky, the same logs come from the `edge.evm.logs` dataset instead of a CSV
+# (https://docs.goldsky.com/turbo-pipelines/sources/edge-evm), where `data` is the
+# same hex string.
 name: zama-public-decrypt-sepolia
 sources:
   logs:
