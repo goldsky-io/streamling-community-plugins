@@ -4,7 +4,10 @@
 //! directory is bind-mounted at the same path inside the container, so the
 //! catalog (metadata files) and the plugin and test code on the host (data
 //! files, manifests) see identical paths. The container runs as the host user
-//! so both sides can write into each other's directories.
+//! so both sides can write into each other's directories. A generated
+//! `/etc/passwd` names that uid: Hadoop's login fails with "invalid null
+//! input: name" for a uid the image does not know (CI runners use 1001; the
+//! image only has 1000).
 #![allow(dead_code)] // each test binary uses its own subset
 
 use std::collections::HashMap;
@@ -49,12 +52,26 @@ impl IcebergFixture {
             .expect("chmod warehouse dir");
         let meta = std::fs::metadata(&warehouse_dir).expect("stat warehouse dir");
         let dir = warehouse_dir.to_str().expect("utf-8 temp dir").to_string();
+        let passwd = warehouse_dir.with_extension("passwd");
+        std::fs::write(
+            &passwd,
+            format!(
+                "root:x:0:0::/root:/bin/sh\nstreamling:x:{}:{}::/tmp:/bin/sh\n",
+                meta.uid(),
+                meta.gid()
+            ),
+        )
+        .expect("write passwd");
 
         let container = GenericImage::new(IMAGE, TAG)
             .with_exposed_port(ContainerPort::Tcp(PORT))
             .with_wait_for(WaitFor::message_on_either_std("Started Server@"))
             .with_env_var("CATALOG_WAREHOUSE", format!("file://{dir}"))
             .with_mount(Mount::bind_mount(dir.clone(), dir.clone()))
+            .with_mount(Mount::bind_mount(
+                passwd.to_str().expect("utf-8 temp dir"),
+                "/etc/passwd",
+            ))
             .with_user(format!("{}:{}", meta.uid(), meta.gid()))
             .start()
             .await
@@ -122,5 +139,6 @@ impl IcebergFixture {
 impl Drop for IcebergFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.warehouse_dir);
+        let _ = std::fs::remove_file(self.warehouse_dir.with_extension("passwd"));
     }
 }
