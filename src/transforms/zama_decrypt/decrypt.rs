@@ -221,13 +221,13 @@ impl<B: Backend> Decryptor<B> {
                 failures,
                 "zama_decrypt: batch decrypted"
             );
-            let by_handle: HashMap<B256, Result<ClearValue, SdkError>> = items
+            let by_input: HashMap<(B256, Address), Result<ClearValue, SdkError>> = items
                 .into_iter()
-                .map(|item| (item.encrypted_value, item.result))
+                .map(|item| ((item.encrypted_value, item.contract_address), item.result))
                 .collect();
             for (row, transfer) in entries {
                 let cell = &mut output[row];
-                match by_handle.get(&transfer.handle) {
+                match by_input.get(&(transfer.handle, transfer.token)) {
                     Some(Ok(value)) => match render(value) {
                         Ok(amount) => cell.amount = Some(amount),
                         Err(error) => cell.error = Some(error),
@@ -412,6 +412,7 @@ mod tests {
     const DELEGATE: Address = Address::repeat_byte(0xdd);
     const HANDLE: B256 = B256::repeat_byte(0x01);
     const OTHER_HANDLE: B256 = B256::repeat_byte(0x02);
+    const OTHER_TOKEN: Address = Address::repeat_byte(0x22);
 
     fn transfer(from: Address, to: Address, handle: B256) -> Option<DecodedTransfer> {
         Some(DecodedTransfer {
@@ -432,7 +433,7 @@ mod tests {
         }
     }
 
-    type BatchAnswer = Result<Vec<(B256, Result<ClearValue, SdkError>)>, BackendError>;
+    type BatchAnswer = Result<Vec<(B256, Address, Result<ClearValue, SdkError>)>, BackendError>;
 
     /// Scripted daemon: delegation answers per delegator, one batch answer
     /// per call in order, and a record of what was asked.
@@ -459,6 +460,18 @@ mod tests {
         }
 
         fn batch(self, answer: Vec<(B256, Result<ClearValue, SdkError>)>) -> Self {
+            self.batch_per_contract(
+                answer
+                    .into_iter()
+                    .map(|(handle, result)| (handle, TOKEN, result))
+                    .collect(),
+            )
+        }
+
+        fn batch_per_contract(
+            self,
+            answer: Vec<(B256, Address, Result<ClearValue, SdkError>)>,
+        ) -> Self {
             self.batches.lock().unwrap().push(Ok(answer));
             self
         }
@@ -513,9 +526,9 @@ mod tests {
             batches.remove(0).map(|items| {
                 items
                     .into_iter()
-                    .map(|(handle, result)| BatchItem {
+                    .map(|(handle, contract, result)| BatchItem {
                         encrypted_value: handle,
-                        contract_address: TOKEN,
+                        contract_address: contract,
                         result,
                     })
                     .collect()
@@ -600,6 +613,27 @@ mod tests {
         let calls = decryptor.backend.batch_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, vec![HANDLE]);
+    }
+
+    #[tokio::test]
+    async fn a_handle_under_two_tokens_gets_each_tokens_own_result() {
+        let fake = Fake::default()
+            .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
+            .batch_per_contract(vec![
+                (HANDLE, TOKEN, Ok(ClearValue::Number(5))),
+                (HANDLE, OTHER_TOKEN, Ok(ClearValue::Number(9))),
+            ]);
+        let decryptor = with(fake);
+        let other = transfer(BOB, ALICE, HANDLE).map(|t| DecodedTransfer {
+            token: OTHER_TOKEN,
+            ..t
+        });
+        let out = decryptor
+            .decrypt(&[transfer(BOB, ALICE, HANDLE), other])
+            .await
+            .expect("batch ok");
+        assert_eq!(out[0].amount.as_deref(), Some("5"));
+        assert_eq!(out[1].amount.as_deref(), Some("9"));
     }
 
     #[tokio::test]

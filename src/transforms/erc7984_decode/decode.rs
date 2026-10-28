@@ -5,7 +5,7 @@
 //! - `OperatorSet(address indexed holder, address indexed operator, uint48 until)`
 //! - `AmountDisclosed(bytes32 indexed encryptedAmount, uint64 amount)`
 
-use crate::utils::text_column::{TextColumn, is_text, text_column};
+use crate::utils::text_column::{TextColumn, is_text, text_column, validate_text_columns};
 use alloy_primitives::{Address, B256, U256, keccak256};
 use arrow::array::{Array, ArrayRef, LargeListArray, ListArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
@@ -63,7 +63,7 @@ impl Event {
 
 #[derive(Clone, Debug)]
 pub enum TopicColumns {
-    /// One string column per topic, null when the log has fewer topics.
+    /// One string column per topic, null or empty when the log has fewer topics.
     Separate([String; 4]),
     /// One column holding all topics: a list of strings, or a single string
     /// with the topics separated by commas (`[` `]` and quotes are ignored).
@@ -80,24 +80,16 @@ pub struct LogColumns {
 
 /// Run at startup so a column typo fails initialization rather than the first batch.
 pub fn validate_columns(schema: &Schema, columns: &LogColumns) -> Result<(), String> {
-    let text_columns = match &columns.topics {
-        TopicColumns::Separate(topics) => topics.iter().collect::<Vec<_>>(),
+    let topic_columns = match &columns.topics {
+        TopicColumns::Separate(topics) => topics.iter().map(String::as_str).collect(),
         TopicColumns::Joined(_) => Vec::new(),
     };
-    for name in [&columns.address, &columns.data]
-        .into_iter()
-        .chain(text_columns)
-    {
-        let field = schema
-            .field_with_name(name)
-            .map_err(|_| format!("input has no '{name}' column"))?;
-        if !is_text(field.data_type()) {
-            return Err(format!(
-                "column '{name}' must be a string column, got {}",
-                field.data_type()
-            ));
-        }
-    }
+    validate_text_columns(
+        schema,
+        [columns.address.as_str(), columns.data.as_str()]
+            .into_iter()
+            .chain(topic_columns),
+    )?;
     if let TopicColumns::Joined(name) = &columns.topics {
         let field = schema
             .field_with_name(name)
@@ -174,8 +166,9 @@ impl Topics {
         match self {
             Self::Separate(columns) => {
                 let mut topics = Vec::with_capacity(4);
+                // Some exports write "" rather than null for an absent topic.
                 for column in columns.iter() {
-                    match column.value(row) {
+                    match column.value(row).filter(|text| !text.trim().is_empty()) {
                         Some(text) => topics.push(parse_word(text)?),
                         None => break,
                     }
@@ -292,6 +285,9 @@ pub(crate) mod tests {
         format!("{topic:#x}")
     }
 
+    static TRANSFER_TOPIC_HEX: LazyLock<String> =
+        LazyLock::new(|| hex(&CONFIDENTIAL_TRANSFER_TOPIC));
+
     pub fn separate_columns() -> LogColumns {
         LogColumns {
             address: "address".into(),
@@ -315,9 +311,7 @@ pub(crate) mod tests {
         Row {
             address: Some(address),
             topics: vec![
-                Some(Box::leak(
-                    hex(&CONFIDENTIAL_TRANSFER_TOPIC).into_boxed_str(),
-                )),
+                Some(TRANSFER_TOPIC_HEX.as_str()),
                 Some(FROM_WORD),
                 Some(TO_WORD),
                 Some(HANDLE),
@@ -498,6 +492,42 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(decoded[3], None);
+    }
+
+    #[test]
+    fn empty_topic_cells_count_as_absent() {
+        let operator_set = hex(&OPERATOR_SET_TOPIC);
+        let amount_disclosed = hex(&AMOUNT_DISCLOSED_TOPIC);
+        let rows = [
+            Row {
+                address: Some(TOKEN),
+                topics: vec![
+                    Some(&operator_set),
+                    Some(FROM_WORD),
+                    Some(TO_WORD),
+                    Some(""),
+                ],
+                data: Some(UNTIL_DATA),
+            },
+            Row {
+                address: Some(TOKEN),
+                topics: vec![Some(&amount_disclosed), Some(HANDLE), Some(" "), Some("")],
+                data: Some(AMOUNT_DATA),
+            },
+        ];
+        let decoded = decode_batch(&separate_batch(&rows), &separate_columns(), &HashSet::new())
+            .expect("decode");
+        assert!(matches!(
+            decoded[0],
+            Some(Event::OperatorSet { until: 1337, .. })
+        ));
+        assert!(matches!(
+            decoded[1],
+            Some(Event::AmountDisclosed {
+                amount: 1_000_000,
+                ..
+            })
+        ));
     }
 
     #[test]
