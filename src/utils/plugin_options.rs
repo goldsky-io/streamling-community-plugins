@@ -47,6 +47,11 @@ impl PluginOptions {
             .or_else(|| self.options.get(key).cloned())
     }
 
+    /// Like [`lookup`](Self::lookup), but an empty string counts as unset.
+    pub fn lookup_non_empty(&self, key: &str) -> Option<String> {
+        self.lookup(key).filter(|value| !value.is_empty())
+    }
+
     /// A required option. An option set to the empty string counts as unset:
     /// no required option has a meaningful empty value, and reporting it here
     /// beats the downstream failure it would otherwise cause.
@@ -109,6 +114,22 @@ impl PluginOptions {
                 self.plugin_name
             ))
         })
+    }
+
+    /// Streamling logs every plugin's YAML options at INFO when it creates the
+    /// plugin, so a credential present in YAML is an error, not a warning.
+    pub fn get_env_only_secret(&self, key: &str) -> Result<Option<String>, PluginError> {
+        let env_key = self.env_key(key);
+        if self.options.contains_key(key) {
+            return Err(PluginError::Internal(format!(
+                "{}: '{}' must be set through the environment variable {}, not in YAML \
+                 (Streamling logs YAML options at startup)",
+                self.plugin_name, key, env_key
+            )));
+        }
+        Ok(std::env::var(env_key)
+            .ok()
+            .filter(|value| !value.is_empty()))
     }
 
     pub fn get_secret(&self, key: &str) -> Option<String> {

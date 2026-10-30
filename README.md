@@ -310,6 +310,41 @@ All YAML options can also be set via `STREAMLING__PLUGIN__ICEBERG_SOURCE__<KEY>`
 | `on_non_append_snapshot` | no | `error` | `error` stops the source on an `overwrite` or `delete` snapshot, `skip` ignores it |
 
 Example pipeline: [`examples/pipeline-iceberg-source.yaml`](examples/pipeline-iceberg-source.yaml)
+### ERC-7984 Decode Transform (`erc7984_decode`)
+
+Decodes the three ERC-7984 events (`ConfidentialTransfer`, `OperatorSet`, `AmountDisclosed`) from raw EVM logs into plain columns, so downstream SQL or `zama_decrypt` never parse topics. Each input row is a raw log (`address`, topics, `data`); matching rows get ten nullable text columns appended (`erc7984_event`, `erc7984_token`, `erc7984_from`, `erc7984_to`, `erc7984_amount_handle`, `erc7984_holder`, `erc7984_operator`, `erc7984_until`, `erc7984_encrypted_amount`, `erc7984_amount`), other rows pass through with them null. See the module docs in [`src/transforms/erc7984_decode/mod.rs`](src/transforms/erc7984_decode/mod.rs).
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `address_column` | no | `address` | Log address column, hex string |
+| `topics_column` | no | — | One column holding all topics: a list of strings, or a comma-separated string. Overrides the four topic columns |
+| `topic0_column` to `topic3_column` | no | `topic0` to `topic3` | Log topic columns, hex strings, null when absent |
+| `data_column` | no | `data` | Log data column, hex string |
+| `tokens` | no | all | Comma-separated token contracts to decode |
+
+### Zama Decrypt Transform (`zama_decrypt`)
+
+Decrypts the amounts of decoded ERC-7984 `ConfidentialTransfer` events through the Zama SDK daemon, on behalf of wallets that delegated decryption rights on-chain to the plugin's own signing key. It reads the columns `erc7984_decode` appends (`erc7984_token`, `erc7984_from`, `erc7984_to`, `erc7984_amount_handle`, all configurable) and appends three nullable text columns (`zama_amount`, `zama_delegator`, `zama_error`); other rows pass through with them null. See the module docs in [`src/transforms/zama_decrypt/mod.rs`](src/transforms/zama_decrypt/mod.rs) for the row flow, failure semantics, output columns, metrics and deployment requirements.
+
+All YAML options can also be set via `STREAMLING__PLUGIN__ZAMA_DECRYPT__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML. The two credentials are accepted from env vars only, because Streamling logs YAML options at startup.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `chain_id` | yes | — | EVM chain id |
+| `rpc_url` | yes | — | JSON-RPC endpoint the daemon uses for public reads |
+| `daemon_socket` | yes | — | Absolute path of the daemon Unix socket |
+| `delegate_private_key` | yes | — | Key of the address wallets delegate to (env var only) |
+| `relayer_api_key` | no | — | Zama relayer credential (env var only) |
+| `tokens` | no | all | Comma-separated token contracts to decrypt |
+| `token_column`, `from_column`, `to_column`, `handle_column` | no | `erc7984_token`, `erc7984_from`, `erc7984_to`, `erc7984_amount_handle` | Input columns, hex strings |
+| `max_concurrency` | no | SDK default | Relayer concurrency for batch decryption |
+
+Requirements and caveats:
+
+- Needs a running Zama SDK daemon (`packages/sdk-daemon` in [zama-ai/sdk](https://github.com/zama-ai/sdk), built from the `v<version>` tag matching the `zama_sdk` version pinned in `Cargo.toml`) reachable over a Unix socket. Streamling must run as the same UID as the daemon.
+- The delegate key signs decryption permits only and needs no funds; use one key per tenant, since every wallet delegating to the same address is decryptable by the same pipeline.
+- Rows the relayer or ACL refuses for good carry the reason in `zama_error` and are not retried. A failure that may clear on a retry (daemon unreachable, relayer timeout, rate limit, delegation not yet propagated) fails the batch; Streamling then restarts the pipeline and replays it.
+- The SDK client is a crates.io pre-release pinned to an exact version; it is bumped together with the daemon image. After a bump, check it against a running daemon and Sepolia: `ZAMA_SDK_DAEMON_SOCKET=/tmp/zama-sdk/zama.sock cargo test --lib live_ -- --ignored` (optional `ZAMA_LIVE_RPC_URL`).
 
 ### Quick start
 
