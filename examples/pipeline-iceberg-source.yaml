@@ -1,7 +1,7 @@
 # Example pipeline: Iceberg source (plugin) -> ClickHouse sink
 #
 # Requires STREAMLING__PLUGIN__PATH pointing to the compiled plugins library
-# (.so / .dylib / .dll) — see "How to Use" in the README.
+# (.so / .dylib) — see "How to Use" in the README.
 #
 # Reads lake.events: a full scan of the current snapshot, then every newly
 # committed append snapshot. The read position is checkpointed, so a restart
