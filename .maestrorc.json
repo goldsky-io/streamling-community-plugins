@@ -1,0 +1,9 @@
+{
+  "$schema": "https://maestro.goldsky.com/maestrorc/schema",
+  "review": {
+    "external_prs": true
+  },
+  "security": {
+    "trusted_author_associations": ["OWNER", "MEMBER", "COLLABORATOR"]
+  }
+}
