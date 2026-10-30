@@ -36,7 +36,9 @@ use uuid::Uuid;
 use super::config::{IcebergSinkConfig, PartitionTerm, parse_config};
 use super::schema::{BatchProjector, ensure_inserts_only, table_schema_for};
 use crate::utils::iceberg::iceberg_error;
-use crate::utils::parquet_compression::{CompressionError, SUPPORTED_CODECS, parquet_compression};
+use crate::utils::parquet_compression::{
+    CompressionError, LEVELED_CODECS, SUPPORTED_CODECS, parquet_compression,
+};
 use crate::utils::plugin_options::{PluginOptions, configuration_error};
 
 /// Snapshot summary property: the Streamling checkpoint epoch a snapshot
@@ -474,6 +476,11 @@ fn parquet_writer_properties(
         CompressionError::InvalidLevel(e) => {
             invalid(LEVEL, &level.map(|l| l.to_string()).unwrap_or_default(), &e)
         }
+        CompressionError::LevelNotSupported => invalid(
+            LEVEL,
+            &level.map(|l| l.to_string()).unwrap_or_default(),
+            &format_args!("not supported for {codec}: only {LEVELED_CODECS} take a level"),
+        ),
     })?;
     let cdc = table_props.cdc_enabled.then_some(CdcOptions {
         min_chunk_size: table_props.cdc_min_chunk_size,

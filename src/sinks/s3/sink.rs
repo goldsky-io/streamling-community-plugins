@@ -21,7 +21,9 @@ use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
 use super::partitioning::{PartitionConfig, partition_batch};
-use crate::utils::parquet_compression::{CompressionError, SUPPORTED_CODECS, parquet_compression};
+use crate::utils::parquet_compression::{
+    CompressionError, LEVELED_CODECS, SUPPORTED_CODECS, parquet_compression,
+};
 use crate::utils::plugin_options::PluginOptions;
 
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(100);
@@ -192,8 +194,29 @@ impl S3Sink {
                     "s3_sink: invalid compression_level '{}' for {codec}: {e}",
                     level.unwrap_or_default()
                 ),
+                CompressionError::LevelNotSupported => format!(
+                    "s3_sink: compression_level '{}' is not supported for {codec}: only {LEVELED_CODECS} take a level",
+                    level.unwrap_or_default()
+                ),
             })
         })
+    }
+
+    /// Serialize keyed batches to Parquet off the async executor. Encoding is
+    /// CPU-bound and, at high compression levels, slow enough to stall other
+    /// tasks if run inline.
+    async fn serialize_blocking(
+        items: Vec<(String, RecordBatch)>,
+        compression: Compression,
+    ) -> Result<Vec<(String, Vec<u8>)>, PluginError> {
+        tokio::task::spawn_blocking(move || {
+            items
+                .into_iter()
+                .map(|(key, batch)| Ok((key, Self::serialize_to_parquet(&batch, compression)?)))
+                .collect()
+        })
+        .await
+        .map_err(|e| PluginError::Internal(format!("Parquet serialization task panicked: {e}")))?
     }
 
     /// Build the S3 object key for a file, optionally including a partition path segment.
@@ -358,15 +381,12 @@ impl SinkPlugin for S3Sink {
                     "Batch split into partitions"
                 );
 
-                // Serialize all partitions to Parquet upfront (CPU-bound, not async)
-                let uploads: Vec<(String, Vec<u8>)> = partitions
+                // Serialize all partitions to Parquet upfront, off the executor.
+                let keyed = partitions
                     .into_iter()
-                    .map(|p| {
-                        let key = self.build_key(Some(&p.path_segment));
-                        let data = Self::serialize_to_parquet(&p.batch, compression)?;
-                        Ok((key, data))
-                    })
-                    .collect::<Result<Vec<_>, PluginError>>()?;
+                    .map(|p| (self.build_key(Some(&p.path_segment)), p.batch))
+                    .collect();
+                let uploads = Self::serialize_blocking(keyed, compression).await?;
 
                 // Upload partitions concurrently with a bounded parallelism limit.
                 let max_concurrent = self
@@ -393,8 +413,10 @@ impl SinkPlugin for S3Sink {
             }
             None => {
                 let key = self.build_key(None);
-                let data = Self::serialize_to_parquet(&batch, compression)?;
-                self.upload_to_s3(&key, data).await?;
+                let uploads = Self::serialize_blocking(vec![(key, batch)], compression).await?;
+                for (key, data) in uploads {
+                    self.upload_to_s3(&key, data).await?;
+                }
             }
         }
 
@@ -571,10 +593,7 @@ mod tests {
                 &[("compression", "gzip")][..],
                 Compression::GZIP(GzipLevel::try_new(6).unwrap()),
             ),
-            (
-                &[("compression", "snappy"), ("compression_level", "9")][..],
-                Compression::SNAPPY,
-            ),
+            (&[("compression", "snappy")][..], Compression::SNAPPY),
             (&[("compression", "lz4_raw")][..], Compression::LZ4_RAW),
         ] {
             assert_eq!(
@@ -589,7 +608,13 @@ mod tests {
     fn test_parse_compression_rejects_invalid_values() {
         for (pairs, key) in [
             (&[("compression", "lzo")][..], "compression 'lzo'"),
+            (&[("compression", "lz4")][..], "compression 'lz4'"),
+            (&[("compression", "none")][..], "compression 'none'"),
             (&[("compression", "")][..], "compression ''"),
+            (
+                &[("compression", "snappy"), ("compression_level", "3")][..],
+                "compression_level '3' is not supported for snappy",
+            ),
             (
                 &[("compression", "zstd"), ("compression_level", "99")][..],
                 "compression_level '99'",
@@ -613,7 +638,6 @@ mod tests {
             Compression::SNAPPY,
             Compression::GZIP(GzipLevel::default()),
             Compression::BROTLI(BrotliLevel::default()),
-            Compression::LZ4,
             Compression::LZ4_RAW,
             Compression::ZSTD(ZstdLevel::default()),
         ] {
