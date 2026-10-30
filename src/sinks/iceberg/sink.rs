@@ -24,7 +24,6 @@ use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
 use iceberg::{Catalog, ErrorKind, NamespaceIdent, TableCreation};
 use iceberg_catalog_rest::RestCatalog;
-use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use streamling_plugin::api::{PluginStateBackendFactory, SupportsGracefulShutdown};
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
@@ -37,6 +36,7 @@ use uuid::Uuid;
 use super::config::{IcebergSinkConfig, PartitionTerm, parse_config};
 use super::schema::{BatchProjector, ensure_inserts_only, table_schema_for};
 use crate::utils::iceberg::iceberg_error;
+use crate::utils::parquet_compression::{CompressionError, SUPPORTED_CODECS, parquet_compression};
 use crate::utils::plugin_options::{PluginOptions, configuration_error};
 
 /// Snapshot summary property: the Streamling checkpoint epoch a snapshot
@@ -467,30 +467,14 @@ fn parquet_writer_properties(
         .get(LEVEL)
         .map(|v| v.trim().parse::<u32>().map_err(|e| invalid(LEVEL, v, &e)))
         .transpose()?;
-    let level_error = |e: parquet::errors::ParquetError| {
-        invalid(LEVEL, &level.map(|l| l.to_string()).unwrap_or_default(), &e)
-    };
-    let compression = match codec.trim().to_ascii_lowercase().as_str() {
-        // Iceberg (parquet-java) defaults: zstd level 3, gzip level 6.
-        "zstd" => {
-            Compression::ZSTD(ZstdLevel::try_new(level.unwrap_or(3) as i32).map_err(level_error)?)
+    let compression = parquet_compression(codec, level).map_err(|e| match e {
+        CompressionError::UnknownCodec => {
+            invalid(CODEC, codec, &format_args!("expected {SUPPORTED_CODECS}"))
         }
-        "gzip" => Compression::GZIP(GzipLevel::try_new(level.unwrap_or(6)).map_err(level_error)?),
-        "brotli" => {
-            Compression::BROTLI(BrotliLevel::try_new(level.unwrap_or(1)).map_err(level_error)?)
+        CompressionError::InvalidLevel(e) => {
+            invalid(LEVEL, &level.map(|l| l.to_string()).unwrap_or_default(), &e)
         }
-        "snappy" => Compression::SNAPPY,
-        "lz4" => Compression::LZ4,
-        "lz4_raw" => Compression::LZ4_RAW,
-        "uncompressed" | "none" => Compression::UNCOMPRESSED,
-        _ => {
-            return Err(invalid(
-                CODEC,
-                codec,
-                &"expected zstd, gzip, brotli, snappy, lz4, lz4_raw or uncompressed",
-            ));
-        }
-    };
+    })?;
     let cdc = table_props.cdc_enabled.then_some(CdcOptions {
         min_chunk_size: table_props.cdc_min_chunk_size,
         max_chunk_size: table_props.cdc_max_chunk_size,
@@ -571,6 +555,7 @@ mod tests {
     use crate::sinks::iceberg::config::parse_partition_by;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use iceberg::spec::Transform;
+    use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 
     fn input_schema() -> ArrowSchema {
         ArrowSchema::new(vec![

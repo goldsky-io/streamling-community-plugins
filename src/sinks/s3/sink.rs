@@ -5,6 +5,7 @@ use futures::stream::{self, StreamExt};
 use object_store::ObjectStore;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
 use super::partitioning::{PartitionConfig, partition_batch};
+use crate::utils::parquet_compression::{CompressionError, SUPPORTED_CODECS, parquet_compression};
 use crate::utils::plugin_options::PluginOptions;
 
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(100);
@@ -42,6 +44,7 @@ pub struct S3Sink {
     bucket: OnceLock<String>,
     prefix: OnceLock<Option<String>>,
     partition_config: OnceLock<Option<PartitionConfig>>,
+    compression: OnceLock<Compression>,
     running: Arc<AtomicBool>,
 }
 
@@ -60,15 +63,21 @@ impl S3Sink {
             bucket: OnceLock::new(),
             prefix: OnceLock::new(),
             partition_config: OnceLock::new(),
+            compression: OnceLock::new(),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
 
     /// Serialize a RecordBatch to Parquet bytes.
-    fn serialize_to_parquet(batch: &RecordBatch) -> Result<Vec<u8>, PluginError> {
+    fn serialize_to_parquet(
+        batch: &RecordBatch,
+        compression: Compression,
+    ) -> Result<Vec<u8>, PluginError> {
         let estimated_size = batch.get_array_memory_size();
         let mut buffer = Vec::with_capacity(estimated_size);
-        let props = WriterProperties::builder().build();
+        let props = WriterProperties::builder()
+            .set_compression(compression)
+            .build();
         let mut writer =
             ArrowWriter::try_new(&mut buffer, batch.schema(), Some(props)).map_err(|e| {
                 let err_msg = format!("Failed to create Parquet writer: {}", e);
@@ -166,6 +175,27 @@ impl S3Sink {
         }
     }
 
+    /// Parse the `compression` / `compression_level` options.
+    fn parse_compression(&self) -> Result<Compression, PluginError> {
+        let codec = self.opts.get_or("compression", "uncompressed");
+        let level = self
+            .opts
+            .lookup("compression_level")
+            .map(|v| self.opts.parse_value::<u32>("compression_level", &v))
+            .transpose()?;
+        parquet_compression(&codec, level).map_err(|e| {
+            PluginError::Internal(match e {
+                CompressionError::UnknownCodec => {
+                    format!("s3_sink: invalid compression '{codec}': expected {SUPPORTED_CODECS}")
+                }
+                CompressionError::InvalidLevel(e) => format!(
+                    "s3_sink: invalid compression_level '{}' for {codec}: {e}",
+                    level.unwrap_or_default()
+                ),
+            })
+        })
+    }
+
     /// Build the S3 object key for a file, optionally including a partition path segment.
     fn build_key(&self, partition_segment: Option<&str>) -> String {
         let filename = format!("batch_{}.parquet", Uuid::now_v7());
@@ -214,6 +244,12 @@ impl SinkPlugin for S3Sink {
             );
         }
         let _ = self.partition_config.set(pc);
+
+        let compression = self.parse_compression().inspect_err(|e| {
+            error!(error = %e, "S3 sink initialization failed");
+        })?;
+        info!(compression = %compression, "S3 sink Parquet compression");
+        let _ = self.compression.set(compression);
 
         // Cache the trimmed prefix once (avoids per-batch allocation in build_key)
         let prefix = self
@@ -306,8 +342,12 @@ impl SinkPlugin for S3Sink {
             cols = batch.num_columns(),
             "Processing batch for S3 upload"
         );
-
         let partition_config = self.partition_config.get().and_then(|o| o.as_ref());
+        let compression = *self.compression.get().ok_or_else(|| {
+            let err = "Compression is not initialized".to_string();
+            error!(error = %err);
+            PluginError::Internal(err)
+        })?;
 
         match partition_config {
             Some(config) => {
@@ -323,7 +363,7 @@ impl SinkPlugin for S3Sink {
                     .into_iter()
                     .map(|p| {
                         let key = self.build_key(Some(&p.path_segment));
-                        let data = Self::serialize_to_parquet(&p.batch)?;
+                        let data = Self::serialize_to_parquet(&p.batch, compression)?;
                         Ok((key, data))
                     })
                     .collect::<Result<Vec<_>, PluginError>>()?;
@@ -353,7 +393,7 @@ impl SinkPlugin for S3Sink {
             }
             None => {
                 let key = self.build_key(None);
-                let data = Self::serialize_to_parquet(&batch)?;
+                let data = Self::serialize_to_parquet(&batch, compression)?;
                 self.upload_to_s3(&key, data).await?;
             }
         }
@@ -418,6 +458,7 @@ mod tests {
             bucket: OnceLock::new(),
             prefix: OnceLock::new(),
             partition_config: OnceLock::new(),
+            compression: OnceLock::new(),
             running: Arc::new(AtomicBool::new(true)),
         };
         let _ = sink.prefix.set(prefix);
@@ -431,7 +472,7 @@ mod tests {
     #[test]
     fn test_serialize_to_parquet_produces_valid_parquet() {
         let batch = make_test_batch();
-        let data = S3Sink::serialize_to_parquet(&batch).unwrap();
+        let data = S3Sink::serialize_to_parquet(&batch, Compression::UNCOMPRESSED).unwrap();
 
         assert!(!data.is_empty());
         // Parquet magic bytes: PAR1
@@ -442,7 +483,7 @@ mod tests {
     #[test]
     fn test_serialize_to_parquet_roundtrips_data() {
         let batch = make_test_batch();
-        let data = S3Sink::serialize_to_parquet(&batch).unwrap();
+        let data = S3Sink::serialize_to_parquet(&batch, Compression::UNCOMPRESSED).unwrap();
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(data))
             .unwrap()
@@ -481,7 +522,7 @@ mod tests {
     #[test]
     fn test_serialize_to_parquet_preserves_schema_field_names() {
         let batch = make_test_batch();
-        let data = S3Sink::serialize_to_parquet(&batch).unwrap();
+        let data = S3Sink::serialize_to_parquet(&batch, Compression::UNCOMPRESSED).unwrap();
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(data))
             .unwrap()
@@ -494,6 +535,106 @@ mod tests {
             .map(|f| f.name().as_str())
             .collect();
         assert_eq!(field_names, vec!["id", "name", "value"]);
+    }
+
+    // ── Compression ──
+
+    fn sink_with(pairs: &[(&str, &str)]) -> S3Sink {
+        let options = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        make_test_sink(options, None, None)
+    }
+
+    #[test]
+    fn test_parse_compression_defaults_to_uncompressed() {
+        assert_eq!(
+            sink_with(&[]).parse_compression().unwrap(),
+            Compression::UNCOMPRESSED
+        );
+    }
+
+    #[test]
+    fn test_parse_compression_codecs_and_levels() {
+        use parquet::basic::{GzipLevel, ZstdLevel};
+        for (pairs, expected) in [
+            (
+                &[("compression", "ZSTD")][..],
+                Compression::ZSTD(ZstdLevel::try_new(3).unwrap()),
+            ),
+            (
+                &[("compression", "zstd"), ("compression_level", "9")][..],
+                Compression::ZSTD(ZstdLevel::try_new(9).unwrap()),
+            ),
+            (
+                &[("compression", "gzip")][..],
+                Compression::GZIP(GzipLevel::try_new(6).unwrap()),
+            ),
+            (
+                &[("compression", "snappy"), ("compression_level", "9")][..],
+                Compression::SNAPPY,
+            ),
+            (&[("compression", "lz4_raw")][..], Compression::LZ4_RAW),
+        ] {
+            assert_eq!(
+                sink_with(pairs).parse_compression().unwrap(),
+                expected,
+                "for {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_compression_rejects_invalid_values() {
+        for (pairs, key) in [
+            (&[("compression", "lzo")][..], "compression 'lzo'"),
+            (&[("compression", "")][..], "compression ''"),
+            (
+                &[("compression", "zstd"), ("compression_level", "99")][..],
+                "compression_level '99'",
+            ),
+            (
+                &[("compression", "gzip"), ("compression_level", "high")][..],
+                "compression_level 'high'",
+            ),
+        ] {
+            let err = sink_with(pairs).parse_compression().unwrap_err();
+            assert!(err.to_string().contains(key), "for {pairs:?}: got {err}");
+        }
+    }
+
+    #[test]
+    fn test_serialize_to_parquet_writes_requested_codec() {
+        use parquet::basic::{BrotliLevel, GzipLevel, ZstdLevel};
+        let batch = make_test_batch();
+        for compression in [
+            Compression::UNCOMPRESSED,
+            Compression::SNAPPY,
+            Compression::GZIP(GzipLevel::default()),
+            Compression::BROTLI(BrotliLevel::default()),
+            Compression::LZ4,
+            Compression::LZ4_RAW,
+            Compression::ZSTD(ZstdLevel::default()),
+        ] {
+            let data = S3Sink::serialize_to_parquet(&batch, compression).unwrap();
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(data)).unwrap();
+            for column in builder.metadata().row_group(0).columns() {
+                assert_eq!(
+                    std::mem::discriminant(&column.compression()),
+                    std::mem::discriminant(&compression),
+                    "column {} written with {compression}",
+                    column.column_path()
+                );
+            }
+            let rows: usize = builder
+                .build()
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            assert_eq!(rows, batch.num_rows(), "{compression}");
+        }
     }
 
     // ── Backwards-compatibility: build_key ──

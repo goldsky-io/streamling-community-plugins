@@ -27,6 +27,8 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S3_SINK__<KEY>` enviro
 | `allow_http` | no | Allow plain HTTP (auto-detected from `endpoint`) |
 | `partition_columns` | no | Comma-separated column names for Hive partitioning |
 | `max_concurrent_partition_uploads` | no | Max parallel partition uploads (default: 16) |
+| `compression` | no | Parquet codec: `zstd`, `gzip`, `brotli`, `snappy`, `lz4`, `lz4_raw` or `uncompressed` (default: `uncompressed`) |
+| `compression_level` | no | Level for `zstd` (1–22, default 3), `gzip` (0–9, default 6) or `brotli` (0–11, default 1); ignored for other codecs |
 
 ### MySQL Sink (`mysql_sink`)
 
