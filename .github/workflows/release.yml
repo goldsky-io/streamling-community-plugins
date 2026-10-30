@@ -1,7 +1,8 @@
 name: community-plugins-release
 
 # Manual, versioned release pipeline.
-#   - Builds release-optimized shared libraries for linux, macOS and Windows.
+#   - Builds release-optimized shared libraries for linux and macOS.
+#     (Windows is not built: zama_sdk needs Unix sockets and no consumer asks for it.)
 #   - Publishes a GitHub release tagged from the `community_plugins` crate version.
 #
 # Trigger:
@@ -226,66 +227,12 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  build-release-windows:
-    needs: [validate-and-test, version]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: blacksmith-8vcpu-windows-2025
-            os: windows
-            arch: x86_64
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Cache release-optimized library
-        id: lib-cache
-        uses: actions/cache@v4
-        with:
-          path: target/release-optimized/community_plugins.dll
-          key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-      - name: Configure Rust toolchain
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.95.0
-      - name: Setup rust cache
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "v0-release-opt-windows-${{ matrix.arch }}"
-          cache-targets: true
-          cache-on-failure: true
-      # aws-lc-sys (pulled via aws-sdk-sqs default-https-client / rustls-aws-lc)
-      # assembles NASM-format asm on Windows; cmake ships on the windows-2025
-      # image, nasm does not.
-      - name: Install NASM
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: ilammy/setup-nasm@v1
-      - name: Verify native build tools
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        run: |
-          cmake --version
-          nasm --version
-      - name: Build release-optimized library
-        if: steps.lib-cache.outputs.cache-hit != 'true'
-        run: cargo build --profile release-optimized --lib --locked
-        env:
-          CARGO_INCREMENTAL: 0
-      - name: Upload release library
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-lib-${{ matrix.os }}-${{ matrix.arch }}
-          path: target/release-optimized/community_plugins.dll
-          retention-days: 1
-          if-no-files-found: error
-
   # ==========================================================================
   # Versioned GitHub release. Assets are named community-plugins-<os>-<arch>;
   # tag/name come from the resolved Cargo version.
   # ==========================================================================
   publish-release:
-    needs: [version, build-release-linux, build-release-macos, build-release-windows]
+    needs: [version, build-release-linux, build-release-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -310,11 +257,8 @@ jobs:
             name="$(basename "$dir")"            # release-lib-linux-x86_64
             os_arch="${name#release-lib-}"       # linux-x86_64
             base="community-plugins-${os_arch}"
-            # Windows ships a .dll packaged as .zip; unix ships .so/.dylib
-            # packaged as .tar.gz. The library sits flat at the archive root.
-            if [[ -f "$dir/community_plugins.dll" ]]; then
-              zip -j "release-assets/${base}.zip" "$dir/community_plugins.dll"
-            elif [[ -f "$dir/libcommunity_plugins.so" ]]; then
+            # .so/.dylib packaged as .tar.gz, flat at the archive root.
+            if [[ -f "$dir/libcommunity_plugins.so" ]]; then
               tar -czf "release-assets/${base}.tar.gz" -C "$dir" libcommunity_plugins.so
             elif [[ -f "$dir/libcommunity_plugins.dylib" ]]; then
               tar -czf "release-assets/${base}.tar.gz" -C "$dir" libcommunity_plugins.dylib
