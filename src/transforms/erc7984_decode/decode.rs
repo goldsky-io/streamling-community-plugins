@@ -236,14 +236,14 @@ fn decode_row(
             token,
             holder: word_to_address(topics[1])?,
             operator: word_to_address(topics[2])?,
-            until: word_to_u64(parse_word(data.value(row)?)?)?,
+            until: word_to_uint(parse_word(data.value(row)?)?, 48)?,
         })
     } else {
         (topics.len() == 2).then_some(())?;
         Some(Event::AmountDisclosed {
             token,
             encrypted_amount: topics[1],
-            amount: word_to_u64(parse_word(data.value(row)?)?)?,
+            amount: word_to_uint(parse_word(data.value(row)?)?, 64)?,
         })
     }
 }
@@ -260,9 +260,11 @@ fn word_to_address(word: B256) -> Option<Address> {
         .then(|| Address::from_slice(&word[12..]))
 }
 
-/// A `uint48` or `uint64` word is the value right-aligned in 32 bytes.
-fn word_to_u64(word: B256) -> Option<u64> {
-    u64::try_from(U256::from_be_bytes(word.0)).ok()
+/// A `uint<bits>` word is the value right-aligned in 32 bytes; anything wider
+/// is malformed.
+fn word_to_uint(word: B256, bits: u32) -> Option<u64> {
+    let value = u64::try_from(U256::from_be_bytes(word.0)).ok()?;
+    (bits >= 64 || value >> bits == 0).then_some(value)
 }
 
 #[cfg(test)]
@@ -492,6 +494,59 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(decoded[3], None);
+    }
+
+    #[test]
+    fn integer_fields_respect_their_solidity_width() {
+        let operator_set = hex(&OPERATOR_SET_TOPIC);
+        let amount_disclosed = hex(&AMOUNT_DISCLOSED_TOPIC);
+        let word = |value: U256| format!("{:#x}", B256::from(value));
+        let max48 = word(U256::from((1u64 << 48) - 1));
+        let over48 = word(U256::from(1u64 << 48));
+        let max64 = word(U256::from(u64::MAX));
+        let over64 = word(U256::from(u64::MAX) + U256::from(1));
+        let operator = |data: &str| -> Option<Event> {
+            let row = Row {
+                address: Some(TOKEN),
+                topics: vec![Some(&operator_set), Some(FROM_WORD), Some(TO_WORD), None],
+                data: Some(data),
+            };
+            decode_batch(
+                &separate_batch(&[row]),
+                &separate_columns(),
+                &HashSet::new(),
+            )
+            .expect("decode")
+            .remove(0)
+        };
+        let disclosed = |data: &str| -> Option<Event> {
+            let row = Row {
+                address: Some(TOKEN),
+                topics: vec![Some(&amount_disclosed), Some(HANDLE), None, None],
+                data: Some(data),
+            };
+            decode_batch(
+                &separate_batch(&[row]),
+                &separate_columns(),
+                &HashSet::new(),
+            )
+            .expect("decode")
+            .remove(0)
+        };
+
+        assert!(
+            matches!(operator(&max48), Some(Event::OperatorSet { until, .. }) if until == (1 << 48) - 1)
+        );
+        assert_eq!(operator(&over48), None);
+        assert_eq!(operator(&max64), None);
+        assert!(matches!(
+            disclosed(&max64),
+            Some(Event::AmountDisclosed {
+                amount: u64::MAX,
+                ..
+            })
+        ));
+        assert_eq!(disclosed(&over64), None);
     }
 
     #[test]

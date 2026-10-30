@@ -775,3 +775,65 @@ mod tests {
         assert!(render(&ClearValue::Undefined).is_err());
     }
 }
+
+/// Opt-in check against a real Zama SDK daemon and Sepolia:
+/// `ZAMA_SDK_DAEMON_SOCKET=/tmp/zama-sdk/zama.sock cargo test --lib live_ -- --ignored`
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::transforms::zama_decrypt::config::Settings;
+    use crate::transforms::zama_decrypt::daemon;
+    use alloy_primitives::keccak256;
+
+    #[tokio::test]
+    #[ignore = "needs a running Zama SDK daemon; set ZAMA_SDK_DAEMON_SOCKET"]
+    async fn live_daemon_answers_a_real_sepolia_transfer() {
+        let socket = std::env::var("ZAMA_SDK_DAEMON_SOCKET").expect("ZAMA_SDK_DAEMON_SOCKET");
+        let rpc_url = std::env::var("ZAMA_LIVE_RPC_URL")
+            .unwrap_or_else(|_| "https://ethereum-sepolia-rpc.publicnode.com".into());
+        // A deterministic key no wallet delegates to, so the expected answer is stable.
+        let key = keccak256("streamling-community-plugins zama_decrypt live test");
+        // SAFETY: only this opt-in test runs with `--ignored live_`; nothing reads the
+        // environment concurrently.
+        unsafe {
+            std::env::set_var(
+                "STREAMLING__PLUGIN__ZAMA_DECRYPT__DELEGATE_PRIVATE_KEY",
+                format!("{key:#x}"),
+            )
+        };
+        let settings = Settings::parse(HashMap::from([
+            ("chain_id".to_string(), "11155111".to_string()),
+            ("rpc_url".to_string(), rpc_url),
+            ("daemon_socket".to_string(), socket),
+        ]))
+        .expect("settings");
+        let sdk = daemon::connect(&settings).await.expect("daemon reachable");
+        let decryptor = Decryptor::new(SdkBackend(sdk), settings.delegate_address(), None);
+
+        // cUSDCMock ConfidentialTransfer in Sepolia block 11915267.
+        let transfer = DecodedTransfer {
+            token: "0x7c5bf43b851c1dff1a4fee8db225b87f2c223639"
+                .parse()
+                .unwrap(),
+            from: "0x9b86ecfd4d8409a34516358b101b1a1a881d4621"
+                .parse()
+                .unwrap(),
+            to: "0x51ba89c2685499853c66e726a9f86cae1c25cd7a"
+                .parse()
+                .unwrap(),
+            handle: "0xf28b8d5e064017bbf707dd00f729e347d91bb261a2ff0000000000aa36a70500"
+                .parse()
+                .unwrap(),
+        };
+        let out = decryptor
+            .decrypt(&[Some(transfer), None])
+            .await
+            .expect("ACL lookups through the daemon succeed");
+        assert_eq!(
+            out[0].error.as_deref(),
+            Some("no active delegation from either party")
+        );
+        assert_eq!(out[1], Decrypted::default());
+        decryptor.close().await.expect("close");
+    }
+}

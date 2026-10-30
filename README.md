@@ -344,7 +344,7 @@ Requirements and caveats:
 - Needs a running Zama SDK daemon (`packages/sdk-daemon` in [zama-ai/sdk](https://github.com/zama-ai/sdk), built from the `v<version>` tag matching the `zama_sdk` version pinned in `Cargo.toml`) reachable over a Unix socket. Streamling must run as the same UID as the daemon.
 - The delegate key signs decryption permits only and needs no funds; use one key per tenant, since every wallet delegating to the same address is decryptable by the same pipeline.
 - Rows the relayer or ACL refuses for good carry the reason in `zama_error` and are not retried. A failure that may clear on a retry (daemon unreachable, relayer timeout, rate limit, delegation not yet propagated) fails the batch; Streamling then restarts the pipeline and replays it.
-- The SDK client is a crates.io pre-release pinned to an exact version; it is bumped together with the daemon image.
+- The SDK client is a crates.io pre-release pinned to an exact version; it is bumped together with the daemon image. After a bump, check it against a running daemon and Sepolia: `ZAMA_SDK_DAEMON_SOCKET=/tmp/zama-sdk/zama.sock cargo test --lib live_ -- --ignored` (optional `ZAMA_LIVE_RPC_URL`).
 
 ### Quick start
 
