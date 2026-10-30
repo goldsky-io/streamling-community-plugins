@@ -2,6 +2,7 @@
 
 use crate::utils::plugin_options::PluginOptions;
 use streamling_plugin::PluginError;
+use tracing::warn;
 
 pub const DEFAULT_ROLE_SESSION_NAME: &str = "streamling-sqs-sink";
 
@@ -36,6 +37,11 @@ impl SqsSinkConfig {
                 validate_role_arn(&role_arn)?;
                 // Env only: the operator, not the pipeline author, chooses the external ID.
                 let external_id = opts.env_non_empty("external_id");
+                if external_id.is_none() && opts.lookup_non_empty("external_id").is_some() {
+                    warn!(
+                        "sqs_sink: external_id in YAML is ignored; it is read only from STREAMLING__PLUGIN__SQS_SINK__EXTERNAL_ID"
+                    );
+                }
                 if let Some(id) = &external_id {
                     validate_external_id(id)?;
                 }
