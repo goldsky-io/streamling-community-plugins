@@ -358,9 +358,9 @@ Decrypts Zama FHE handles that were made publicly decryptable on-chain (for exam
 | `rpc_url` | yes | | JSON-RPC endpoint the daemon uses |
 | `daemon_socket` | yes | | Absolute path of the daemon's Unix socket |
 | `handle_column` | no | `handle` | String column holding the handle |
-| `relayer_api_key` | no | | Zama relayer credential; required on mainnet only |
+| `relayer_api_key` | no | | Zama relayer credential; required on mainnet only (env var only) |
 
-A handle the KMS refuses gets its reason in `zama_public_error`; a retryable error or an unreachable daemon fails the batch so Streamling replays it.
+A handle the KMS refuses (not public, no ciphertext, malformed) gets its reason in `zama_public_error`; any other error, including a relayer outage or an unreachable daemon, fails the batch so Streamling replays it.
 
 Example pipeline (every row must print `matches: true`): [`examples/pipeline-zama-public-decrypt.yaml`](examples/pipeline-zama-public-decrypt.yaml)
 
