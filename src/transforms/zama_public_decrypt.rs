@@ -5,12 +5,13 @@
 //!
 //! Options (flat keys; `STREAMLING__PLUGIN__ZAMA_PUBLIC_DECRYPT__<KEY>` wins):
 //! `chain_id`, `rpc_url`, `daemon_socket` (required); `handle_column`
-//! (default `handle`, `0x` hex bytes32, any Arrow string type); `relayer_api_key`
-//! (secret, required by the mainnet relayer only).
+//! (default `handle`, `0x` hex bytes32, any Arrow string type);
+//! `relayer_api_key` (required by the mainnet relayer only; environment only,
+//! since Streamling logs YAML options at startup).
 //!
 //! Appends nullable Utf8 `zama_public_amount` (decimal) and `zama_public_error`.
-//! A handle the KMS refuses (e.g. not public) is a row error; an unreachable
-//! daemon or a retryable SDK error fails the batch so Streamling replays it.
+//! A handle the KMS positively refuses (not public, no ciphertext, malformed)
+//! is a row error; any other failure fails the batch so Streamling replays it.
 
 use crate::utils::plugin_options::{PluginOptions, configuration_error};
 use arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
@@ -67,8 +68,8 @@ impl ZamaPublicDecryptTransform {
         let daemon_socket = PathBuf::from(opts.get("daemon_socket").map_err(configuration_error)?);
         let handle_column = opts.get_or("handle_column", "handle");
         let relayer_api_key = opts
-            .get_secret("relayer_api_key")
-            .filter(|key| !key.is_empty());
+            .get_env_only_secret("relayer_api_key")
+            .map_err(configuration_error)?;
         let output_schema = output_schema(&schema, &handle_column).map_err(|message| {
             PluginInitializationError::Configuration(format!("{PLUGIN_NAME}: {message}").into())
         })?;
@@ -164,10 +165,18 @@ fn read_handles(
     )))
 }
 
-/// The KMS refused the request itself; retrying the same input cannot help.
+/// SDK codes that refuse the handle itself; retrying the same input cannot
+/// help. Anything else (relayer 5xx, unknown failure) may clear on a replay.
+const REFUSAL_CODES: [&str; 2] = ["NOT_ENTITLED", "NO_CIPHERTEXT"];
+
 fn is_refusal(error: &ClientError) -> bool {
-    matches!(error.kind(), ErrorKind::Sdk | ErrorKind::InvalidInput)
-        && !error.sdk_error().is_some_and(|sdk| sdk.retryable)
+    match error.kind() {
+        ErrorKind::InvalidInput => true,
+        ErrorKind::Sdk => error
+            .sdk_error()
+            .is_some_and(|sdk| !sdk.retryable && REFUSAL_CODES.contains(&sdk.code.as_str())),
+        _ => false,
+    }
 }
 
 fn render(value: &ClearValue) -> Result<String, String> {
@@ -327,14 +336,18 @@ mod tests {
     const A: B256 = B256::repeat_byte(0xaa);
     const B: B256 = B256::repeat_byte(0xbb);
 
-    fn refusal(retryable: bool) -> ClientError {
+    fn sdk_error(code: &str, retryable: bool) -> ClientError {
         ClientError::from(SdkError {
-            code: "NOT_PUBLIC".into(),
-            message: "handle is not publicly decryptable".into(),
+            code: code.into(),
+            message: "nope".into(),
             retryable,
             retry_after_seconds: None,
             revert_data: None,
         })
+    }
+
+    fn refusal(retryable: bool) -> ClientError {
+        sdk_error("NOT_ENTITLED", retryable)
     }
 
     #[tokio::test]
@@ -368,13 +381,24 @@ mod tests {
         .await
         .expect("refusal is a row error");
         assert_eq!(answers[&A], Ok("7".to_string()));
-        assert!(answers[&B].as_ref().unwrap_err().contains("NOT_PUBLIC"));
+        assert!(answers[&B].as_ref().unwrap_err().contains("NOT_ENTITLED"));
     }
 
     #[tokio::test]
     async fn retryable_error_fails_the_batch() {
         let result = decrypt_all(vec![A], |_| async { Err(refusal(true)) }).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn relayer_outage_fails_the_batch_instead_of_nulling_rows() {
+        for handles in [vec![A], vec![A, B]] {
+            let result = decrypt_all(handles, |_| async {
+                Err(sdk_error("RELAYER_REQUEST_FAILED", false))
+            })
+            .await;
+            assert!(result.is_err());
+        }
     }
 
     #[tokio::test]
