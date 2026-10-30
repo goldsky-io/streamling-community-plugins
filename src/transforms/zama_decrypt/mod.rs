@@ -38,17 +38,20 @@
 //!
 //! # Failure semantics
 //!
-//! - A relayer or ACL answer that refuses one handle or one delegator for good
-//!   (no entitlement, bad input) is written to `zama_error` on the affected
-//!   rows; the batch is still emitted and the checkpoint advances. Such rows
-//!   are not retried: re-run them from the raw logs.
-//! - A failure that may clear on a retry fails the batch with an execution
-//!   error: a daemon that cannot be reached or whose context is gone, and any
-//!   SDK error flagged retryable (relayer timeout, RPC rate limit, a delegation
-//!   not yet propagated). Streamling terminates the transform on a batch
-//!   error, restarts the pipeline and replays the batch into a fresh plugin
-//!   instance, which reconnects in `initialize`. A relayer blip therefore
-//!   costs a restart, never a silently undecrypted row.
+//! - An SDK answer that positively refuses one handle or one delegator
+//!   (`NOT_ENTITLED`, `NO_CIPHERTEXT`, `DELEGATION_NOT_FOUND`,
+//!   `DELEGATION_EXPIRED`, invalid input) is written to `zama_error` on the
+//!   affected rows; the batch is still emitted and the checkpoint advances.
+//!   Such rows are not retried: re-run them from the raw logs.
+//! - Any other failure fails the batch with an execution error: a daemon that
+//!   cannot be reached or whose context is gone, a relayer outage (HTTP 5xx,
+//!   even when the SDK does not flag it retryable), an unclassified SDK error,
+//!   and any SDK error flagged retryable (relayer timeout, RPC rate limit, a
+//!   delegation not yet propagated). Streamling terminates the transform on a
+//!   batch error, restarts the pipeline and replays the batch into a fresh
+//!   plugin instance, which reconnects in `initialize`. A relayer blip
+//!   therefore costs a restart, never a silently undecrypted row; a handle
+//!   that fails the same unclassified way on every replay stalls the pipeline.
 //! - A missing or non-string input column, a bad option, a credential in
 //!   YAML, or an unreachable daemon at startup is an initialization error.
 //!
