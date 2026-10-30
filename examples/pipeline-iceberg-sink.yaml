@@ -1,7 +1,7 @@
 # Example pipeline: Kafka source -> Iceberg sink (plugin)
 #
 # Requires STREAMLING__PLUGIN__PATH pointing to the compiled plugins library
-# (.so / .dylib / .dll) — see "How to Use" in the README.
+# (.so / .dylib) — see "How to Use" in the README.
 #
 # The sink commits one Iceberg snapshot per Streamling checkpoint; keep the
 # checkpoint interval at one minute or more (STREAMLING__CHECKPOINT_INTERVAL_SEC=60)

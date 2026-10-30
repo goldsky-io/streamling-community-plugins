@@ -1,7 +1,7 @@
 # Example pipeline: Kafka source -> SQS sink (plugin)
 #
 # Requires STREAMLING__PLUGIN__PATH pointing to the compiled plugins library
-# (.so / .dylib / .dll) — see "How to Use" in the README.
+# (.so / .dylib) — see "How to Use" in the README.
 #
 # For local testing without AWS, point `endpoint_url` at ElasticMQ or
 # LocalStack and use test credentials (see the commented options below).
