@@ -1,0 +1,61 @@
+# Example pipeline: UnwrapFinalized logs -> zama_public_decrypt -> print
+#
+# Checks the Zama relayer path with no key. The fixture holds 10 Sepolia
+# `UnwrapFinalized(address indexed receiver, bytes32 indexed unwrapRequestId,
+# bytes32 encryptedAmount, uint64 cleartextAmount)` logs of the cUSDCMock wrapper
+# (blocks 11910290-11910400). Each log carries both the public handle and the
+# cleartext the chain accepted for it, so every row must print `matches: true`.
+#
+# Run from the repository root with:
+#   - STREAMLING__PLUGIN__PATH pointing to this repo's compiled plugin library.
+#   - The Zama SDK daemon listening on `daemon_socket`; see "Running the Zama
+#     examples locally" in the README.
+# A finished run is checkpointed in ./state.db; delete it to run again.
+#
+# On Goldsky, the same logs come from the `edge.evm.logs` dataset instead of a CSV
+# (https://docs.goldsky.com/turbo-pipelines/sources/edge-evm), where `data` is the
+# same hex string.
+name: zama-public-decrypt-sepolia
+sources:
+  logs:
+    type: file
+    path: examples/fixtures/sepolia-unwrap-finalized.csv
+    format: csv
+    mode:
+      type: bounded
+    primary_key: id
+
+transforms:
+  unwraps:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT
+        id, block_number, transaction_hash, log_index,
+        substr(data, 1, 66) AS handle,
+        -- cleartextAmount is the low 8 bytes of the second data word
+        COALESCE(NULLIF(ltrim(substr(data, 115, 16), '0'), ''), '0') AS expected_hex
+      FROM logs
+
+  decrypted:
+    type: zama_public_decrypt
+    from: unwraps
+    chain_id: "11155111"
+    rpc_url: https://ethereum-sepolia-rpc.publicnode.com
+    daemon_socket: /tmp/zama-sdk/zama.sock  # or STREAMLING__PLUGIN__ZAMA_PUBLIC_DECRYPT__DAEMON_SOCKET
+    handle_column: handle
+
+  checked:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT
+        id, block_number, transaction_hash, handle,
+        zama_public_amount, zama_public_error,
+        to_hex(CAST(zama_public_amount AS BIGINT)) = expected_hex AS matches
+      FROM decrypted
+
+sinks:
+  out:
+    type: print
+    from: checked

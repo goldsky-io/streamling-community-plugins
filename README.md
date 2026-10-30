@@ -346,6 +346,44 @@ Requirements and caveats:
 - Rows the relayer or ACL refuses for good carry the reason in `zama_error` and are not retried. A failure that may clear on a retry (daemon unreachable, relayer timeout, rate limit, delegation not yet propagated) fails the batch; Streamling then restarts the pipeline and replays it.
 - The SDK client is a crates.io pre-release pinned to an exact version; it is bumped together with the daemon image. After a bump, check it against a running daemon and Sepolia: `ZAMA_SDK_DAEMON_SOCKET=/tmp/zama-sdk/zama.sock cargo test --lib live_ -- --ignored` (optional `ZAMA_LIVE_RPC_URL`).
 
+Example pipeline: [`examples/pipeline-zama-delegated-decrypt.yaml`](examples/pipeline-zama-delegated-decrypt.yaml)
+
+### Zama Public Decrypt Transform (`zama_public_decrypt`)
+
+Decrypts Zama FHE handles that were made publicly decryptable on-chain (for example ERC-7984 unwrap amounts) through the same Zama SDK daemon. No signer or delegation is needed. Reads a `0x` hex handle column and appends nullable text columns `zama_public_amount` (decimal) and `zama_public_error`. Options can also be set via `STREAMLING__PLUGIN__ZAMA_PUBLIC_DECRYPT__<KEY>`; env vars take precedence.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `chain_id` | yes | | EVM chain id |
+| `rpc_url` | yes | | JSON-RPC endpoint the daemon uses |
+| `daemon_socket` | yes | | Absolute path of the daemon's Unix socket |
+| `handle_column` | no | `handle` | String column holding the handle |
+| `relayer_api_key` | no | | Zama relayer credential; required on mainnet only (env var only) |
+
+A handle the KMS refuses (not public, no ciphertext, malformed) gets its reason in `zama_public_error`; any other error, including a relayer outage or an unreachable daemon, fails the batch so Streamling replays it.
+
+Example pipeline (every row must print `matches: true`): [`examples/pipeline-zama-public-decrypt.yaml`](examples/pipeline-zama-public-decrypt.yaml)
+
+### Running the Zama examples locally
+
+The examples read committed Sepolia log fixtures (`examples/fixtures/`), so they need only Streamling, this repo's plugin library and the Zama SDK daemon. On Goldsky the logs come from the [`edge.evm.logs` dataset](https://docs.goldsky.com/turbo-pipelines/sources/edge-evm) instead.
+
+```bash
+# Zama SDK daemon, same version as `zama_sdk` in Cargo.toml; needs Node 24+
+git clone --depth 1 --branch v3.8.0-beta.5 https://github.com/zama-ai/sdk.git
+(cd sdk && CI=1 pnpm install --frozen-lockfile && CI=1 pnpm daemon:build)
+mkdir -p /tmp/zama-sdk && chmod 700 /tmp/zama-sdk
+(cd sdk/packages/sdk-daemon && ZAMA_SDK_DAEMON_SOCKET_PATH=/tmp/zama-sdk/zama.sock node dist/main.js) &
+
+# Plugin library, then the examples (Streamling built from https://github.com/goldsky-io/streamling)
+just build-release
+export STREAMLING__PLUGIN__PATH="$PWD/target/release/libcommunity_plugins.dylib"  # .so on Linux
+streamling examples/pipeline-zama-public-decrypt.yaml
+STREAMLING__PLUGIN__ZAMA_DECRYPT__DELEGATE_PRIVATE_KEY=0x<64 hex> streamling examples/pipeline-zama-delegated-decrypt.yaml
+```
+
+An older `node` first on `PATH` makes context creation fail with `INTERNAL TypeError` in the daemon log.
+
 ### Quick start
 
 ```bash
