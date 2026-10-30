@@ -1,0 +1,32 @@
+# Example pipeline: Iceberg source (plugin) -> ClickHouse sink
+#
+# Requires STREAMLING__PLUGIN__PATH pointing to the compiled plugins library
+# (.so / .dylib / .dll) — see "How to Use" in the README.
+#
+# Reads lake.events: a full scan of the current snapshot, then every newly
+# committed append snapshot. The read position is checkpointed, so a restart
+# resumes where the last finalized checkpoint left off.
+sources:
+  events:
+    type: iceberg_source
+    catalog_uri: http://localhost:8181
+    # warehouse: analytics
+    table: lake.events
+    start_position: earliest    # or `latest`: only snapshots committed from now on
+    poll_interval_secs: 60
+    batch_size: 1000
+    on_non_append_snapshot: error  # or `skip` to pass over overwrite/delete snapshots
+    #
+    # Prefer env vars over YAML for credentials:
+    #   STREAMLING__PLUGIN__ICEBERG_SOURCE__CREDENTIAL   (OAuth2 client_id:client_secret)
+    #   STREAMLING__PLUGIN__ICEBERG_SOURCE__TOKEN
+    #   STREAMLING__PLUGIN__ICEBERG_SOURCE__S3_ACCESS_KEY_ID / __S3_SECRET_ACCESS_KEY
+
+transforms: {}
+
+sinks:
+  clickhouse:
+    type: clickhouse
+    from: events
+    table: events
+    primary_key: id

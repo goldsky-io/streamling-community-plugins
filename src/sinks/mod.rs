@@ -1,3 +1,4 @@
+pub mod iceberg;
 pub mod mysql;
 pub mod s2;
 pub mod s3;

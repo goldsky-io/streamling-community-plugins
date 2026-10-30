@@ -265,6 +265,50 @@ environment variables (uppercase key). Env vars take precedence over YAML.
 | `memory_backpressure_activate_threshold` | no | `0.85` | System-memory ratio above which backpressure activates (ignored when disabled) |
 | `memory_backpressure_resume_threshold` | no | `0.75` | System-memory ratio below which backpressure releases; must be `<` the activate threshold (ignored when disabled) |
 
+### Iceberg Sink (`iceberg_sink`)
+
+Appends rows to an [Apache Iceberg](https://iceberg.apache.org) table through a [REST catalog](https://iceberg.apache.org/rest-catalog-spec/). The sink writes Parquet data files as batches arrive. At each Streamling checkpoint, it commits the files in one fast-append snapshot. The snapshot summary records `streamling.checkpoint-epoch` and `streamling.writer-id`. Epochs without rows commit nothing. Delivery is at-least-once: a crash after a commit and before the checkpoint acknowledgment appends the epoch again.
+
+Each commit adds a snapshot and small data files. Keep the Streamling checkpoint interval at one minute or longer. Run table maintenance from an engine such as Spark: `rewrite_data_files`, `expire_snapshots`, and `remove_orphan_files`. The sink is append-only, because iceberg-rust 0.10 cannot commit delete files. By default the table keeps the `_gs_op` column, so CDC input lands as a changelog that you apply downstream with `MERGE INTO`. The type mapping, delivery details, and limitations are in the module docs in [`src/sinks/iceberg/mod.rs`](src/sinks/iceberg/mod.rs).
+
+All YAML options can also be set via `STREAMLING__PLUGIN__ICEBERG_SINK__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `catalog_uri` | yes | — | REST catalog base URL |
+| `warehouse` | no | — | Warehouse name or location passed to the catalog |
+| `token` | no | — | Static bearer token (env var preferred) |
+| `credential` | no | — | OAuth2 client credentials `client_id:client_secret` (env var preferred) |
+| `s3_endpoint` / `s3_region` | no | — | S3-compatible endpoint and region |
+| `s3_access_key_id` / `s3_secret_access_key` / `s3_session_token` | no | — | Static S3 credentials (env var preferred). Omit them to use vended credentials or the AWS default chain |
+| `s3_path_style_access` | no | — | Path-style S3 URLs (MinIO and most S3-compatible stores) |
+| `catalog_properties` | no | — | Extra comma-separated `key=value` catalog and FileIO properties, for example `scope=PRINCIPAL_ROLE:ALL` |
+| `table` | yes | — | Target table, `namespace.table` |
+| `auto_create` | no | `true` | Create the namespace and the table from the input schema if they do not exist |
+| `partition_by` | no | — | Partition spec for a created table: `col`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, `bucket(N, col)`, `truncate(W, col)` |
+| `format_version` | no | `2` | Format version (`1` or `2`) for a created table |
+| `table_properties` | no | — | Extra comma-separated `key=value` properties for a created table. Defaults: `write.parquet.compression-codec=zstd`, `write.metadata.delete-after-commit.enabled=true`, `write.metadata.previous-versions-max=100` |
+| `include_op_column` | no | `true` | Keep `_gs_op` as a table column, so the table is an append-only changelog. If `false`, the column is dropped and a row with `_gs_op` other than `i` fails the batch |
+
+The catalog requests vended credentials (`X-Iceberg-Access-Delegation: vended-credentials`) by default. Example pipeline: [`examples/pipeline-iceberg-sink.yaml`](examples/pipeline-iceberg-sink.yaml)
+
+### Iceberg Source (`iceberg_source`)
+
+Reads an Apache Iceberg table through a REST catalog. With `start_position: earliest`, the source scans the current snapshot and then reads each new `append` snapshot (Flink `TABLE_SCAN_THEN_INCREMENTAL`). The output is `_gs_op` (always `i`) followed by the table columns. The schema is fixed when the source starts. `replace` snapshots (compaction) are skipped. `overwrite` and `delete` snapshots stop the source unless `on_non_append_snapshot: skip` is set. Delivery is at-least-once, with a checkpointed position that resumes at the exact row. If the checkpointed snapshot was expired, the source fails at start. Keep snapshot retention longer than the longest expected downtime. Details are in the module docs in [`src/sources/iceberg/mod.rs`](src/sources/iceberg/mod.rs).
+
+All YAML options can also be set via `STREAMLING__PLUGIN__ICEBERG_SOURCE__<KEY>` environment variables (uppercase key). Env vars take precedence over YAML.
+
+| YAML option | Required | Default | Description |
+|---|---|---|---|
+| `catalog_uri` … `catalog_properties` | — | — | Same catalog options as `iceberg_sink` |
+| `table` | yes | — | Table to read, `namespace.table` |
+| `start_position` | no | `earliest` | Start of a source with no checkpoint: `earliest` (scan the current snapshot, then new snapshots) or `latest` (only snapshots committed after start) |
+| `poll_interval_secs` | no | `60` | How often to reload table metadata after the source reads all snapshots |
+| `batch_size` | no | `1000` | Max rows per generated Arrow batch |
+| `on_non_append_snapshot` | no | `error` | `error` stops the source on an `overwrite` or `delete` snapshot, `skip` ignores it |
+
+Example pipeline: [`examples/pipeline-iceberg-source.yaml`](examples/pipeline-iceberg-source.yaml)
+
 ### Quick start
 
 ```bash

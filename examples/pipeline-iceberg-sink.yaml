@@ -1,0 +1,49 @@
+# Example pipeline: Kafka source -> Iceberg sink (plugin)
+#
+# Requires STREAMLING__PLUGIN__PATH pointing to the compiled plugins library
+# (.so / .dylib / .dll) — see "How to Use" in the README.
+#
+# The sink commits one Iceberg snapshot per Streamling checkpoint; keep the
+# checkpoint interval at one minute or more (STREAMLING__CHECKPOINT_INTERVAL_SEC=60)
+# and run compaction / expire_snapshots / remove_orphan_files maintenance.
+#
+# For local testing, run the REST fixture
+#   docker run -p 8181:8181 apache/iceberg-rest-fixture:1.10.1
+# and point `catalog_uri` at http://localhost:8181.
+sources:
+  kafka_source:
+    type: kafka
+    topic: my.topic.v1
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  filtered:
+    from: kafka_source
+    type: sql
+    sql: |
+      select * from kafka_source where id is not null;
+    primary_key: id
+
+sinks:
+  iceberg_sink:
+    type: iceberg_sink
+    from: filtered
+    catalog_uri: https://catalog.example.com/api/catalog
+    warehouse: analytics
+    table: raw.events
+    # Only used when the sink creates the table:
+    partition_by: day(event_time), bucket(16, id)
+    # table_properties: write.target-file-size-bytes=134217728
+    # format_version: 2
+    #
+    # For S3-compatible storage without vended credentials, uncomment:
+    # s3_endpoint: http://localhost:9000
+    # s3_region: us-east-1
+    # s3_path_style_access: true
+    #
+    # Prefer env vars over YAML for credentials:
+    #   STREAMLING__PLUGIN__ICEBERG_SINK__CREDENTIAL   (OAuth2 client_id:client_secret)
+    #   STREAMLING__PLUGIN__ICEBERG_SINK__TOKEN
+    #   STREAMLING__PLUGIN__ICEBERG_SINK__S3_ACCESS_KEY_ID
+    #   STREAMLING__PLUGIN__ICEBERG_SINK__S3_SECRET_ACCESS_KEY
