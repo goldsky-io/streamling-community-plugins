@@ -109,7 +109,7 @@ const PRODUCER_IDLE_TTL: Duration = Duration::from_secs(300);
 struct ProducerState {
     producer: Producer,
     pending: VecDeque<RecordSubmitTicket>,
-    last_used: std::time::Instant,
+    last_used: tokio::time::Instant,
 }
 
 impl ProducerState {
@@ -117,7 +117,7 @@ impl ProducerState {
         Self {
             producer,
             pending: VecDeque::new(),
-            last_used: std::time::Instant::now(),
+            last_used: tokio::time::Instant::now(),
         }
     }
 }
@@ -275,7 +275,7 @@ impl S2Sink {
 
         for (stream, run) in runs {
             let producer_state = state.ensure_producer(&mut producers, &stream).await?;
-            producer_state.last_used = std::time::Instant::now();
+            producer_state.last_used = tokio::time::Instant::now();
             for record in run {
                 let ticket = producer_state.producer.submit(record).await.map_err(|e| {
                     PluginError::Internal(format!(
@@ -964,7 +964,7 @@ mod tests {
         assert_eq!(names, vec!["events/acme/1", "events/globex/2"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_idle_producers_are_evicted_and_active_ones_kept() {
         use s2_sdk::S2;
         use s2_sdk::types::{BasinName, S2Config};
@@ -990,10 +990,12 @@ mod tests {
                 .ensure_producer(&mut producers, &active)
                 .await
                 .expect("open active producer");
-            let backdated = std::time::Instant::now()
-                .checked_sub(PRODUCER_IDLE_TTL)
-                .expect("backdate");
-            producers.get_mut(&idle).expect("idle exists").last_used = backdated;
+        }
+        tokio::time::advance(PRODUCER_IDLE_TTL).await;
+        {
+            let mut producers = state.producers.lock().await;
+            producers.get_mut(&active).expect("active exists").last_used =
+                tokio::time::Instant::now();
         }
 
         let evicted = state.take_idle_producers().await;
