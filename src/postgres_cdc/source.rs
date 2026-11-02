@@ -333,29 +333,14 @@ impl SourcePlugin for PostgresCdcSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abi_stable::external_types::crossbeam_channel;
-    use streamling_plugin::PluginStateBackendConfig;
-    use streamling_plugin::r#async::DirectTokioProxy;
-
-    fn test_state_backend() -> PluginStateBackendFactory {
-        PluginStateBackendFactory::new(PluginStateBackendConfig::new(
-            "test_app".to_string(),
-            "test_postgres_cdc_source".to_string(),
-            r#"{"backend_type": "InMemory"}"#.to_string(),
-        ))
-    }
-
-    fn test_metrics() -> PluginMetricsRecorder {
-        let (sender, _receiver) = crossbeam_channel::bounded(1);
-        PluginMetricsRecorder::new(sender)
-    }
+    use crate::utils::test_support;
 
     #[test]
     fn constructor_rejects_missing_required_options() {
         let err = PostgresCdcSource::new(
-            DirectTokioProxy::new().into_async_runtime_obj(),
-            test_state_backend(),
-            test_metrics(),
+            test_support::async_runtime(),
+            test_support::state_backend_factory("test_postgres_cdc_source"),
+            test_support::metrics_recorder(),
             HashMap::new(),
         )
         .err()
@@ -383,9 +368,9 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         let err = PostgresCdcSource::new(
-            DirectTokioProxy::new().into_async_runtime_obj(),
-            test_state_backend(),
-            test_metrics(),
+            test_support::async_runtime(),
+            test_support::state_backend_factory("test_postgres_cdc_source"),
+            test_support::metrics_recorder(),
             options,
         )
         .err()

@@ -63,6 +63,41 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: 0
         timeout-minutes: 15
 
+  # Releases ship a Windows .dll; build it on every push so a Unix-only
+  # dependency fails here instead of at release time.
+  validate-and-test-windows:
+    runs-on: blacksmith-8vcpu-windows-2025
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - name: Setup rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "community-plugins-windows"
+          cache-targets: true
+          cache-on-failure: true
+      # aws-lc-sys assembles NASM-format asm on Windows; the image lacks nasm.
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+      # Library and its unit tests only: tests/ are Linux e2e suites (k3s, std::os::unix).
+      - name: Run clippy
+        run: cargo clippy --locked --lib --profile test -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run tests
+        run: cargo nextest run --locked --lib
+        env:
+          RUST_LOG: info
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        timeout-minutes: 20
+
   # ==========================================================================
   # Build the community plugins .so and fetch the streamling binary for e2e
   # ==========================================================================

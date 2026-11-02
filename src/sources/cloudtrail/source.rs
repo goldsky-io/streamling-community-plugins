@@ -345,11 +345,10 @@ impl SourcePlugin for CloudTrailSource {
 mod tests {
     use super::*;
     use crate::utils::test_support;
-    use streamling_plugin::r#async::DirectTokioProxy;
 
     fn new_source(options: &[(&str, &str)]) -> Result<CloudTrailSource, PluginInitializationError> {
         CloudTrailSource::new(
-            DirectTokioProxy::new().into_async_runtime_obj(),
+            test_support::async_runtime(),
             test_support::state_backend_factory("test_cloudtrail_source"),
             test_support::metrics_recorder(),
             options

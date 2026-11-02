@@ -1025,7 +1025,6 @@ mod tests {
     #[test]
     fn test_constructor_rejects_bad_config() {
         use crate::utils::test_support;
-        use streamling_plugin::r#async::DirectTokioProxy;
 
         let new_sink = |pairs: &[(&str, &str)]| {
             S2Sink::new(
@@ -1034,7 +1033,7 @@ mod tests {
                     arrow_schema::DataType::Int64,
                     false,
                 )])),
-                DirectTokioProxy::new().into_async_runtime_obj(),
+                test_support::async_runtime(),
                 test_support::state_backend_factory("test_s2_sink"),
                 test_support::metrics_recorder(),
                 pairs
