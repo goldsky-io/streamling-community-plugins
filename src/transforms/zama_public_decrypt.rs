@@ -196,8 +196,44 @@ fn answer(values: &ClearValues, handle: &B256) -> Result<String, String> {
     )
 }
 
-/// Decrypts every handle in one call. One refused handle fails the whole call,
-/// so on a refusal the handles are asked one by one to pin the error to its row.
+/// The KMS rejects a request whose handles total more than this many
+/// encrypted bits; the SDK chunks private decrypts but not public ones.
+const MAX_REQUEST_BITS: u32 = 2048;
+
+/// Encrypted bit width from the FHE type in byte 30 of the handle, as the SDK's
+/// `encryptionBitsForHandle` reads it; an unknown type counts as the widest.
+fn encryption_bits(handle: &B256) -> u32 {
+    match handle[30] {
+        0 => 2,
+        2 => 8,
+        3 => 16,
+        4 => 32,
+        5 => 64,
+        6 => 128,
+        7 => 160,
+        _ => 256,
+    }
+}
+
+/// Greedy split keeping each chunk within [`MAX_REQUEST_BITS`], in input order.
+fn chunk_by_bits(handles: Vec<B256>) -> Vec<Vec<B256>> {
+    let mut chunks: Vec<Vec<B256>> = Vec::new();
+    let mut bits = 0;
+    for handle in handles {
+        let cost = encryption_bits(&handle);
+        match chunks.last_mut() {
+            Some(chunk) if bits + cost <= MAX_REQUEST_BITS => chunk.push(handle),
+            _ => {
+                chunks.push(vec![handle]);
+                bits = 0;
+            }
+        }
+        bits += cost;
+    }
+    chunks
+}
+
+/// Decrypts every handle, one request per bit-budget chunk.
 async fn decrypt_all<F, Fut>(
     handles: Vec<B256>,
     decrypt: F,
@@ -206,9 +242,23 @@ where
     F: Fn(Vec<B256>) -> Fut,
     Fut: Future<Output = Result<ClearValues, ClientError>>,
 {
-    if handles.is_empty() {
-        return Ok(HashMap::new());
+    let mut answers = HashMap::with_capacity(handles.len());
+    for chunk in chunk_by_bits(handles) {
+        answers.extend(decrypt_chunk(chunk, &decrypt).await?);
     }
+    Ok(answers)
+}
+
+/// One refused handle fails the whole call, so on a refusal the handles are
+/// asked one by one to pin the error to its row.
+async fn decrypt_chunk<F, Fut>(
+    handles: Vec<B256>,
+    decrypt: &F,
+) -> Result<HashMap<B256, Result<String, String>>, ClientError>
+where
+    F: Fn(Vec<B256>) -> Fut,
+    Fut: Future<Output = Result<ClearValues, ClientError>>,
+{
     match decrypt(handles.clone()).await {
         Ok(values) => Ok(handles
             .iter()
@@ -330,6 +380,7 @@ impl TransformPlugin for ZamaPublicDecryptTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
     use zama_sdk::{BigInt, SdkError};
 
@@ -382,6 +433,57 @@ mod tests {
         .expect("refusal is a row error");
         assert_eq!(answers[&A], Ok("7".to_string()));
         assert!(answers[&B].as_ref().unwrap_err().contains("NOT_ENTITLED"));
+    }
+
+    /// A distinct handle with FHE type `type_id` in byte 30.
+    fn typed_handle(index: u8, type_id: u8) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = index;
+        bytes[30] = type_id;
+        B256::from(bytes)
+    }
+
+    /// Bits per request when every handle decrypts to 1.
+    async fn request_bits(handles: Vec<B256>) -> Vec<u32> {
+        let requests = StdMutex::new(Vec::new());
+        let answers = decrypt_all(handles.clone(), |chunk| {
+            requests
+                .lock()
+                .unwrap()
+                .push(chunk.iter().map(encryption_bits).sum::<u32>());
+            async move {
+                Ok(chunk
+                    .into_iter()
+                    .map(|h| (h, ClearValue::Number(1)))
+                    .collect())
+            }
+        })
+        .await
+        .expect("decrypted");
+        assert!(handles.iter().all(|h| answers[h] == Ok("1".to_string())));
+        requests.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_stay_within_the_kms_bit_budget() {
+        let uint64 = |count: u8| (0..count).map(|i| typed_handle(i, 5)).collect::<Vec<_>>();
+        assert_eq!(request_bits(uint64(32)).await, vec![2048]);
+        assert_eq!(request_bits(uint64(33)).await, vec![2048, 64]);
+        let mixed = vec![
+            typed_handle(0, 8),
+            typed_handle(1, 8),
+            typed_handle(2, 8),
+            typed_handle(3, 8),
+            typed_handle(4, 8),
+            typed_handle(5, 8),
+            typed_handle(6, 8),
+            typed_handle(7, 6),
+            typed_handle(8, 5),
+            typed_handle(9, 5),
+            typed_handle(10, 0),
+        ];
+        assert_eq!(request_bits(mixed).await, vec![2048, 2]);
+        assert_eq!(request_bits(vec![typed_handle(0, 0xff)]).await, vec![256]);
     }
 
     #[tokio::test]
