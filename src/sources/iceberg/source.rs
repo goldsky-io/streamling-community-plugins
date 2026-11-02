@@ -431,12 +431,11 @@ mod tests {
     use crate::sources::iceberg::snapshots::tests::metadata;
     use crate::utils::test_support;
     use iceberg::spec::Operation;
-    use streamling_plugin::r#async::DirectTokioProxy;
 
     #[test]
     fn constructor_rejects_invalid_options_before_any_io() {
         let err = IcebergSource::new(
-            DirectTokioProxy::new().into_async_runtime_obj(),
+            test_support::async_runtime(),
             test_support::state_backend_factory("test_iceberg_source"),
             test_support::metrics_recorder(),
             HashMap::from([("catalog_uri".to_string(), "http://127.0.0.1:1".to_string())]),
