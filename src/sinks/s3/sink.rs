@@ -16,7 +16,10 @@ use streamling_plugin::r#api::PluginStateBackendFactory;
 use streamling_plugin::api::SupportsGracefulShutdown;
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::PluginMetricsRecorder;
-use streamling_plugin::{CheckpointEpoch, PluginError, SinkPlugin};
+use streamling_plugin::{
+    CheckpointEpoch, InputPlacement, PartitionCount, PartitionedSinkPlugin, PluginError,
+    PluginInitializationError, PluginInstanceContext, SinkDescription, SinkPlugin,
+};
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
@@ -24,7 +27,7 @@ use super::partitioning::{PartitionConfig, partition_batch};
 use crate::utils::parquet_compression::{
     CompressionError, LEVELED_CODECS, SUPPORTED_CODECS, parquet_compression,
 };
-use crate::utils::plugin_options::PluginOptions;
+use crate::utils::plugin_options::{PluginOptions, configuration_error};
 
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -179,11 +182,14 @@ impl S3Sink {
 
     /// Parse the `compression` / `compression_level` options.
     fn parse_compression(&self) -> Result<Compression, PluginError> {
-        let codec = self.opts.get_or("compression", "uncompressed");
-        let level = self
-            .opts
+        Self::parse_compression_options(&self.opts)
+    }
+
+    fn parse_compression_options(opts: &PluginOptions) -> Result<Compression, PluginError> {
+        let codec = opts.get_or("compression", "uncompressed");
+        let level = opts
             .lookup("compression_level")
-            .map(|v| self.opts.parse_value::<u32>("compression_level", &v))
+            .map(|v| opts.parse_value::<u32>("compression_level", &v))
             .transpose()?;
         parquet_compression(&codec, level).map_err(|e| {
             PluginError::Internal(match e {
@@ -242,6 +248,42 @@ impl SupportsGracefulShutdown for S3Sink {
     async fn terminate(&self) -> Result<(), PluginError> {
         self.running.store(false, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+impl PartitionedSinkPlugin for S3Sink {
+    /// Every batch becomes its own `batch_<uuidv7>.parquet` object and the sink
+    /// keeps no state, so any instance can take any batch.
+    fn describe(
+        input_schema: SchemaRef,
+        options: &HashMap<String, String>,
+    ) -> Result<SinkDescription, PluginInitializationError> {
+        let opts = PluginOptions::new(options.clone(), "s3_sink", "STREAMLING__PLUGIN__S3_SINK");
+        PartitionConfig::parse(opts.get("partition_columns").ok().as_deref(), &input_schema)
+            .map_err(configuration_error)?;
+        Self::parse_compression_options(&opts).map_err(configuration_error)?;
+        Ok(SinkDescription {
+            labels: Vec::new(),
+            input_placement: InputPlacement::RoundRobin,
+            partition_count: PartitionCount::default(),
+        })
+    }
+
+    fn create(
+        _context: PluginInstanceContext,
+        input_schema: SchemaRef,
+        rt: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError> {
+        Ok(S3Sink::new(
+            input_schema,
+            rt,
+            state_backend_factory,
+            metrics_recorder,
+            options,
+        ))
     }
 }
 
@@ -626,6 +668,37 @@ mod tests {
         ] {
             let err = sink_with(pairs).parse_compression().unwrap_err();
             assert!(err.to_string().contains(key), "for {pairs:?}: got {err}");
+        }
+    }
+
+    // ── Partitioned registration ──
+
+    fn describe_with(pairs: &[(&str, &str)]) -> Result<SinkDescription, PluginInitializationError> {
+        let options = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        <S3Sink as PartitionedSinkPlugin>::describe(make_test_schema(), &options)
+    }
+
+    #[test]
+    fn test_describe_accepts_any_instance_per_batch() {
+        let description =
+            describe_with(&[("partition_columns", "name"), ("compression", "zstd")]).unwrap();
+        assert!(matches!(
+            description.input_placement,
+            InputPlacement::RoundRobin
+        ));
+    }
+
+    #[test]
+    fn test_describe_rejects_invalid_options_at_planning_time() {
+        for pairs in [
+            &[("compression", "lzo")][..],
+            &[("compression", "snappy"), ("compression_level", "3")][..],
+            &[("partition_columns", "missing")][..],
+        ] {
+            assert!(describe_with(pairs).is_err(), "for {pairs:?}");
         }
     }
 
