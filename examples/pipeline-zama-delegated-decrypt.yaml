@@ -1,0 +1,54 @@
+# Example pipeline: ConfidentialTransfer logs -> erc7984_decode -> zama_decrypt -> print
+#
+# Decrypts ERC-7984 transfer amounts for wallets that delegated decryption on-chain
+# (ACL.delegateForUserDecryption) to the address of a delegate key. The committed
+# fixture holds 2 Sepolia cUSDCMock transfers (block 11915267) between wallets that
+# did not delegate, so every row prints
+# zama_error = "no active delegation from either party".
+#
+# Test with your own Sepolia wallet:
+#   1. From the wallet that sends or receives the transfers, delegate decryption on
+#      the token to the delegate address (ACL.delegateForUserDecryption, or
+#      sdk.delegations.delegateDecryption in the Zama SDK). The delegate key needs
+#      no funds and must not be the wallet itself.
+#   2. Write that wallet's transfers to a CSV and point `path` below at it:
+#        examples/fixtures/fetch-confidential-transfers.sh \
+#          https://ethereum-sepolia-rpc.publicnode.com <token> <from_block> <to_block> > my-transfers.csv
+#   3. Put the delegate private key in the environment, never in this file
+#      (Streamling logs YAML options at INFO):
+#        export STREAMLING__PLUGIN__ZAMA_DECRYPT__DELEGATE_PRIVATE_KEY=0x...
+#   4. Run from the repository root with the same plugin library and daemon as
+#      pipeline-zama-public-decrypt.yaml. Rows of your wallet print zama_amount and
+#      zama_delegator; other parties' rows keep the error. A finished run is
+#      checkpointed in ./state.db; delete it to run again (or after a new CSV).
+#
+# On Goldsky, the same logs come from the `edge.evm.logs` dataset instead of a CSV
+# (https://docs.goldsky.com/turbo-pipelines/sources/edge-evm); give
+# erc7984_decode `topics_column: topics` for its list-shaped topics.
+name: zama-delegated-decrypt-sepolia
+sources:
+  logs:
+    type: file
+    path: examples/fixtures/sepolia-confidential-transfers.csv  # step 2: your CSV
+    format: csv
+    mode:
+      type: bounded
+    primary_key: id
+
+transforms:
+  decoded:
+    type: erc7984_decode
+    from: logs
+
+  decrypted:
+    type: zama_decrypt
+    from: decoded
+    chain_id: "11155111"
+    rpc_url: https://ethereum-sepolia-rpc.publicnode.com
+    daemon_socket: /tmp/zama-sdk/zama.sock  # or STREAMLING__PLUGIN__ZAMA_DECRYPT__DAEMON_SOCKET
+    # delegate_private_key: set by STREAMLING__PLUGIN__ZAMA_DECRYPT__DELEGATE_PRIVATE_KEY (step 3)
+
+sinks:
+  out:
+    type: print
+    from: decrypted
