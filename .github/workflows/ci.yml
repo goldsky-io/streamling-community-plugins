@@ -84,8 +84,9 @@ jobs:
       # aws-lc-sys assembles NASM-format asm on Windows; the image lacks nasm.
       - name: Install NASM
         uses: ilammy/setup-nasm@v1
+      # Library and its unit tests only: tests/ are Linux e2e suites (k3s, std::os::unix).
       - name: Run clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --lib --profile test -- -D warnings
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
