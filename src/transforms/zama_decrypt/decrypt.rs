@@ -25,13 +25,12 @@ pub struct Decrypted {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendError {
-    /// The request was refused for good (ACL, relayer, input). Reported on
-    /// the affected rows; the batch still goes through.
+    /// The request was refused for good (ACL, no ciphertext, invalid input).
+    /// Reported on the affected rows; the batch still goes through.
     Rejected(String),
-    /// May clear on a retry: daemon unreachable, context gone, or an SDK error
-    /// flagged retryable (relayer timeout, RPC rate limit, delegation not yet
-    /// propagated). Fails the batch so Streamling replays it instead of
-    /// writing nulls.
+    /// Anything else: daemon unreachable, context gone, relayer outage, an
+    /// unclassified SDK failure. Fails the batch so Streamling replays it
+    /// instead of writing nulls.
     Transient(String),
 }
 
@@ -43,17 +42,25 @@ impl fmt::Display for BackendError {
     }
 }
 
+/// SDK codes that refuse the request itself; retrying the same input cannot
+/// help. A non-retryable relayer 5xx is not among them and must replay.
+const REFUSAL_CODES: [&str; 4] = [
+    "NOT_ENTITLED",
+    "NO_CIPHERTEXT",
+    "DELEGATION_NOT_FOUND",
+    "DELEGATION_EXPIRED",
+];
+
+fn is_refusal(error: &SdkError) -> bool {
+    !error.retryable && REFUSAL_CODES.contains(&error.code.as_str())
+}
+
 impl From<ClientError> for BackendError {
     fn from(error: ClientError) -> Self {
-        match error.kind() {
-            ErrorKind::Sdk | ErrorKind::InvalidInput => {
-                if error.sdk_error().is_some_and(|sdk| sdk.retryable) {
-                    Self::Transient(format!("{error} (retryable)"))
-                } else {
-                    Self::Rejected(error.to_string())
-                }
-            }
-            kind => Self::Transient(format!("{error} ({kind:?})")),
+        match (error.kind(), error.sdk_error()) {
+            (ErrorKind::InvalidInput, _) => Self::Rejected(error.to_string()),
+            (ErrorKind::Sdk, Some(sdk)) if is_refusal(sdk) => Self::Rejected(error.to_string()),
+            (kind, _) => Self::Transient(format!("{error} ({kind:?})")),
         }
     }
 }
@@ -232,11 +239,11 @@ impl<B: Backend> Decryptor<B> {
                         Ok(amount) => cell.amount = Some(amount),
                         Err(error) => cell.error = Some(error),
                     },
-                    Some(Err(error)) if error.retryable => {
+                    Some(Err(error)) if !is_refusal(error) => {
                         // A relayer blip must not become a permanent null row.
                         return Err(BackendError::Transient(format!(
-                            "{}: {} (retryable)",
-                            error.code, error.message
+                            "{}: {} (retryable: {})",
+                            error.code, error.message, error.retryable
                         )));
                     }
                     Some(Err(error)) => {
@@ -665,8 +672,50 @@ mod tests {
             .expect_err("must fail");
         assert_eq!(
             error,
-            BackendError::Transient("RELAYER_TIMEOUT: nope (retryable)".into())
+            BackendError::Transient("RELAYER_TIMEOUT: nope (retryable: true)".into())
         );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_relayer_failure_fails_the_batch_instead_of_nulling_the_row() {
+        let fake = Fake::default()
+            .delegated(ALICE, PERMANENT_DELEGATION_EXPIRY)
+            .batch(vec![(
+                HANDLE,
+                Err(sdk_error("RELAYER_REQUEST_FAILED", false)),
+            )]);
+        let decryptor = with(fake);
+        let error = decryptor
+            .decrypt(&[transfer(BOB, ALICE, HANDLE)])
+            .await
+            .expect_err("must fail");
+        assert_eq!(
+            error,
+            BackendError::Transient("RELAYER_REQUEST_FAILED: nope (retryable: false)".into())
+        );
+    }
+
+    #[test]
+    fn only_positive_refusals_become_row_errors() {
+        let classify = |code: &str, retryable: bool| {
+            BackendError::from(ClientError::from(sdk_error(code, retryable)))
+        };
+        for code in REFUSAL_CODES {
+            assert!(
+                matches!(classify(code, false), BackendError::Rejected(_)),
+                "{code}"
+            );
+        }
+        for (code, retryable) in [
+            ("RELAYER_REQUEST_FAILED", false),
+            ("DECRYPTION_FAILED", false),
+            ("DELEGATION_NOT_PROPAGATED", true),
+        ] {
+            assert!(
+                matches!(classify(code, retryable), BackendError::Transient(_)),
+                "{code}"
+            );
+        }
     }
 
     #[tokio::test]
