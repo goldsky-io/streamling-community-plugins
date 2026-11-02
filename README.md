@@ -351,7 +351,7 @@ Example pipeline: [`examples/pipeline-zama-delegated-decrypt.yaml`](examples/pip
 
 ### Zama Public Decrypt Transform (`zama_public_decrypt`)
 
-Decrypts Zama FHE handles that were made publicly decryptable on-chain (for example ERC-7984 unwrap amounts) through the same Zama SDK daemon. No signer or delegation is needed. Reads a `0x` hex handle column and appends nullable text columns `zama_public_amount` (decimal) and `zama_public_error`. Options can also be set via `STREAMLING__PLUGIN__ZAMA_PUBLIC_DECRYPT__<KEY>`; env vars take precedence.
+Decrypts Zama FHE handles that were made publicly decryptable on-chain (for example ERC-7984 unwrap amounts) through the same Zama SDK daemon. No signer or delegation is needed. Reads a `0x` hex handle column and appends nullable text columns `zama_public_amount` (decimal) and `zama_public_error`. Options can also be set via `STREAMLING__PLUGIN__ZAMA_PUBLIC_DECRYPT__<KEY>`; env vars take precedence. Not built on Windows, for the same Unix-socket reason as `zama_decrypt`.
 
 | YAML option | Required | Default | Description |
 |---|---|---|---|

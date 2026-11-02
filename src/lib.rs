@@ -16,6 +16,7 @@ use crate::sources::s2::S2Source;
 use crate::transforms::erc7984_decode::Erc7984DecodeTransform;
 #[cfg(unix)]
 use crate::transforms::zama_decrypt::ZamaDecryptTransform;
+#[cfg(unix)]
 use crate::transforms::zama_public_decrypt::ZamaPublicDecryptTransform;
 
 use streamling_plugin::{
@@ -35,6 +36,7 @@ register_plugin_source!("iceberg_source", IcebergSource);
 register_plugin_transform!("erc7984_decode", Erc7984DecodeTransform);
 #[cfg(unix)]
 register_plugin_transform!("zama_decrypt", ZamaDecryptTransform);
+#[cfg(unix)]
 register_plugin_transform!("zama_public_decrypt", ZamaPublicDecryptTransform);
 
 init_plugin_with_async_runtime!();
