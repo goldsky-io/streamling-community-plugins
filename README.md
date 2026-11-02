@@ -58,7 +58,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__SQS_SINK__<KEY>` envir
 | YAML option | Required | Default | Description |
 |---|---|---|---|
 | `queue_url` | yes | — | SQS queue URL |
-| `region` | no | from `queue_url` | AWS region of the queue. Defaults to the region in a standard `queue_url` (`sqs.<region>.amazonaws.com`). Role assumption uses the host's region, falling back to this one |
+| `region` | no | from `queue_url` | AWS region of the queue. Defaults to the region in a standard `queue_url` (`sqs.<region>.amazonaws.com`). The AWS credential chain and role assumption use the host's region, falling back to this one |
 | `endpoint_url` | no | — | Custom SQS endpoint (e.g. LocalStack). Applies to SQS only; role assumption still calls STS |
 | `access_key_id` | no | — | AWS access key (env var preferred). Must be set together with `secret_access_key` |
 | `secret_access_key` | no | — | AWS secret key (env var preferred) |

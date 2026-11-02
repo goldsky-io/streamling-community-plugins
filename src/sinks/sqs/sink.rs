@@ -1,6 +1,7 @@
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use aws_config::meta::region::{ProvideRegion, RegionProviderChain};
 use aws_config::sts::AssumeRoleProvider;
 use aws_config::{BehaviorVersion, ConfigLoader, SdkConfig};
 use aws_credential_types::Credentials;
@@ -67,13 +68,20 @@ impl SqsSink {
     }
 }
 
-/// No `endpoint_url`/`region`: STS uses this config, and may be off in the queue's region.
+/// No `endpoint_url` here, so STS never hits the SQS endpoint. Region is host first, queue
+/// second, and set before `load()` because a web-identity base chain calls STS itself.
 async fn load_sdk_config(
     loader: ConfigLoader,
+    host_region: impl ProvideRegion + 'static,
     config: &SqsSinkConfig,
     opts: &PluginOptions,
 ) -> Result<SdkConfig, PluginError> {
     let mut loader = loader;
+    let mut region = RegionProviderChain::first_try(host_region);
+    if let Some(queue_region) = &config.region {
+        region = region.or_else(Region::new(queue_region.clone()));
+    }
+    loader = loader.region(region);
     let secret = |key| opts.get_secret(key).filter(|value| !value.is_empty());
     if let (Some(access_key_id), Some(secret_access_key)) =
         (secret("access_key_id"), secret("secret_access_key"))
@@ -90,7 +98,7 @@ async fn load_sdk_config(
 
     match &config.assume_role {
         None => Ok(base),
-        Some(role) => with_assumed_role(base, role, config.region.as_deref()).await,
+        Some(role) => with_assumed_role(base, role).await,
     }
 }
 
@@ -98,14 +106,10 @@ async fn load_sdk_config(
 async fn with_assumed_role(
     base: SdkConfig,
     role: &AssumeRoleConfig,
-    fallback_region: Option<&str>,
 ) -> Result<SdkConfig, PluginError> {
     let mut builder = AssumeRoleProvider::builder(&role.role_arn)
         .session_name(&role.session_name)
         .configure(&base);
-    if let (None, Some(region)) = (base.region(), fallback_region) {
-        builder = builder.region(Region::new(region.to_string()));
-    }
     if let Some(external_id) = &role.external_id {
         builder = builder.external_id(external_id);
     }
@@ -169,6 +173,7 @@ impl SinkPlugin for SqsSink {
 
         let sdk_config = load_sdk_config(
             aws_config::defaults(BehaviorVersion::latest()),
+            aws_config::default_provider::region::default_provider(),
             &self.config,
             &self.opts,
         )
@@ -683,13 +688,9 @@ mod tests {
     async fn assumes_the_role_at_sts_with_the_external_id() {
         let http = sts_events(&[(200, ASSUME_ROLE_OK), (200, ASSUME_ROLE_OK)]);
 
-        let sdk = with_assumed_role(
-            base_config(&http, Some("us-east-1")),
-            &role(),
-            Some("eu-west-1"),
-        )
-        .await
-        .expect("role assumed");
+        let sdk = with_assumed_role(base_config(&http, Some("us-east-1")), &role())
+            .await
+            .expect("role assumed");
         let creds = sdk
             .credentials_provider()
             .expect("credentials provider")
@@ -726,30 +727,42 @@ mod tests {
     async fn denied_assume_role_fails_with_the_role_and_external_id() {
         let http = sts_events(&[(403, ASSUME_ROLE_DENIED)]);
 
-        let err = with_assumed_role(
-            base_config(&http, Some("us-east-1")),
-            &role(),
-            Some("eu-west-1"),
-        )
-        .await
-        .expect_err("denied")
-        .to_string();
+        let err = with_assumed_role(base_config(&http, Some("us-east-1")), &role())
+            .await
+            .expect_err("denied")
+            .to_string();
         assert!(err.contains(ROLE), "{err}");
         assert!(err.contains(EXTERNAL_ID), "{err}");
         assert!(err.contains("AccessDenied"), "{err}");
         assert!(err.contains("trust policy"), "{err}");
     }
 
-    #[tokio::test]
-    async fn sts_uses_the_host_region_and_falls_back_to_the_queue_region() {
-        let host = sts_events(&[(200, ASSUME_ROLE_OK)]);
-        with_assumed_role(
-            base_config(&host, Some("us-west-2")),
-            &role(),
-            Some("ap-east-1"),
+    /// Host AWS env is emptied so the region under test is the only one in play.
+    async fn load_with(
+        http: &StaticReplayClient,
+        host_region: Option<&str>,
+        pairs: &[(&str, &str)],
+    ) -> SdkConfig {
+        let opts = opts(pairs);
+        let config = SqsSinkConfig::from_options(&opts).unwrap();
+        let loader = aws_config::defaults(BehaviorVersion::latest())
+            .empty_test_environment()
+            .http_client(http.clone());
+        load_sdk_config(
+            loader,
+            host_region.map(|r| Region::new(r.to_string())),
+            &config,
+            &opts,
         )
         .await
-        .expect("role assumed");
+        .expect("sdk config")
+    }
+
+    #[tokio::test]
+    async fn region_is_host_first_then_queue_and_reaches_the_base_config() {
+        let host = sts_events(&[(200, ASSUME_ROLE_OK)]);
+        let sdk = load_with(&host, Some("us-west-2"), &[("role_arn", ROLE)]).await;
+        assert_eq!(sdk.region().map(|r| r.as_ref()), Some("us-west-2"));
         let uri = host.actual_requests().next().unwrap().uri().to_string();
         assert!(
             uri.starts_with("https://sts.us-west-2.amazonaws.com"),
@@ -757,9 +770,13 @@ mod tests {
         );
 
         let no_host = sts_events(&[(200, ASSUME_ROLE_OK)]);
-        with_assumed_role(base_config(&no_host, None), &role(), Some("ap-east-1"))
-            .await
-            .expect("role assumed");
+        let sdk = load_with(
+            &no_host,
+            None,
+            &[("role_arn", ROLE), ("region", "ap-east-1")],
+        )
+        .await;
+        assert_eq!(sdk.region().map(|r| r.as_ref()), Some("ap-east-1"));
         let uri = no_host.actual_requests().next().unwrap().uri().to_string();
         assert!(
             uri.starts_with("https://sts.ap-east-1.amazonaws.com"),
@@ -773,7 +790,7 @@ mod tests {
         let opts = opts(&[]);
         let config = SqsSinkConfig::from_options(&opts).unwrap();
         let loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http.clone());
-        let sdk = load_sdk_config(loader, &config, &opts)
+        let sdk = load_sdk_config(loader, None, &config, &opts)
             .await
             .expect("static credentials");
         let creds = sdk
