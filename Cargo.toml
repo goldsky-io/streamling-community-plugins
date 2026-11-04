@@ -4,16 +4,11 @@ version = "0.4.0"
 edition = "2024"
 
 [dependencies]
-streamling-plugin = "0.2.3"
+streamling-plugin = "0.2.4"
 alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
 # RowKind: keys the dbz.op <-> _gs_op mapping on the engine's enum so the
 # round-trip contract tracks upstream by construction.
-streamling-common = "0.4.0"
-
-# Generic RecordBatch-to-JSON conversion (see utils::record_batch_json).
-# U256 columns are serialized as decimal strings; arrow_json emits hex by default.
-# Minimal dependency - avoids pulling in streamling-core.
-uint = "0.10"
+streamling-common = "0.5.0"
 
 # FFI dependencies (required by init_plugin_with_async_runtime! macro)
 abi_stable = "0.11.3"
@@ -105,7 +100,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 [dev-dependencies]
 regex = "1.11.1"
 s2-testcontainers = "0.39.1"
-streamling-e2e = "0.4.0"
+streamling-e2e = "0.5.0"
 testcontainers = "0.27.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 # e2e tests print plugin/etl logs (captured; shown on failure).

@@ -4,16 +4,17 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, RecordBatch, RecordBatchOptions};
-use arrow::array::{StringArray, StringBuilder, new_null_array};
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow::array::{StringArray, new_null_array};
 use arrow::compute::{CastOptions, can_cast_types, cast, cast_with_options};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use iceberg::spec::Schema as IcebergSchema;
-use streamling_common::types::i256::{I256Type, bytes_to_i256, i256_to_string};
-use streamling_common::types::u256::{U256Type, bytes_to_u256};
+use streamling_common::types::decimal_arb::DecimalArbType;
+use streamling_common::types::decimal_arb_legacy::decimal_arb_to_legacy_wide_int;
 use streamling_plugin::PluginError;
 use streamling_plugin::api::STREAMLING_COLUMN_NAME_OP;
 
+use crate::utils::decimal_arb::{decimal_arb_text, nests_decimal_arb};
 use crate::utils::iceberg::iceberg_error;
 
 /// Fails unless every row's `_gs_op` is an insert (`i`). An append-only
@@ -70,42 +71,26 @@ pub(crate) fn table_schema_for(
         .map_err(|e| iceberg_error("derive the Iceberg schema from the input schema", e))
 }
 
-/// Big-endian 256-bit integers stored as exact decimal text.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum DecimalText {
-    U256,
-    I256,
-}
-
-fn decimal_text_kind(field: &Field) -> Option<DecimalText> {
-    if U256Type::is_u256_field(field) {
-        Some(DecimalText::U256)
-    } else if I256Type::is_i256_field(field) {
-        Some(DecimalText::I256)
-    } else {
-        None
-    }
-}
-
 /// Maps an input field to one Iceberg (v1/v2) can store. iceberg-rust's
 /// converter already maps UInt8/16 → int, UInt32 → long, LargeUtf8/Utf8View
 /// → string, and dictionaries to their value type; this adds the rest:
-/// U256/I256 and Decimal256 → string (exact decimal text), UInt64 →
+/// decimal_arb and Decimal256 → string (exact decimal text), UInt64 →
 /// decimal(20,0), any timestamp → microseconds (zoned ones normalized to
 /// UTC), Date64 → date, Time32/Time64(ns) → time, Float16 → float.
 pub(crate) fn storable_field(field: &Field) -> Result<Field, PluginError> {
-    let data_type = match decimal_text_kind(field) {
-        Some(_) => DataType::Utf8,
-        None => storable_type(field.name(), field.data_type())?,
+    let data_type = if DecimalArbType::is_decimal_arb_field(field) {
+        DataType::Utf8
+    } else {
+        storable_type(field.name(), field.data_type())?
     };
     Ok(Field::new(field.name(), data_type, field.is_nullable()))
 }
 
 fn storable_child(column: &str, child: &Field) -> Result<Arc<Field>, PluginError> {
-    if decimal_text_kind(child).is_some() {
+    if DecimalArbType::is_decimal_arb_field(child) {
         return Err(PluginError::Internal(format!(
-            "iceberg_sink: column '{column}': nested U256/I256 fields are not supported; \
-             cast them to strings upstream"
+            "iceberg_sink: {}",
+            nested_decimal_arb_error(column)
         )));
     }
     Ok(Arc::new(Field::new(
@@ -197,15 +182,18 @@ impl BatchProjector {
             match written.iter().find(|f| f.name() == name) {
                 Some(input_field) => {
                     let to = target_field.data_type();
-                    match decimal_text_kind(input_field) {
-                        Some(_) if is_u256_target(to) => {}
-                        Some(_) => problems.push(format!(
-                            "column '{name}': cannot losslessly convert {} to the table \
-                             type {to}; U256/I256 columns need a string, binary or fixed(32) \
-                             table column",
-                            input_field.data_type()
-                        )),
-                        None => check_conversion(name, input_field.data_type(), to, &mut problems),
+                    if DecimalArbType::is_decimal_arb_field(input_field) {
+                        if !is_decimal_arb_target(input_field, to) {
+                            problems.push(format!(
+                                "column '{name}': cannot losslessly convert decimal_arb to the \
+                                 table type {to}; decimal_arb columns need a string table \
+                                 column, or binary / fixed(32) for u256/i256 integers"
+                            ));
+                        }
+                    } else if nests_decimal_arb(input_field.data_type()) {
+                        problems.push(nested_decimal_arb_error(name));
+                    } else {
+                        check_conversion(name, input_field.data_type(), to, &mut problems);
                     }
                     sources.push(ColumnSource::Input(name.clone()));
                 }
@@ -257,16 +245,24 @@ impl BatchProjector {
     }
 }
 
-/// Table types a U256/I256 column can be written to exactly: decimal text
-/// for strings, the raw 32 big-endian bytes for binary and fixed(32).
-fn is_u256_target(to: &DataType) -> bool {
-    matches!(
-        to,
-        DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::FixedSizeBinary(32)
+/// Table types a decimal_arb column can be written to exactly: decimal text
+/// for strings; for u256/i256-hinted integers also the 32 big-endian bytes
+/// (two's complement for i256) in binary and fixed(32).
+fn is_decimal_arb_target(input: &Field, to: &DataType) -> bool {
+    match to {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(32) => {
+            DecimalArbType::native_int_kind_from_field(input).is_some()
+                && DecimalArbType::precision_scale_from_field(input).is_some_and(|(_, s)| s == 0)
+        }
+        _ => false,
+    }
+}
+
+fn nested_decimal_arb_error(column: &str) -> String {
+    format!(
+        "column '{column}': nested decimal_arb (wide integer / arbitrary-precision decimal) \
+         fields are not supported; CAST them to TEXT upstream"
     )
 }
 
@@ -416,6 +412,14 @@ fn convert_column(
     input_field: &Field,
     target_field: &Field,
 ) -> Result<ArrayRef, PluginError> {
+    // Checked per batch: Streamling stamps nested decimal_arb metadata on the
+    // batches only, so the declared schema `try_new` saw may not show it.
+    if nests_decimal_arb(input_field.data_type()) {
+        return Err(PluginError::Internal(format!(
+            "iceberg_sink: {}",
+            nested_decimal_arb_error(input_field.name())
+        )));
+    }
     let column_error = |e: &dyn std::fmt::Display| {
         PluginError::Internal(format!(
             "iceberg_sink: column '{}': cannot convert {} to {}: {e}",
@@ -424,16 +428,11 @@ fn convert_column(
             target_field.data_type()
         ))
     };
-    let array = match decimal_text_kind(input_field) {
-        Some(kind)
-            if matches!(
-                target_field.data_type(),
-                DataType::Utf8 | DataType::LargeUtf8
-            ) =>
-        {
-            decimal_text(array, kind).map_err(|e| column_error(&e))?
-        }
-        _ => array.clone(),
+    let array = if DecimalArbType::is_decimal_arb_field(input_field) {
+        decimal_arb_column(array, input_field, target_field.data_type())
+            .map_err(|e| column_error(&e))?
+    } else {
+        array.clone()
     };
     convert_array(&array, target_field.data_type()).map_err(|e| column_error(&e))
 }
@@ -530,25 +529,15 @@ fn convert_array(array: &ArrayRef, to: &DataType) -> Result<ArrayRef, arrow::err
     }
 }
 
-/// Renders big-endian 256-bit integers as exact decimal strings.
-fn decimal_text(array: &ArrayRef, kind: DecimalText) -> Result<ArrayRef, String> {
-    let values = array
-        .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or("expected FixedSizeBinary(32) values")?;
-    let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 20);
-    for value in values.iter() {
-        let Some(bytes) = value else {
-            builder.append_null();
-            continue;
-        };
-        let bytes: &[u8; 32] = bytes.try_into().map_err(|_| "expected 32-byte values")?;
-        match kind {
-            DecimalText::U256 => builder.append_value(bytes_to_u256(bytes).to_string()),
-            DecimalText::I256 => builder.append_value(i256_to_string(&bytes_to_i256(bytes))),
+/// Renders decimal_arb values as exact decimal strings, or (binary targets,
+/// u256/i256-hinted integers only) as 32 big-endian bytes.
+fn decimal_arb_column(array: &ArrayRef, field: &Field, to: &DataType) -> Result<ArrayRef, String> {
+    match DecimalArbType::native_int_kind_from_field(field) {
+        Some(kind) if !matches!(to, DataType::Utf8 | DataType::LargeUtf8) => {
+            decimal_arb_to_legacy_wide_int(array.as_ref(), field, kind).map_err(|e| e.to_string())
         }
+        _ => decimal_arb_text(field, array).map_err(|e| e.to_string()),
     }
-    Ok(Arc::new(builder.finish()))
 }
 
 #[cfg(test)]
@@ -559,24 +548,31 @@ mod tests {
         TimestampMillisecondArray, UInt64Array,
     };
     use iceberg::spec::{PrimitiveType, Type};
+    use streamling_common::types::decimal_arb::{DecimalArbArrayBuilder, NativeIntKind};
 
-    fn u256_field(name: &str, kind: DecimalText) -> Field {
-        let metadata = match kind {
-            DecimalText::U256 => U256Type::metadata(),
-            DecimalText::I256 => I256Type::metadata(),
-        };
-        Field::new(name, DataType::FixedSizeBinary(32), true).with_metadata(metadata)
+    fn decimal_arb_field(name: &str, scale: u32, kind: Option<NativeIntKind>) -> Field {
+        let field = DecimalArbType::field(name, 78, scale, true).unwrap();
+        match kind {
+            Some(kind) => DecimalArbType::with_native_int_kind(field, kind).unwrap(),
+            None => field,
+        }
     }
 
-    fn be_bytes(value: u128, negative: bool) -> [u8; 32] {
-        let mut bytes = [if negative { 0xff } else { 0 }; 32];
-        let v = if negative {
-            (value as i128).wrapping_neg() as u128
-        } else {
-            value
-        };
-        bytes[16..].copy_from_slice(&v.to_be_bytes());
-        bytes
+    fn wide_int_field(name: &str, kind: NativeIntKind) -> Field {
+        decimal_arb_field(name, 0, Some(kind))
+    }
+
+    fn decimal_arb_values(field: &Field, values: &[Option<&str>]) -> ArrayRef {
+        let (_, scale) = DecimalArbType::precision_scale_from_field(field).unwrap();
+        let mut builder =
+            DecimalArbArrayBuilder::with_capacity(values.len(), field.name(), 78, scale).unwrap();
+        for value in values {
+            match value {
+                Some(value) => builder.append_str(value).unwrap(),
+                None => builder.append_null(),
+            }
+        }
+        Arc::new(builder.finish().into_inner().0)
     }
 
     fn op_batch(ops: &[&str]) -> RecordBatch {
@@ -598,8 +594,8 @@ mod tests {
         let input = ArrowSchema::new(vec![
             Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false),
             Field::new("id", DataType::UInt64, false),
-            u256_field("amount", DecimalText::U256),
-            u256_field("delta", DecimalText::I256),
+            wide_int_field("amount", NativeIntKind::U256),
+            decimal_arb_field("delta", 2, None),
             Field::new("big", DataType::Decimal256(60, 2), true),
             Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
             Field::new(
@@ -654,7 +650,7 @@ mod tests {
     fn rejects_unstorable_types() {
         let nested_u256 = ArrowSchema::new(vec![Field::new(
             "amounts",
-            DataType::List(Arc::new(u256_field("item", DecimalText::U256))),
+            DataType::List(Arc::new(wide_int_field("item", NativeIntKind::U256))),
             true,
         )]);
         let err = table_schema_for(&nested_u256, false).unwrap_err();
@@ -683,11 +679,13 @@ mod tests {
 
     #[test]
     fn projection_converts_values_exactly() {
+        let amount = wide_int_field("amount", NativeIntKind::U256);
+        let delta = decimal_arb_field("delta", 2, None);
         let input = Arc::new(ArrowSchema::new(vec![
             Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false),
             Field::new("id", DataType::UInt64, false),
-            u256_field("amount", DecimalText::U256),
-            u256_field("delta", DecimalText::I256),
+            amount.clone(),
+            delta.clone(),
             Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
         ]));
         let batch = RecordBatch::try_new(
@@ -695,19 +693,8 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["i", "i"])),
                 Arc::new(UInt64Array::from(vec![u64::MAX, 1])),
-                Arc::new(
-                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                        [Some(be_bytes(u128::MAX, false)), None].into_iter(),
-                        32,
-                    )
-                    .unwrap(),
-                ),
-                Arc::new(
-                    FixedSizeBinaryArray::try_from_iter(
-                        [be_bytes(5, true), be_bytes(7, false)].into_iter(),
-                    )
-                    .unwrap(),
-                ),
+                decimal_arb_values(&amount, &[Some(&u128::MAX.to_string()), None]),
+                decimal_arb_values(&delta, &[Some("-5.25"), Some("7.5")]),
                 Arc::new(TimestampMillisecondArray::from(vec![Some(1_500), None])),
             ],
         )
@@ -733,7 +720,7 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!((delta.value(0), delta.value(1)), ("-5", "7"));
+        assert_eq!((delta.value(0), delta.value(1)), ("-5.25", "7.50"));
         let ts = out
             .column(3)
             .as_any()
@@ -959,15 +946,15 @@ mod tests {
     }
 
     #[test]
-    fn u256_into_binary_columns_keeps_raw_bytes() {
+    fn wide_ints_into_binary_columns_write_big_endian_bytes() {
         use arrow::array::AsArray;
-        let input = Arc::new(ArrowSchema::new(vec![u256_field("v", DecimalText::U256)]));
-        let bytes = be_bytes(u128::MAX, false);
+        let field = wide_int_field("v", NativeIntKind::I256);
+        let input = Arc::new(ArrowSchema::new(vec![field.clone()]));
+        let mut bytes = [0xff; 32];
+        bytes[31] = 0xfb;
         let batch = RecordBatch::try_new(
             input.clone(),
-            vec![Arc::new(
-                FixedSizeBinaryArray::try_from_iter([bytes].into_iter()).unwrap(),
-            )],
+            vec![decimal_arb_values(&field, &[Some("-5")])],
         )
         .unwrap();
         for to in [DataType::Binary, DataType::FixedSizeBinary(32)] {
@@ -985,5 +972,71 @@ mod tests {
         let target = target_for(vec![Field::new("v", DataType::Decimal128(38, 0), true)]);
         let err = BatchProjector::try_new(&input, target, false).unwrap_err();
         assert!(err.to_string().contains("column 'v'"), "got {err}");
+    }
+
+    #[test]
+    fn decimal_arb_without_int_hint_needs_a_string_column() {
+        let input = ArrowSchema::new(vec![decimal_arb_field("v", 0, None)]);
+        let target = target_for(vec![Field::new("v", DataType::FixedSizeBinary(32), true)]);
+        let err = BatchProjector::try_new(&input, target, false).unwrap_err();
+        assert!(err.to_string().contains("column 'v'"), "got {err}");
+    }
+
+    #[test]
+    fn existing_tables_reject_nested_decimal_arb() {
+        let amount = || decimal_arb_field("amount", 2, None);
+        let binary = || Field::new("amount", DataType::Binary, true);
+        for (input, table) in [
+            (
+                DataType::Struct(vec![amount()].into()),
+                DataType::Struct(vec![binary()].into()),
+            ),
+            (
+                DataType::List(Arc::new(amount())),
+                DataType::List(Arc::new(binary())),
+            ),
+        ] {
+            let input = ArrowSchema::new(vec![Field::new("v", input, true)]);
+            let target = target_for(vec![Field::new("v", table, true)]);
+            let err = BatchProjector::try_new(&input, target, false).unwrap_err();
+            assert!(err.to_string().contains("nested decimal_arb"), "got {err}");
+        }
+    }
+
+    /// Streamling 0.5 stamps nested decimal_arb metadata only on the batches,
+    /// not on the schema the sink is built with.
+    #[test]
+    fn batches_with_nested_decimal_arb_fail_even_if_the_declared_schema_lacks_it() {
+        use arrow::array::StructArray;
+        let amount = decimal_arb_field("amount", 2, None);
+        let bare = Field::new("amount", DataType::LargeBinary, true);
+        let declared = ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Struct(vec![bare].into()),
+            true,
+        )]);
+        let target = target_for(vec![Field::new(
+            "v",
+            DataType::Struct(vec![Field::new("amount", DataType::Binary, true)].into()),
+            true,
+        )]);
+        let projector = BatchProjector::try_new(&declared, target, false).unwrap();
+
+        let values = StructArray::new(
+            vec![amount.clone()].into(),
+            vec![decimal_arb_values(&amount, &[Some("12.34")])],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "v",
+                values.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(values)],
+        )
+        .unwrap();
+        let err = projector.project(&batch).unwrap_err();
+        assert!(err.to_string().contains("nested decimal_arb"), "got {err}");
     }
 }

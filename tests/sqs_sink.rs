@@ -522,7 +522,7 @@ async fn test_sqs_sink_uint256() {
         .await
         .expect("Failed to produce records");
 
-    // SQL transform: to_u256(value) creates a uint256 column
+    // SQL transform: CAST(... AS DECIMAL(78, 0)) creates a uint256 (decimal_arb) column
     let pipeline = format!(
         r#"
 sources:
@@ -536,7 +536,7 @@ transforms:
   with_u256:
     type: sql
     primary_key: id
-    sql: "SELECT id, to_u256(value) as amount FROM kafka_source"
+    sql: "SELECT id, CAST(value AS DECIMAL(78, 0)) as amount, named_struct('amount', CAST(value AS DECIMAL(78, 0))) as nested FROM kafka_source"
 
 sinks:
   sqs_sink:
@@ -607,6 +607,11 @@ sinks:
             amount, *expected,
             "id {}: expected amount '{}', got '{}'",
             id, expected, amount
+        );
+        assert_eq!(
+            parsed["nested"]["amount"].as_str(),
+            Some(*expected),
+            "id {id}: nested decimal_arb is decimal text, not hex: {msg}"
         );
     }
 }

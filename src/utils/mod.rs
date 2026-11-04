@@ -1,3 +1,4 @@
+pub mod decimal_arb;
 pub mod iceberg;
 pub mod parquet_compression;
 pub mod plugin_options;
