@@ -20,11 +20,12 @@ use crate::transforms::zama_decrypt::ZamaDecryptTransform;
 use crate::transforms::zama_public_decrypt::ZamaPublicDecryptTransform;
 
 use streamling_plugin::{
-    init_plugin_with_async_runtime, register_plugin_sink, register_plugin_source,
-    register_plugin_transform,
+    init_plugin_with_async_runtime, register_partitioned_plugin_sink, register_plugin_sink,
+    register_plugin_source, register_plugin_transform,
 };
 
-register_plugin_sink!("s3_sink", S3Sink);
+register_partitioned_plugin_sink!("s3_sink", S3Sink);
+
 register_plugin_sink!("mysql_sink", MySqlSink);
 register_plugin_sink!("sqs", SqsSink);
 register_plugin_sink!("s2_sink", S2Sink);

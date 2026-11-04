@@ -30,6 +30,8 @@ All YAML options can also be set via `STREAMLING__PLUGIN__S3_SINK__<KEY>` enviro
 | `compression` | no | Parquet codec: `zstd`, `gzip`, `brotli`, `snappy`, `lz4_raw` or `uncompressed` (default: `uncompressed`) |
 | `compression_level` | no | Only with `zstd` (1–22, default 3), `gzip` (0–9, default 6) or `brotli` (0–11, default 1); rejected for other codecs |
 
+The sink supports the node-level `parallelism:` setting. Each instance writes its own `batch_<uuid>.parquet` objects, so files do not collide, but object order no longer follows input order.
+
 ### MySQL Sink (`mysql_sink`)
 
 Writes to MySQL with upsert/delete (CDC) support. Rows with `_gs_op = "d"` are deleted; all others are upserted.
