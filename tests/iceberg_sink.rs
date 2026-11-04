@@ -591,7 +591,7 @@ async fn test_iceberg_sink_rejects_nested_decimal_arb_into_existing_binary_colum
         .await
         .expect("create table");
     let count = 3;
-    produce(&fixture, 1..=count, "i").await;
+    produce(&fixture, 1..=count, "c").await;
 
     let yaml = pipeline(&fixture.ctx.kafka_topic)
         .replace(
