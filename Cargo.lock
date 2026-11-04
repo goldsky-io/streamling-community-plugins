@@ -2032,7 +2032,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uint 0.10.0",
  "url",
  "urlencoding",
  "uuid",
@@ -8462,9 +8461,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streamling-common"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82dc47e4c1964e3de8746453f060db12abb6de8d43d6430a7015acc34bca34cc"
+checksum = "ec9d7256917ef54fc3c05f4a6bf04878c74f07098088f22d2813bad6450a22e1"
 dependencies = [
  "anyhow",
  "apache-avro 0.17.0",
@@ -8494,9 +8493,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-config"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19299073795e7b97725d658a1e7b9a3fb1232ea4ff7badf78a6decb515ba9a03"
+checksum = "6c56abb6f1aa448aed455be0543c56ab9e788d2c1b92184c9bcc998b8203eb1f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8514,9 +8513,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-e2e"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fffcfd0525a8e853b2e8e1a6e309fdd6b0d235c448201f07874f2616a53c8744"
+checksum = "fbe985f1c03892aa1c1e85c94253116e0cae9de2463172a694258a2c3574aabe"
 dependencies = [
  "apache-avro 0.17.0",
  "aws-config",
@@ -8524,6 +8523,7 @@ dependencies = [
  "aws-types",
  "axum",
  "clickhouse",
+ "num-bigint",
  "rdkafka",
  "regex",
  "reqwest 0.12.28",
@@ -8544,9 +8544,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a318fe41f06d705899b8306720dd622aa1dc407d264fdb70ac49989e6b81c0a7"
+checksum = "cd119409f09d0f0c89006b73027c6e011ab696a814d2e8c5aef4cf77cbb40674"
 dependencies = [
  "abi_stable",
  "arrow",
@@ -8572,9 +8572,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin-derive"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c935a2ff6bf7656c5663877e2bf57aa7c5027ec77a98eeb0fe6eeb34e00daf56"
+checksum = "c2eb6065675ffe647ab4882f067179243990e56b9a913af5e6ee5178510cc2ad"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8583,9 +8583,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-retry"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "412649c27b194138bf30435af664794ae46c79e3927144f20f9cf5624bddf0fb"
+checksum = "981b64f69d7eade51b493951bc7f7856ec42d8460f10d70251942a2ea63cf26c"
 dependencies = [
  "tokio",
  "tracing",
@@ -8593,9 +8593,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-state"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b90cc73129914ee8d50fa90d17fd86be131f579481b7726441827379e766035"
+checksum = "a6debe2f451c8ffb071796f7a97aeb246120baefd105a95940f85893e2213632"
 dependencies = [
  "async-trait",
  "parking_lot",

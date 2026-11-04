@@ -10,11 +10,6 @@ alloy-primitives = { version = "1.7", default-features = false, features = ["std
 # round-trip contract tracks upstream by construction.
 streamling-common = "0.5.0"
 
-# Generic RecordBatch-to-JSON conversion (see utils::record_batch_json).
-# U256 columns are serialized as decimal strings; arrow_json emits hex by default.
-# Minimal dependency - avoids pulling in streamling-core.
-uint = "0.10"
-
 # FFI dependencies (required by init_plugin_with_async_runtime! macro)
 abi_stable = "0.11.3"
 

@@ -484,8 +484,7 @@ async fn test_iceberg_sink_preserves_exact_numeric_boundaries() {
         .await
         .expect("produce numeric strings");
 
-    // v0.4.0's SQL planner supports BIGINT UNSIGNED, and to_u256 attaches
-    // Streamling's extension metadata to its FixedSizeBinary(32) output.
+    // CAST(... AS DECIMAL(78, 0)) yields a u256-hinted decimal_arb column.
     let yaml = pipeline(&fixture.ctx.kafka_topic)
         .replace(
             "transforms: {}",
@@ -494,7 +493,7 @@ async fn test_iceberg_sink_preserves_exact_numeric_boundaries() {
   exact_numbers:
     type: sql
     primary_key: id
-    sql: "SELECT id, CAST(value AS DECIMAL(38,4)) AS amount, CAST(category AS BIGINT UNSIGNED) AS unsigned_value, to_u256(CASE WHEN id = 1 THEN '{U256_MAX}' ELSE '0' END) AS huge FROM kafka_source""#
+    sql: "SELECT id, CAST(value AS DECIMAL(38,4)) AS amount, CAST(category AS BIGINT UNSIGNED) AS unsigned_value, CAST(CASE WHEN id = 1 THEN '{U256_MAX}' ELSE '0' END AS DECIMAL(78, 0)) AS huge FROM kafka_source""#
             ),
         )
         .replace("from: kafka_source", "from: exact_numbers");

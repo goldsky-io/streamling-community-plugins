@@ -92,7 +92,7 @@
 //! | UInt64 | decimal(20, 0) |
 //! | Float16/32, Float64 | float, double |
 //! | Decimal128(p, s) | decimal(p, s) |
-//! | Decimal256, U256 / I256 (`streamling.u256` / `streamling.i256`) | string (exact decimal text) |
+//! | Decimal256, `decimal_arb` (`streamling.decimal_arb`, incl. 256-bit integers) | string (exact decimal text) |
 //! | Utf8, LargeUtf8, Utf8View | string |
 //! | Binary, LargeBinary, BinaryView / FixedSizeBinary(n) | binary / fixed(n) |
 //! | Date32, Date64 | date |
@@ -103,8 +103,8 @@
 //! | List, LargeList, FixedSizeList, Struct, Map | list, struct, map (recursively) |
 //!
 //! Nanosecond timestamps lose sub-microsecond precision (format v1/v2 has no
-//! nanosecond type). Null-typed columns and U256/I256 nested inside lists or
-//! structs are rejected.
+//! nanosecond type). Null-typed columns and `decimal_arb` nested inside lists
+//! or structs are rejected.
 //!
 //! For an existing table its current schema is authoritative: input columns
 //! are matched to table columns by name, and struct fields to table struct
@@ -128,8 +128,9 @@
 //!   unit, plus nanoseconds → microseconds (truncating sub-µs digits);
 //!   timestamp ↔ timestamptz keeps the stored instant (zoned inputs are
 //!   normalized to UTC; tz-less values are taken as UTC);
-//! - U256/I256 → string (exact decimal text), or binary / fixed(32) (the raw
-//!   32 big-endian bytes).
+//! - `decimal_arb` → string (exact decimal text); u256/i256-hinted integers
+//!   (e.g. `CAST(x AS DECIMAL(78, 0))`) also → binary / fixed(32) (32
+//!   big-endian bytes, two's complement for i256).
 //!
 //! Values that still cannot convert (e.g. a string longer than a fixed width)
 //! fail the batch rather than becoming nulls.
