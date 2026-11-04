@@ -4,16 +4,17 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchOptions};
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::array::{StringArray, new_null_array};
 use arrow::compute::{CastOptions, can_cast_types, cast, cast_with_options};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use iceberg::spec::Schema as IcebergSchema;
-use streamling_common::types::decimal_arb::{DecimalArbArray, DecimalArbType};
+use streamling_common::types::decimal_arb::DecimalArbType;
 use streamling_common::types::decimal_arb_legacy::decimal_arb_to_legacy_wide_int;
 use streamling_plugin::PluginError;
 use streamling_plugin::api::STREAMLING_COLUMN_NAME_OP;
 
+use crate::utils::decimal_arb::{decimal_arb_text, nests_decimal_arb};
 use crate::utils::iceberg::iceberg_error;
 
 /// Fails unless every row's `_gs_op` is an insert (`i`). An append-only
@@ -88,8 +89,8 @@ pub(crate) fn storable_field(field: &Field) -> Result<Field, PluginError> {
 fn storable_child(column: &str, child: &Field) -> Result<Arc<Field>, PluginError> {
     if DecimalArbType::is_decimal_arb_field(child) {
         return Err(PluginError::Internal(format!(
-            "iceberg_sink: column '{column}': nested decimal_arb (wide integer / \
-             arbitrary-precision decimal) fields are not supported; CAST them to TEXT upstream"
+            "iceberg_sink: {}",
+            nested_decimal_arb_error(column)
         )));
     }
     Ok(Arc::new(Field::new(
@@ -189,6 +190,8 @@ impl BatchProjector {
                                  column, or binary / fixed(32) for u256/i256 integers"
                             ));
                         }
+                    } else if nests_decimal_arb(input_field.data_type()) {
+                        problems.push(nested_decimal_arb_error(name));
                     } else {
                         check_conversion(name, input_field.data_type(), to, &mut problems);
                     }
@@ -254,6 +257,13 @@ fn is_decimal_arb_target(input: &Field, to: &DataType) -> bool {
         }
         _ => false,
     }
+}
+
+fn nested_decimal_arb_error(column: &str) -> String {
+    format!(
+        "column '{column}': nested decimal_arb (wide integer / arbitrary-precision decimal) \
+         fields are not supported; CAST them to TEXT upstream"
+    )
 }
 
 /// Records a problem unless `from` converts losslessly to `to`. Struct
@@ -402,6 +412,14 @@ fn convert_column(
     input_field: &Field,
     target_field: &Field,
 ) -> Result<ArrayRef, PluginError> {
+    // Checked per batch: Streamling stamps nested decimal_arb metadata on the
+    // batches only, so the declared schema `try_new` saw may not show it.
+    if nests_decimal_arb(input_field.data_type()) {
+        return Err(PluginError::Internal(format!(
+            "iceberg_sink: {}",
+            nested_decimal_arb_error(input_field.name())
+        )));
+    }
     let column_error = |e: &dyn std::fmt::Display| {
         PluginError::Internal(format!(
             "iceberg_sink: column '{}': cannot convert {} to {}: {e}",
@@ -514,21 +532,11 @@ fn convert_array(array: &ArrayRef, to: &DataType) -> Result<ArrayRef, arrow::err
 /// Renders decimal_arb values as exact decimal strings, or (binary targets,
 /// u256/i256-hinted integers only) as 32 big-endian bytes.
 fn decimal_arb_column(array: &ArrayRef, field: &Field, to: &DataType) -> Result<ArrayRef, String> {
-    let values = array
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or("expected LargeBinary decimal_arb values")?;
     match DecimalArbType::native_int_kind_from_field(field) {
         Some(kind) if !matches!(to, DataType::Utf8 | DataType::LargeUtf8) => {
-            decimal_arb_to_legacy_wide_int(values, field, kind).map_err(|e| e.to_string())
+            decimal_arb_to_legacy_wide_int(array.as_ref(), field, kind).map_err(|e| e.to_string())
         }
-        _ => {
-            let values = DecimalArbArray::try_from_array_and_field(values.clone(), field)
-                .map_err(|e| e.to_string())?;
-            Ok(Arc::new(
-                values.to_string_array().map_err(|e| e.to_string())?,
-            ))
-        }
+        _ => decimal_arb_text(field, array).map_err(|e| e.to_string()),
     }
 }
 
@@ -972,5 +980,63 @@ mod tests {
         let target = target_for(vec![Field::new("v", DataType::FixedSizeBinary(32), true)]);
         let err = BatchProjector::try_new(&input, target, false).unwrap_err();
         assert!(err.to_string().contains("column 'v'"), "got {err}");
+    }
+
+    #[test]
+    fn existing_tables_reject_nested_decimal_arb() {
+        let amount = || decimal_arb_field("amount", 2, None);
+        let binary = || Field::new("amount", DataType::Binary, true);
+        for (input, table) in [
+            (
+                DataType::Struct(vec![amount()].into()),
+                DataType::Struct(vec![binary()].into()),
+            ),
+            (
+                DataType::List(Arc::new(amount())),
+                DataType::List(Arc::new(binary())),
+            ),
+        ] {
+            let input = ArrowSchema::new(vec![Field::new("v", input, true)]);
+            let target = target_for(vec![Field::new("v", table, true)]);
+            let err = BatchProjector::try_new(&input, target, false).unwrap_err();
+            assert!(err.to_string().contains("nested decimal_arb"), "got {err}");
+        }
+    }
+
+    /// Streamling 0.5 stamps nested decimal_arb metadata only on the batches,
+    /// not on the schema the sink is built with.
+    #[test]
+    fn batches_with_nested_decimal_arb_fail_even_if_the_declared_schema_lacks_it() {
+        use arrow::array::StructArray;
+        let amount = decimal_arb_field("amount", 2, None);
+        let bare = Field::new("amount", DataType::LargeBinary, true);
+        let declared = ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Struct(vec![bare].into()),
+            true,
+        )]);
+        let target = target_for(vec![Field::new(
+            "v",
+            DataType::Struct(vec![Field::new("amount", DataType::Binary, true)].into()),
+            true,
+        )]);
+        let projector = BatchProjector::try_new(&declared, target, false).unwrap();
+
+        let values = StructArray::new(
+            vec![amount.clone()].into(),
+            vec![decimal_arb_values(&amount, &[Some("12.34")])],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "v",
+                values.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(values)],
+        )
+        .unwrap();
+        let err = projector.project(&batch).unwrap_err();
+        assert!(err.to_string().contains("nested decimal_arb"), "got {err}");
     }
 }

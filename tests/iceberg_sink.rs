@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Int64Type, TimeUnit, TimestampMicrosecondType};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Transform, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
 use iceberg::{Catalog, TableCreation};
 use iceberg_common::IcebergFixture;
 use serde::Serialize;
@@ -557,4 +557,80 @@ async fn test_iceberg_sink_preserves_exact_numeric_boundaries() {
         assert_eq!(row["unsigned_value"], unsigned[i]);
         assert_eq!(row["huge"], if i == 0 { U256_MAX } else { "0" });
     }
+}
+
+/// Streamling stamps nested decimal_arb metadata on batches only; the sink
+/// must still refuse to write the canonical bytes into a nested binary column.
+#[tokio::test]
+async fn test_iceberg_sink_rejects_nested_decimal_arb_into_existing_binary_column() {
+    let fixture = IcebergFixture::setup(TestContextOptions::new().with_plugin()).await;
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(
+                2,
+                "s",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(3, "amount", Type::Primitive(PrimitiveType::Binary))
+                        .into(),
+                ])),
+            )
+            .into(),
+        ])
+        .build()
+        .expect("schema");
+    fixture
+        .catalog
+        .create_table(
+            &fixture.namespace,
+            TableCreation::builder()
+                .name("nested".to_string())
+                .schema(schema)
+                .build(),
+        )
+        .await
+        .expect("create table");
+    let count = 3;
+    produce(&fixture, 1..=count, "i").await;
+
+    let yaml = pipeline(&fixture.ctx.kafka_topic)
+        .replace(
+            "transforms: {}",
+            r#"transforms:
+  nested:
+    type: sql
+    primary_key: id
+    sql: "SELECT id, named_struct('amount', CAST('12.34' AS DECIMAL(80, 2))) AS s FROM kafka_source""#,
+        )
+        .replace("from: kafka_source", "from: nested");
+    let output = fixture
+        .ctx
+        .run_pipeline_raw(
+            &yaml,
+            sink_opts(&fixture, "nested")
+                .env(format!("{SINK_ENV}__AUTO_CREATE"), "false")
+                .env(format!("{SINK_ENV}__INCLUDE_OP_COLUMN"), "false")
+                .record_limit(count as u64),
+        )
+        .await
+        .expect("pipeline execution");
+    assert!(
+        !output.status.success(),
+        "nested decimal_arb must fail the pipeline"
+    );
+    assert!(
+        output.stderr.contains("column 's': nested decimal_arb"),
+        "fails for the nested decimal_arb, not another reason:\n{}",
+        output.stderr
+    );
+
+    let table = fixture
+        .catalog
+        .load_table(&fixture.table_ident("nested"))
+        .await
+        .expect("load table");
+    assert!(
+        table.metadata().current_snapshot().is_none(),
+        "no canonical bytes were committed"
+    );
 }

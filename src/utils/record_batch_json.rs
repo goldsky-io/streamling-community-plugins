@@ -1,30 +1,19 @@
 //! Utilities for converting Arrow RecordBatches to JSON suitable for sinks.
 //!
 //! Provides [`record_batch_to_line_delimited_json`] which converts a batch to
-//! newline-delimited JSON rows. Top-level `decimal_arb` columns (wide integers
-//! and arbitrary-precision decimals) are serialized as exact decimal strings;
-//! arrow_json would print their canonical bytes as hex.
+//! newline-delimited JSON rows. `decimal_arb` leaves (wide integers and
+//! arbitrary-precision decimals), top-level or nested, are serialized as exact
+//! decimal strings; arrow_json would print their canonical bytes as hex.
 
-use arrow::array::{Array, ArrayRef, LargeBinaryArray, RecordBatch};
+use arrow::array::RecordBatch;
 use arrow_json::LineDelimitedWriter;
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{ArrowError, Schema};
 use bytes::Bytes;
 use std::sync::Arc;
-use streamling_common::types::decimal_arb::{DecimalArbArray, DecimalArbType};
+use streamling_common::types::decimal_arb::DecimalArbType;
 use streamling_common::types::decimal_arb_legacy::upgrade_legacy_wide_int_batch;
 
-fn decimal_arb_as_text(array: &ArrayRef, field: &Field) -> Result<ArrayRef, ArrowError> {
-    let err = |e: &dyn std::fmt::Display| {
-        ArrowError::InvalidArgumentError(format!("decimal_arb column '{}': {e}", field.name()))
-    };
-    let values = array
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| err(&"expected LargeBinary values"))?;
-    let values =
-        DecimalArbArray::try_from_array_and_field(values.clone(), field).map_err(|e| err(&e))?;
-    Ok(Arc::new(values.to_string_array().map_err(|e| err(&e))?))
-}
+use crate::utils::decimal_arb::{decimal_arb_leaves_as_text, nests_decimal_arb};
 
 fn decimal_arb_columns_as_text(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
     // A plugin source may still emit the retired FixedSizeBinary(32) u256/i256 columns.
@@ -35,26 +24,19 @@ fn decimal_arb_columns_as_text(batch: &RecordBatch) -> Result<RecordBatch, Arrow
     if !schema
         .fields()
         .iter()
-        .any(|f| DecimalArbType::is_decimal_arb_field(f))
+        .any(|f| DecimalArbType::is_decimal_arb_field(f) || nests_decimal_arb(f.data_type()))
     {
         return Ok(batch.clone());
     }
 
-    let mut fields = Vec::with_capacity(batch.num_columns());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        if DecimalArbType::is_decimal_arb_field(field) {
-            columns.push(decimal_arb_as_text(column, field)?);
-            fields.push(Field::new(
-                field.name(),
-                DataType::Utf8,
-                field.is_nullable(),
-            ));
-        } else {
-            columns.push(column.clone());
-            fields.push(field.as_ref().clone());
-        }
-    }
+    let (fields, columns): (Vec<_>, Vec<_>) = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| decimal_arb_leaves_as_text(field, column))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
@@ -81,7 +63,8 @@ pub fn record_batch_to_line_delimited_json(batch: &RecordBatch) -> Result<Vec<By
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeBinaryArray, Int64Array};
+    use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int64Array};
+    use arrow_schema::{DataType, Field};
     use streamling_common::types::decimal_arb::DecimalArbArrayBuilder;
 
     fn rows(batch: &RecordBatch) -> Vec<String> {
@@ -137,5 +120,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows(&batch), [r#"{"v":"-5"}"#]);
+    }
+
+    #[test]
+    fn nested_decimal_arb_prints_exact_decimal_text() {
+        use arrow::array::{ListArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        let amount = DecimalArbType::field("amount", 80, 2, true).unwrap();
+        let mut builder = DecimalArbArrayBuilder::with_capacity(2, "amount", 80, 2).unwrap();
+        builder.append_str("12.34").unwrap();
+        builder.append_str("-1").unwrap();
+        let amounts: ArrayRef = Arc::new(builder.finish().into_inner().0);
+        let structs = StructArray::new(vec![amount.clone()].into(), vec![amounts.clone()], None);
+        let lists = ListArray::new(
+            Arc::new(amount.clone()),
+            OffsetBuffer::from_lengths([2, 0]),
+            amounts,
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("s", structs.data_type().clone(), false),
+                Field::new("l", lists.data_type().clone(), false),
+            ])),
+            vec![Arc::new(structs), Arc::new(lists)],
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&batch),
+            [
+                r#"{"s":{"amount":"12.34"},"l":["12.34","-1.00"]}"#,
+                r#"{"s":{"amount":"-1.00"},"l":[]}"#
+            ]
+        );
     }
 }
