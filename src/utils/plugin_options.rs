@@ -52,6 +52,13 @@ impl PluginOptions {
         self.lookup(key).filter(|value| !value.is_empty())
     }
 
+    /// The option's environment variable only, ignoring YAML; empty counts as unset.
+    pub fn env_non_empty(&self, key: &str) -> Option<String> {
+        std::env::var(self.env_key(key))
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+
     /// A required option. An option set to the empty string counts as unset:
     /// no required option has a meaningful empty value, and reporting it here
     /// beats the downstream failure it would otherwise cause.
