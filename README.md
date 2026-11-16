@@ -341,7 +341,7 @@ All YAML options can also be set via `STREAMLING__PLUGIN__ZAMA_DECRYPT__<KEY>` e
 | `rpc_url` | yes | — | JSON-RPC endpoint the daemon uses for public reads |
 | `daemon_socket` | yes | — | Absolute path of the daemon Unix socket |
 | `delegate_private_key` | yes | — | Key of the address wallets delegate to (env var only) |
-| `relayer_api_key` | no | — | Zama relayer credential (env var only) |
+| `relayer_api_key` | no | — | Zama relayer credential; required on mainnet only (env var only) |
 | `tokens` | no | all | Comma-separated token contracts to decrypt |
 | `token_column`, `from_column`, `to_column`, `handle_column` | no | `erc7984_token`, `erc7984_from`, `erc7984_to`, `erc7984_amount_handle` | Input columns, hex strings |
 | `max_concurrency` | no | SDK default | Relayer concurrency for batch decryption |
