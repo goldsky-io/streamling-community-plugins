@@ -70,7 +70,7 @@
 //! | `rpc_url` | yes | | JSON-RPC endpoint the daemon uses for public reads |
 //! | `daemon_socket` | yes | | Absolute path of the daemon's Unix socket |
 //! | `delegate_private_key` | yes | | Hex secp256k1 key of the address wallets delegate to; environment only |
-//! | `relayer_api_key` | no | | Zama relayer credential; the public Sepolia relayer needs none; environment only |
+//! | `relayer_api_key` | no | | Zama relayer credential; required on mainnet only, the Sepolia relayer needs none; environment only |
 //! | `tokens` | no | all | Comma-separated token contracts to decrypt; others pass through |
 //! | `token_column` | no | `erc7984_token` | Column holding the token contract |
 //! | `from_column`, `to_column` | no | `erc7984_from`, `erc7984_to` | Columns holding the transfer parties |
