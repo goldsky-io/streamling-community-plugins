@@ -35,10 +35,11 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
         with:
+          toolchain: 1.95.0
           components: clippy, rustfmt
       # kache setup mirrors ci.yml (see the comment there).
       - name: Setup kache
@@ -54,7 +55,7 @@ jobs:
           cache-c-cpp: "true"
           pr-comment: "false"
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "community-plugins-release-test"
           cache-targets: true
@@ -63,7 +64,7 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: nextest
       - name: Run unit tests
@@ -83,9 +84,11 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        with:
+          toolchain: 1.95.0
       - name: Resolve version from Cargo metadata
         id: resolve
         run: |
@@ -133,16 +136,18 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Cache release-optimized library
         id: lib-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release-optimized/libcommunity_plugins.so
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        with:
+          toolchain: 1.95.0
       - name: Setup kache
         if: steps.lib-cache.outputs.cache-hit != 'true'
         uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
@@ -158,7 +163,7 @@ jobs:
           pr-comment: "false"
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "v0-release-opt-${{ matrix.os }}-${{ matrix.arch }}"
           cache-targets: true
@@ -174,7 +179,7 @@ jobs:
         if: steps.lib-cache.outputs.cache-hit != 'true'
         run: kache stats || true
       - name: Upload release library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-lib-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release-optimized/libcommunity_plugins.so
@@ -197,19 +202,21 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Cache release-optimized library
         id: lib-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release-optimized/libcommunity_plugins.dylib
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        with:
+          toolchain: 1.95.0
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "v0-release-opt-darwin-${{ matrix.arch }}"
           cache-targets: true
@@ -220,7 +227,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
       - name: Upload release library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-lib-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release-optimized/libcommunity_plugins.dylib
@@ -240,19 +247,21 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Cache release-optimized library
         id: lib-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release-optimized/community_plugins.dll
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        with:
+          toolchain: 1.95.0
       - name: Setup rust cache
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "v0-release-opt-windows-${{ matrix.arch }}"
           cache-targets: true
@@ -262,7 +271,7 @@ jobs:
       # image, nasm does not.
       - name: Install NASM
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
       - name: Verify native build tools
         if: steps.lib-cache.outputs.cache-hit != 'true'
         run: |
@@ -274,7 +283,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
       - name: Upload release library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-lib-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release-optimized/community_plugins.dll
@@ -291,9 +300,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download all library artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-lib-*-*
           path: release-artifacts/
@@ -326,7 +335,7 @@ jobs:
           done
           ls -la release-assets/
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
