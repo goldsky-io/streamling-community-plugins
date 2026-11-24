@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.95.0
           components: clippy, rustfmt
@@ -86,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.95.0
       - name: Resolve version from Cargo metadata
@@ -145,7 +145,7 @@ jobs:
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.95.0
       - name: Setup kache
@@ -211,7 +211,7 @@ jobs:
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.95.0
       - name: Setup rust cache
@@ -256,7 +256,7 @@ jobs:
           key: release-opt-lib-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.lib-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.95.0
       - name: Setup rust cache
