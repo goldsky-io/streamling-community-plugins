@@ -20,10 +20,11 @@ jobs:
   validate-and-test:
     runs-on: blacksmith-8vcpu-ubuntu-2204
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.95.0
           components: clippy, rustfmt
       # kache remote: Tigris bucket github-action-kache. kache uploads only from pushes to a protected branch
       # (main); every other push reads main's entries and writes nothing.
@@ -43,7 +44,7 @@ jobs:
           cache-c-cpp: "true"
           pr-comment: "false"
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "community-plugins"
           cache-targets: true
@@ -52,7 +53,7 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: nextest
       - name: Run tests
@@ -70,24 +71,25 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.95.0
           components: clippy
       - name: Setup rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "community-plugins-windows"
           cache-targets: true
           cache-on-failure: true
       # aws-lc-sys assembles NASM-format asm on Windows; the image lacks nasm.
       - name: Install NASM
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
       # Library and its unit tests only: tests/ are Linux e2e suites (k3s, std::os::unix).
       - name: Run clippy
         run: cargo clippy --locked --lib --profile test -- -D warnings
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: nextest
       - name: Run tests
@@ -105,7 +107,7 @@ jobs:
     needs: [validate-and-test]
     runs-on: blacksmith-8vcpu-ubuntu-2204
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download streamling release binary
         run: |
           set -euo pipefail
@@ -115,7 +117,9 @@ jobs:
           tar -xzf streamling.tar.gz -C streamling-bin
           chmod +x streamling-bin/streamling
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
       - name: Setup kache
         uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
@@ -129,7 +133,7 @@ jobs:
           cache-c-cpp: "true"
           pr-comment: "false"
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "community-plugins-release"
           cache-targets: true
@@ -143,7 +147,7 @@ jobs:
       - name: Show kache stats
         run: kache stats || true
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-artifacts
           path: |
@@ -159,18 +163,18 @@ jobs:
     needs: [build-release]
     runs-on: blacksmith-8vcpu-ubuntu-2204
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # k3s-setup.sh and its manifests live in the streamling repo at the same
       # release tag as the downloaded binary.
       - name: Checkout streamling
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: goldsky-io/streamling
           ref: ${{ env.STREAMLING_VERSION }}
           path: streamling
       # Download pre-built binaries from build-release job (no recompilation)
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-artifacts
           path: artifacts
@@ -182,7 +186,9 @@ jobs:
           echo "STREAMLING__PLUGIN__PATH=$GITHUB_WORKSPACE/artifacts/target/release/libcommunity_plugins.so" >> $GITHUB_ENV
       # Rust + caching (only for compiling the test binary, not streamling)
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
       - name: Setup kache
         uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
@@ -195,20 +201,20 @@ jobs:
           manifest-key: community-plugins-e2e
           cache-c-cpp: "true"
           pr-comment: "false"
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: nextest
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "community-plugins-e2e"
           cache-targets: true
           cache-on-failure: true
       # Infrastructure
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Set up Docker Builder
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@00b770997181b0ea829a64add3dbd306fe9cfa25 # v1
       - name: Install k3d
         run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
       - name: Setup k3s cluster
